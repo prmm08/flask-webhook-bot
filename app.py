@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import asyncio
 import logging
+import json
 import aiohttp
 from flask import Flask, request, jsonify
 
@@ -12,10 +13,10 @@ API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_SECRET")
 
 # -------- Trading Parameter --------
-ORDER_SIZE_USDT = 10
-ORDER_LEVERAGE = 5
-TP_PERCENT = 2.0
-SL_PERCENT = 100.0
+ORDER_SIZE_USDT = float(os.getenv("ORDER_SIZE_USDT", 10))
+ORDER_LEVERAGE = int(os.getenv("ORDER_LEVERAGE", 5))
+TP_PERCENT = float(os.getenv("TP_PERCENT", 2.0))
+SL_PERCENT = float(os.getenv("SL_PERCENT", 100.0))
 
 BINGX_BASE = "https://open-api.bingx.com"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -77,8 +78,7 @@ async def bingx_place_order(session: aiohttp.ClientSession, symbol: str, side: s
 
     async with session.post(url, data=params, headers=headers, timeout=10) as resp:
         txt = await resp.text()
-        logging.info(f"Market Order Response: {txt}")
-        # Versuche JSON, sonst Rohtext zurückgeben
+        logging.info(f"[BINGX] Market Order Response: {txt}")
         try:
             data = await resp.json()
             return {"status_code": resp.status, "data": data}
@@ -90,24 +90,37 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return {"status": "Server läuft"}
+    return {"status": "Server läuft", "routes": ["/signal (POST)"]}
 
 @app.route("/signal", methods=["POST"])
 def signal():
-    data = request.get_json(silent=True) or {}
+    # JSON versuchen
+    data = request.get_json(silent=True)
+    if not data or data == {}:
+        # Fallback: Form-Data
+        if request.form:
+            data = request.form.to_dict()
+        else:
+            # Fallback: Query-Params
+            data = request.args.to_dict()
+
     logging.info(f"[WEBHOOK] Signal empfangen: {data}")
 
-    symbol = norm_symbol(data.get("symbol", "BTC-USDT"))
-    side = data.get("side", "SELL").upper()
-    size = float(data.get("size", ORDER_SIZE_USDT))
-    lev = int(data.get("leverage", ORDER_LEVERAGE))
+    try:
+        symbol = norm_symbol(str(data.get("symbol", "BTC-USDT")))
+        side = str(data.get("side", "SELL")).upper()
+        size = float(data.get("size", ORDER_SIZE_USDT))
+        lev = int(data.get("leverage", ORDER_LEVERAGE))
+    except Exception as e:
+        logging.error(f"[WEBHOOK] Payload parse error: {e}")
+        return jsonify({"status": "error", "message": f"Payload parse error: {e}", "received": data}), 400
 
     try:
         result = asyncio.run(_handle_signal(symbol, side, size, lev))
-        return jsonify({"status": "ok", "bingx_result": result}), 200
+        return jsonify({"status": "ok", "received": {"symbol": symbol, "side": side, "size": size, "leverage": lev}, "bingx_result": result}), 200
     except Exception as e:
-        logging.error(f"Order Fehler: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 400
+        logging.error(f"[WEBHOOK] Order Fehler: {e}")
+        return jsonify({"status": "error", "message": str(e), "received": {"symbol": symbol, "side": side, "size": size, "leverage": lev}}), 400
 
 async def _handle_signal(symbol, side, size, lev):
     async with aiohttp.ClientSession() as session:
