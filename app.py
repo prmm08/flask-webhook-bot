@@ -37,7 +37,7 @@ def test_order():
 
         symbol = str(data.get("symbol", "BTC-USDT")).upper()
         side = str(data.get("side", "SELL")).upper()
-        size = float(data.get("size", 10))       # USDT Notional
+        size = float(data.get("size", 35))       # USDT Notional (mindestens 31 für ETH)
         leverage = int(data.get("leverage", 1))  # kleiner Hebel zum Testen
         tp_percent = float(data.get("tp_percent", 2.0))
         sl_percent = float(data.get("sl_percent", 1.0))
@@ -51,6 +51,7 @@ def test_order():
 
         headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
         url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
+        url_conditional = f"{BINGX_BASE}/openApi/swap/v2/trade/order/conditional"
 
         # Entry Market Order
         entry_params = {
@@ -87,7 +88,7 @@ def test_order():
             "type": "TAKE_PROFIT_MARKET"
         }
         tp_params["signature"] = sign_params(tp_params)
-        tp_resp = requests.post(url_order, data=tp_params, headers=headers, timeout=10)
+        tp_resp = requests.post(url_conditional, data=tp_params, headers=headers, timeout=10)
 
         # SL Conditional Order
         sl_params = {
@@ -99,7 +100,7 @@ def test_order():
             "type": "STOP_MARKET"
         }
         sl_params["signature"] = sign_params(sl_params)
-        sl_resp = requests.post(url_order, data=sl_params, headers=headers, timeout=10)
+        sl_resp = requests.post(url_conditional, data=sl_params, headers=headers, timeout=10)
 
         return jsonify({
             "status": "ok",
