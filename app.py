@@ -6,7 +6,7 @@ import requests
 import os
 from flask import Flask, request, jsonify
 
-# -------- API Keys (aus deinem Testskript) --------
+# -------- API Keys --------
 API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
 API_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
 
@@ -58,9 +58,14 @@ def bingx_place_order(symbol: str, side: str, notional_usdt: float, leverage: in
     resp = requests.post(url_order, data=params, headers=headers, timeout=10)
     logging.info(f"[BINGX] Response: {resp.status_code} {resp.text}")
     try:
-        return {"status_code": resp.status_code, "json": resp.json(), "raw": resp.text}
+        return {
+            "status_code": resp.status_code,
+            "json": resp.json(),
+            "raw": resp.text,
+            "final_payload": params   # <-- zeigt die finale Payload
+        }
     except Exception:
-        return {"status_code": resp.status_code, "raw": resp.text}
+        return {"status_code": resp.status_code, "raw": resp.text, "final_payload": params}
 
 # -------- Flask Webhook --------
 app = Flask(__name__)
@@ -92,14 +97,15 @@ def signal():
         result = bingx_place_order(symbol, side, size, lev)
         return jsonify({
             "status": "ok",
-            "received": {"symbol": symbol, "side": side, "size": size, "leverage": lev},
-            "bingx_result": result   # <-- komplette BingX Antwort zurückgeben
+            "received_signal": {"symbol": symbol, "side": side, "size": size, "leverage": lev},
+            "bingx_payload": result.get("final_payload"),   # <-- zeigt die gesendete Payload
+            "bingx_result": result                          # <-- zeigt die Antwort von BingX
         }), 200
     except Exception as e:
         return jsonify({
             "status": "error",
             "message": str(e),
-            "received": {"symbol": symbol, "side": side, "size": size, "leverage": lev}
+            "received_signal": {"symbol": symbol, "side": side, "size": size, "leverage": lev}
         }), 400
 
 if __name__ == "__main__":
