@@ -68,17 +68,21 @@ def monitor_position(symbol, position_side, entry_price, tp_price, sl_price, int
 
         time.sleep(interval)
 
-@app.route("/testorder", methods=["POST"])
-def test_order():
+@app.route("/alert", methods=["POST"])
+def handle_alert():
     try:
         data = request.get_json(force=True)
 
-        symbol = str(data.get("symbol", "BTC-USDT")).upper()
-        side = str(data.get("side", "SELL")).upper()
-        size = float(data.get("size", 20))       # USDT Notional
-        leverage = int(data.get("leverage", 20))
-        tp_percent = float(data.get("tp_percent", 2.0))
-        sl_percent = float(data.get("sl_percent", 1.0))
+        # Wichtige Felder aus dem Alert
+        currency = str(data.get("currency", "")).upper()
+        symbol = f"{currency}-USDT"   # BingX Symbol Standard
+
+        # Default Parameter für SELL Order
+        side = "SELL"
+        size = 20          # USDT Notional
+        leverage = 10
+        tp_percent = 2.0   # Take Profit %
+        sl_percent = 1.0   # Stop Loss %
 
         # Preis holen
         price = get_price(symbol)
@@ -90,7 +94,7 @@ def test_order():
         # Entry Market Order
         entry_params = {
             "leverage": str(leverage),
-            "positionSide": "SHORT" if side == "SELL" else "LONG",
+            "positionSide": "SHORT",
             "quantity": str(qty),
             "side": side,
             "symbol": symbol,
@@ -101,31 +105,20 @@ def test_order():
         entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
 
         # TP/SL Preise berechnen
-        if side == "BUY":
-            tp_price = round(price * (1 + tp_percent / 100), 2)
-            sl_price = round(price * (1 - sl_percent / 100), 2)
-            position_side = "LONG"
-        else:  # SELL
-            tp_price = round(price * (1 - tp_percent / 100), 2)
-            sl_price = round(price * (1 + sl_percent / 100), 2)
-            position_side = "SHORT"
+        tp_price = round(price * (1 - tp_percent / 100), 2)
+        sl_price = round(price * (1 + sl_percent / 100), 2)
 
         # Hintergrundthread starten
         threading.Thread(
             target=monitor_position,
-            args=(symbol, position_side, price, tp_price, sl_price)
+            args=(symbol, "SHORT", price, tp_price, sl_price)
         ).start()
 
         return jsonify({
             "status": "ok",
-            "received_signal": {
-                "symbol": symbol,
-                "side": side,
-                "size": size,
-                "leverage": leverage,
-                "tp_percent": tp_percent,
-                "sl_percent": sl_percent
-            },
+            "alert_received": data,
+            "symbol": symbol,
+            "side": side,
             "entry_price": price,
             "tp_price": tp_price,
             "sl_price": sl_price,
