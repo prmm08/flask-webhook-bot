@@ -1,22 +1,20 @@
-import os
 import time
 import hmac
 import hashlib
 import asyncio
 import logging
-import json
 import aiohttp
 from flask import Flask, request, jsonify
 
-# -------- API Keys aus Environment Variablen --------
+# -------- API Keys direkt im Code --------
 API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
 API_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
 
 # -------- Trading Parameter --------
-ORDER_SIZE_USDT = float(os.getenv("ORDER_SIZE_USDT", 10))
-ORDER_LEVERAGE = int(os.getenv("ORDER_LEVERAGE", 5))
-TP_PERCENT = float(os.getenv("TP_PERCENT", 2.0))
-SL_PERCENT = float(os.getenv("SL_PERCENT", 100.0))
+ORDER_SIZE_USDT = 10
+ORDER_LEVERAGE = 5
+TP_PERCENT = 2.0
+SL_PERCENT = 100.0
 
 BINGX_BASE = "https://open-api.bingx.com"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -49,7 +47,7 @@ async def bingx_place_order(session: aiohttp.ClientSession, symbol: str, side: s
                             notional_usdt: float, leverage: int,
                             tp_percent: float = None, sl_percent: float = None):
     if not API_KEY or not API_SECRET:
-        raise RuntimeError("BINGX_API_KEY/BINGX_SECRET fehlen in Environment Variables")
+        raise RuntimeError("API Keys fehlen im Code!")
 
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
     price = await bingx_get_price(session, symbol)
@@ -94,14 +92,11 @@ def home():
 
 @app.route("/signal", methods=["POST"])
 def signal():
-    # JSON versuchen
     data = request.get_json(silent=True)
     if not data or data == {}:
-        # Fallback: Form-Data
         if request.form:
             data = request.form.to_dict()
         else:
-            # Fallback: Query-Params
             data = request.args.to_dict()
 
     logging.info(f"[WEBHOOK] Signal empfangen: {data}")
