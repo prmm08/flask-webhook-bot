@@ -92,11 +92,14 @@ def home():
 
 @app.route("/signal", methods=["POST"])
 def signal():
+    # JSON versuchen
     data = request.get_json(silent=True)
     if not data or data == {}:
+        # Fallback: Form-Data
         if request.form:
             data = request.form.to_dict()
         else:
+            # Fallback: Query-Params
             data = request.args.to_dict()
 
     logging.info(f"[WEBHOOK] Signal empfangen: {data}")
