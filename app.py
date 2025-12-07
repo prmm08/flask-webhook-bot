@@ -1,3 +1,4 @@
+import os
 import time
 import hmac
 import hashlib
@@ -6,17 +7,17 @@ import logging
 import aiohttp
 from flask import Flask, request
 
-# -------- Deine festen Daten --------
-BINGX_API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
-BINGX_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
+# -------- API Keys aus Environment Variablen --------
+API_KEY = os.getenv("BINGX_API_KEY")
+API_SECRET = os.getenv("BINGX_SECRET")
 
 # -------- Trading Parameter --------
-ORDER_SIZE_USDT = 10       # feste Ordergröße
-ORDER_LEVERAGE = 10        # fester Leverage
-TP_PERCENT = 2.0           # Take Profit in Prozent
-SL_PERCENT = 100.0         # Stop Loss in Prozent
+ORDER_SIZE_USDT = 10        # feste Ordergröße
+ORDER_LEVERAGE = 5          # fester Leverage
+TP_PERCENT = 2.0            # Take Profit in %
+SL_PERCENT = 100.0          # Stop Loss in %
 
-BINGX_BASE = "https://api-swap-rest.bingx.com"
+BINGX_BASE = "https://open-api.bingx.com"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 # -------- Utils --------
@@ -28,7 +29,7 @@ def sign_query(query_str: str, secret: str):
 
 # -------- BingX API --------
 async def bingx_get_price(session: aiohttp.ClientSession, symbol: str) -> float | None:
-    url = f"{BINGX_BASE}/api/v1/market/getLatestPrice"
+    url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
     params = {"symbol": symbol}
     async with session.get(url, params=params, timeout=10) as r:
         if r.status != 200:
@@ -42,7 +43,7 @@ async def bingx_get_price(session: aiohttp.ClientSession, symbol: str) -> float 
 async def bingx_place_order(session: aiohttp.ClientSession, symbol: str, side: str,
                             notional_usdt: float, leverage: int,
                             tp_percent: float = None, sl_percent: float = None):
-    url = f"{BINGX_BASE}/api/v1/order"
+    url = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
     price = await bingx_get_price(session, symbol)
     if not price or price <= 0:
         raise RuntimeError("Preis nicht verfügbar")
@@ -57,22 +58,22 @@ async def bingx_place_order(session: aiohttp.ClientSession, symbol: str, side: s
         "side": side,
         "type": "MARKET",
         "positionSide": "SHORT" if side == "SELL" else "LONG",
-        "quantity": qty,
-        "reduceOnly": "false",
+        "quantity": str(qty),
         "leverage": str(leverage),
-        "timestamp": str(ts_ms()),
+        "timestamp": str(ts_ms())
     }
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    signature = sign_query(query, BINGX_SECRET)
-    headers = {"X-BX-APIKEY": BINGX_API_KEY, "Content-Type": "application/json"}
-    payload = {**params, "signature": signature}
 
-    async with session.post(url, headers=headers, json=payload, timeout=10) as resp:
+    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    signature = sign_query(query, API_SECRET)
+    params["signature"] = signature
+
+    headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+
+    async with session.post(url, data=params, headers=headers, timeout=10) as resp:
         txt = await resp.text()
         logging.info(f"Market Order Response: {txt}")
 
-    # TP / SL Orders analog wie in deinem alten Code
-    # ...
+    # TP / SL Orders kannst du analog hinzufügen (wie im Testskript)
 
 # -------- Flask Webhook --------
 app = Flask(__name__)
