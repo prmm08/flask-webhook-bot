@@ -35,7 +35,7 @@ def get_positions():
     return resp.json()
 
 def close_position(symbol, side, qty):
-    """Send Market Order in opposite direction to close"""
+    """Schließt Position per Market Order in Gegenrichtung"""
     url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
     headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
 
@@ -52,22 +52,22 @@ def close_position(symbol, side, qty):
     print("Close response:", resp.json())
     return resp.json()
 
-def monitor_position(symbol, side, qty, entry_price, tp_price, sl_price, interval=5):
-    """Background loop to monitor price and close position"""
-    print(f"Monitoring {symbol} position... TP={tp_price}, SL={sl_price}")
+def monitor_position(symbol, position_side, qty, entry_price, tp_price, sl_price, interval=5):
+    """Überwacht Preis und schließt Position bei TP oder SL"""
+    print(f"Monitoring {symbol} {position_side}... TP={tp_price}, SL={sl_price}")
     while True:
         current = get_price(symbol)
         print("Current price:", current)
 
-        if side == "BUY":
+        if position_side == "LONG":
             if current >= tp_price or current <= sl_price:
-                print("Target reached, closing BUY position")
-                close_position(symbol, side, qty)
+                print("Target reached, closing LONG position")
+                close_position(symbol, "BUY", qty)
                 break
-        else:  # SELL
+        elif position_side == "SHORT":
             if current <= tp_price or current >= sl_price:
-                print("Target reached, closing SELL position")
-                close_position(symbol, side, qty)
+                print("Target reached, closing SHORT position")
+                close_position(symbol, "SELL", qty)
                 break
 
         time.sleep(interval)
@@ -108,12 +108,17 @@ def test_order():
         if side == "BUY":
             tp_price = round(price * (1 + tp_percent / 100), 2)
             sl_price = round(price * (1 - sl_percent / 100), 2)
+            position_side = "LONG"
         else:  # SELL
             tp_price = round(price * (1 - tp_percent / 100), 2)
             sl_price = round(price * (1 + sl_percent / 100), 2)
+            position_side = "SHORT"
 
         # Hintergrundthread starten
-        threading.Thread(target=monitor_position, args=(symbol, side, qty, price, tp_price, sl_price)).start()
+        threading.Thread(
+            target=monitor_position,
+            args=(symbol, position_side, qty, price, tp_price, sl_price)
+        ).start()
 
         return jsonify({
             "status": "ok",
