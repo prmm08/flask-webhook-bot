@@ -23,6 +23,17 @@ def get_price(symbol="BTC-USDT"):
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
     return float(r.json()["data"]["price"])
 
+def get_positions():
+    """Fragt aktive Positionen ab"""
+    url = f"{BINGX_BASE}/openApi/swap/v2/user/positions"
+    headers = {"X-BX-APIKEY": API_KEY}
+    params = {
+        "timestamp": str(int(time.time() * 1000))
+    }
+    params["signature"] = sign_params(params)
+    resp = requests.get(url, params=params, headers=headers, timeout=10)
+    return resp.json()
+
 def close_position(symbol, side, qty):
     """Send Market Order in opposite direction to close"""
     url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
@@ -117,7 +128,8 @@ def test_order():
             "entry_price": price,
             "tp_price": tp_price,
             "sl_price": sl_price,
-            "entry_response": entry_resp.json()
+            "entry_response": entry_resp.json(),
+            "positions_response": get_positions()
         }), 200
 
     except Exception as e:
