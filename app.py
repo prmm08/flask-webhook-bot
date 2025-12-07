@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import logging
 import requests
+import os
 from flask import Flask, request, jsonify
 
 # -------- API Keys (aus deinem Testskript) --------
@@ -55,7 +56,11 @@ def bingx_place_order(symbol: str, side: str, notional_usdt: float, leverage: in
     headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
 
     resp = requests.post(url_order, data=params, headers=headers, timeout=10)
-    return {"status_code": resp.status_code, "raw": resp.text, "json": resp.json() if resp.text else None}
+    logging.info(f"[BINGX] Response: {resp.status_code} {resp.text}")
+    try:
+        return {"status_code": resp.status_code, "json": resp.json(), "raw": resp.text}
+    except Exception:
+        return {"status_code": resp.status_code, "raw": resp.text}
 
 # -------- Flask Webhook --------
 app = Flask(__name__)
@@ -88,7 +93,7 @@ def signal():
         return jsonify({
             "status": "ok",
             "received": {"symbol": symbol, "side": side, "size": size, "leverage": lev},
-            "bingx_result": result
+            "bingx_result": result   # <-- komplette BingX Antwort zurückgeben
         }), 200
     except Exception as e:
         return jsonify({
@@ -98,7 +103,5 @@ def signal():
         }), 400
 
 if __name__ == "__main__":
-    # Render setzt automatisch $PORT, deshalb:
-    import os
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5000))  # Render setzt $PORT automatisch
     app.run(host="0.0.0.0", port=port)
