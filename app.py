@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import requests
 import os
+import urllib.parse
 from flask import Flask, request, jsonify
 
 # -------- API Keys --------
@@ -14,7 +15,8 @@ BINGX_BASE = "https://open-api.bingx.com"
 app = Flask(__name__)
 
 def sign_params(params):
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    # URL-encode + alphabetisch sortieren
+    query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 @app.route("/", methods=["GET"])
@@ -36,7 +38,7 @@ def test_order():
         symbol = str(data.get("symbol", "BTC-USDT")).upper()
         side = str(data.get("side", "SELL")).upper()
         size = float(data.get("size", 10))       # USDT Notional
-        leverage = int(data.get("leverage", 5))
+        leverage = int(data.get("leverage", 1))  # kleiner Hebel zum Testen
         tp_percent = float(data.get("tp_percent", 2.0))
         sl_percent = float(data.get("sl_percent", 1.0))
 
