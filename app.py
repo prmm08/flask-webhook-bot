@@ -5,15 +5,15 @@ import requests
 import os
 from flask import Flask, request, jsonify
 
-API_KEY = "DEIN_API_KEY"
-API_SECRET = "DEIN_API_SECRET"
+API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
+API_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
 BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return {"status": "Server läuft", "routes": ["/ping (GET)", "/webhook (POST)"]}
+    return {"status": "Server läuft", "routes": ["/ping (GET)", "/testorder (POST)"]}
 
 @app.route("/ping", methods=["GET"])
 def ping_bingx():
@@ -21,8 +21,9 @@ def ping_bingx():
     resp = requests.get(url, params={"symbol": "BTC-USDT"}, timeout=10)
     return jsonify({"status": "ok", "bingx_response": resp.json()}), 200
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
+# -------- Haupt-Route für Alerts --------
+@app.route("/testorder", methods=["POST"])
+def test_order():
     try:
         data = request.get_json(force=True)
 
