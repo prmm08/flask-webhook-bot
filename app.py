@@ -13,7 +13,6 @@ def home():
 @app.route("/ping", methods=["GET"])
 def ping_bingx():
     try:
-        # einfacher Test: Preis für BTC-USDT abfragen
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
         resp = requests.get(url, params={"symbol": "BTC-USDT"}, timeout=10)
         return jsonify({
