@@ -1,6 +1,13 @@
+import time
+import hmac
+import hashlib
 import requests
 import os
 from flask import Flask, jsonify
+
+# -------- API Keys --------
+API_KEY = "DEIN_API_KEY"
+API_SECRET = "DEIN_API_SECRET"
 
 BINGX_BASE = "https://open-api.bingx.com"
 
@@ -8,8 +15,9 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return {"status": "Server läuft", "routes": ["/ping (GET)"]}
+    return {"status": "Server läuft", "routes": ["/ping (GET)", "/testorder (GET)"]}
 
+# -------- Verbindungstest --------
 @app.route("/ping", methods=["GET"])
 def ping_bingx():
     try:
@@ -23,23 +31,21 @@ def ping_bingx():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # Render setzt $PORT automatisch
-    app.run(host="0.0.0.0", port=port)
-    
-    @app.route("/testorder", methods=["GET"])
+# -------- Testorder --------
+@app.route("/testorder", methods=["GET"])
 def test_order():
     try:
         url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
         params = {
             "leverage": "5",
-            "positionSide": "SHORT",
-            "quantity": "0.0001",
+            "positionSide": "SHORT",   # SELL → SHORT
+            "quantity": "0.0001",      # Mini-Menge zum Testen
             "side": "SELL",
             "symbol": "BTC-USDT",
             "timestamp": str(int(time.time() * 1000)),
             "type": "MARKET"
         }
+        # Signatur erstellen
         query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
         params["signature"] = signature
@@ -56,3 +62,6 @@ def test_order():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
 
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))  # Render setzt $PORT automatisch
+    app.run(host="0.0.0.0", port=port)
