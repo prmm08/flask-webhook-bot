@@ -5,38 +5,29 @@ import requests
 import os
 from flask import Flask, request, jsonify
 
-API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
-API_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
+API_KEY = "DEIN_API_KEY"
+API_SECRET = "DEIN_API_SECRET"
 BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
 
-@app.route("/", methods=["GET"])
-def home():
-    return {"status": "Server läuft", "routes": ["/ping (GET)", "/testorder (POST)"]}
+def sign_params(params):
+    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-@app.route("/ping", methods=["GET"])
-def ping_bingx():
-    url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
-    resp = requests.get(url, params={"symbol": "BTC-USDT"}, timeout=10)
-    return jsonify({"status": "ok", "bingx_response": resp.json()}), 200
-
-# -------- Haupt-Route für Alerts --------
 @app.route("/testorder", methods=["POST"])
 def test_order():
     try:
         data = request.get_json(force=True)
 
-        # Currency aus dem Alert
+        # Basisparameter
         currency = str(data.get("currency", "BTC")).upper()
         symbol = f"{currency}-USDT"
-
-        # Trading Parameter im gewünschten Format
+        side = str(data.get("side", "BUY")).upper()
         ORDER_SIZE_USDT = float(data.get("ORDER_SIZE_USDT", 10))
-        ORDER_LEVERAGE = int(data.get("ORDER_LEVERAGE", 5))
+        ORDER_LEVERAGE = int(data.get("ORDER_LEVERAGE", 10))
         TP_PERCENT = float(data.get("TP_PERCENT", 2.0))
         SL_PERCENT = float(data.get("SL_PERCENT", 100.0))
-        side = str(data.get("side", "BUY")).upper()
 
         # Preis holen
         url_price = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
@@ -44,9 +35,9 @@ def test_order():
         price = float(r.json()["data"]["price"])
         qty = round(ORDER_SIZE_USDT / price, 6)
 
-        # Order vorbereiten
+        # Hauptorder (Market)
         url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
-        params = {
+        main_params = {
             "leverage": str(ORDER_LEVERAGE),
             "positionSide": "LONG" if side == "BUY" else "SHORT",
             "quantity": str(qty),
@@ -55,26 +46,59 @@ def test_order():
             "timestamp": str(int(time.time() * 1000)),
             "type": "MARKET"
         }
-
-        # Signatur
-        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-        params["signature"] = signature
-
+        main_params["signature"] = sign_params(main_params)
         headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
-        resp = requests.post(url_order, data=params, headers=headers, timeout=10)
+        main_resp = requests.post(url_order, data=main_params, headers=headers, timeout=10)
+
+        # TP/SL Preise berechnen
+        if side == "BUY":
+            tp_price = round(price * (1 + TP_PERCENT / 100), 2)
+            sl_price = round(price * (1 - SL_PERCENT / 100), 2)
+        else:  # SELL/SHORT
+            tp_price = round(price * (1 - TP_PERCENT / 100), 2)
+            sl_price = round(price * (1 + SL_PERCENT / 100), 2)
+
+        # TP Order
+        url_stop = f"{BINGX_BASE}/openApi/swap/v2/trade/stopOrder"
+        tp_params = {
+            "symbol": symbol,
+            "side": "SELL" if side == "BUY" else "BUY",
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": str(tp_price),
+            "quantity": str(qty),
+            "timestamp": str(int(time.time() * 1000))
+        }
+        tp_params["signature"] = sign_params(tp_params)
+        tp_resp = requests.post(url_stop, data=tp_params, headers=headers, timeout=10)
+
+        # SL Order
+        sl_params = {
+            "symbol": symbol,
+            "side": "SELL" if side == "BUY" else "BUY",
+            "type": "STOP_MARKET",
+            "stopPrice": str(sl_price),
+            "quantity": str(qty),
+            "timestamp": str(int(time.time() * 1000))
+        }
+        sl_params["signature"] = sign_params(sl_params)
+        sl_resp = requests.post(url_stop, data=sl_params, headers=headers, timeout=10)
 
         return jsonify({
             "status": "ok",
-            "received_currency": currency,
+            "currency": currency,
+            "side": side,
+            "entry_price": price,
             "ORDER_SIZE_USDT": ORDER_SIZE_USDT,
             "ORDER_LEVERAGE": ORDER_LEVERAGE,
             "TP_PERCENT": TP_PERCENT,
             "SL_PERCENT": SL_PERCENT,
-            "side": side,
-            "bingx_payload": params,
-            "bingx_response": resp.json()
+            "tp_price": tp_price,
+            "sl_price": sl_price,
+            "main_order_response": main_resp.json(),
+            "tp_order_response": tp_resp.json(),
+            "sl_order_response": sl_resp.json()
         }), 200
+
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
 
