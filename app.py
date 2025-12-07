@@ -35,20 +35,23 @@ def test_order():
         price = float(r.json()["data"]["price"])
         qty = round(ORDER_SIZE_USDT / price, 6)
 
-        # Hauptorder (Market)
+        headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+
+        # Entry Limit Order
         url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
-        main_params = {
+        entry_params = {
             "leverage": str(ORDER_LEVERAGE),
             "positionSide": "LONG" if side == "BUY" else "SHORT",
             "quantity": str(qty),
             "side": side,
             "symbol": symbol,
+            "price": str(price),
             "timestamp": str(int(time.time() * 1000)),
-            "type": "MARKET"
+            "type": "LIMIT",
+            "timeInForce": "GTC"
         }
-        main_params["signature"] = sign_params(main_params)
-        headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
-        main_resp = requests.post(url_order, data=main_params, headers=headers, timeout=10)
+        entry_params["signature"] = sign_params(entry_params)
+        entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
 
         # TP/SL Preise berechnen
         if side == "BUY":
@@ -62,30 +65,31 @@ def test_order():
             tp_side = "BUY"
             sl_side = "BUY"
 
-        # Conditional Orders für TP/SL
-        url_cond = f"{BINGX_BASE}/openApi/swap/v2/trade/order/conditional"
-
+        # TP Limit Order
         tp_params = {
             "symbol": symbol,
             "side": tp_side,
-            "type": "TAKE_PROFIT_MARKET",
-            "triggerPrice": str(tp_price),
             "quantity": str(qty),
-            "timestamp": str(int(time.time() * 1000))
+            "price": str(tp_price),
+            "timestamp": str(int(time.time() * 1000)),
+            "type": "LIMIT",
+            "timeInForce": "GTC"
         }
         tp_params["signature"] = sign_params(tp_params)
-        tp_resp = requests.post(url_cond, data=tp_params, headers=headers, timeout=10)
+        tp_resp = requests.post(url_order, data=tp_params, headers=headers, timeout=10)
 
+        # SL Limit Order
         sl_params = {
             "symbol": symbol,
             "side": sl_side,
-            "type": "STOP_MARKET",
-            "triggerPrice": str(sl_price),
             "quantity": str(qty),
-            "timestamp": str(int(time.time() * 1000))
+            "price": str(sl_price),
+            "timestamp": str(int(time.time() * 1000)),
+            "type": "LIMIT",
+            "timeInForce": "GTC"
         }
         sl_params["signature"] = sign_params(sl_params)
-        sl_resp = requests.post(url_cond, data=sl_params, headers=headers, timeout=10)
+        sl_resp = requests.post(url_order, data=sl_params, headers=headers, timeout=10)
 
         return jsonify({
             "status": "ok",
@@ -98,7 +102,7 @@ def test_order():
             "SL_PERCENT": SL_PERCENT,
             "tp_price": tp_price,
             "sl_price": sl_price,
-            "main_order_response": main_resp.json(),
+            "entry_order_response": entry_resp.json(),
             "tp_order_response": tp_resp.json(),
             "sl_order_response": sl_resp.json()
         }), 200
