@@ -34,25 +34,21 @@ def get_positions():
     resp = requests.get(url, params=params, headers=headers, timeout=10)
     return resp.json()
 
-def close_position(symbol, side, qty):
-    """Schließt Position per Market Order in Gegenrichtung"""
-    url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
+def close_all_positions(symbol):
+    """Schließt alle offenen Positionen für ein Symbol"""
+    url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions"
     headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
 
-    close_side = "SELL" if side == "BUY" else "BUY"
     params = {
         "symbol": symbol,
-        "side": close_side,
-        "quantity": str(qty),
-        "type": "MARKET",
         "timestamp": str(int(time.time() * 1000))
     }
     params["signature"] = sign_params(params)
-    resp = requests.post(url_order, data=params, headers=headers, timeout=10)
-    print("Close response:", resp.json())
+    resp = requests.post(url, data=params, headers=headers, timeout=10)
+    print("CloseAll response:", resp.json())
     return resp.json()
 
-def monitor_position(symbol, position_side, qty, entry_price, tp_price, sl_price, interval=5):
+def monitor_position(symbol, position_side, entry_price, tp_price, sl_price, interval=5):
     """Überwacht Preis und schließt Position bei TP oder SL"""
     print(f"Monitoring {symbol} {position_side}... TP={tp_price}, SL={sl_price}")
     while True:
@@ -62,12 +58,12 @@ def monitor_position(symbol, position_side, qty, entry_price, tp_price, sl_price
         if position_side == "LONG":
             if current >= tp_price or current <= sl_price:
                 print("Target reached, closing LONG position")
-                close_position(symbol, "BUY", qty)
+                close_all_positions(symbol)
                 break
         elif position_side == "SHORT":
             if current <= tp_price or current >= sl_price:
                 print("Target reached, closing SHORT position")
-                close_position(symbol, "SELL", qty)
+                close_all_positions(symbol)
                 break
 
         time.sleep(interval)
@@ -117,7 +113,7 @@ def test_order():
         # Hintergrundthread starten
         threading.Thread(
             target=monitor_position,
-            args=(symbol, position_side, qty, price, tp_price, sl_price)
+            args=(symbol, position_side, price, tp_price, sl_price)
         ).start()
 
         return jsonify({
