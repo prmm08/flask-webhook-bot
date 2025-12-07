@@ -7,8 +7,8 @@ import aiohttp
 from flask import Flask, request, jsonify
 
 # -------- API Keys direkt im Code --------
-API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
-API_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
+API_KEY = "DEIN_API_KEY"
+API_SECRET = "DEIN_API_SECRET"
 
 # -------- Trading Parameter --------
 ORDER_SIZE_USDT = 10
@@ -118,7 +118,7 @@ def signal():
         return jsonify({
             "status": "ok",
             "received": {"symbol": symbol, "side": side, "size": size, "leverage": lev},
-            "bingx_result": result
+            "bingx_result": result   # <-- komplette BingX Antwort zurückgeben
         }), 200
     except Exception as e:
         logging.error(f"[WEBHOOK] Order Fehler: {e}")
