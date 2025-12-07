@@ -2,12 +2,12 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-# Root-Endpoint für Health-Check
+# Test-Endpoint für GET-Anfragen
 @app.route("/", methods=["GET"])
 def home():
     return {"status": "Server läuft"}
 
-# Signal-Endpoint für POST
+# Dein Signal-Endpoint für POST-Anfragen
 @app.route("/signal", methods=["POST"])
 def signal():
     data = request.json
