@@ -1,14 +1,13 @@
 import time
 import hmac
 import hashlib
-import asyncio
 import logging
-import aiohttp
+import requests
 from flask import Flask, request, jsonify
 
-# -------- API Keys direkt im Code (aus deinem Testskript) --------
-API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
-API_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
+# -------- API Keys direkt im Code --------
+API_KEY = "DEIN_API_KEY"
+API_SECRET = "DEIN_API_SECRET"
 
 # -------- Trading Parameter --------
 ORDER_SIZE_USDT = 10
@@ -29,41 +28,34 @@ def norm_symbol(sym: str) -> str:
     return s if "-" in s else f"{s}-USDT"
 
 # -------- BingX Order --------
-async def bingx_place_order(symbol: str, side: str, notional_usdt: float, leverage: int):
-    async with aiohttp.ClientSession() as session:
-        # Preis holen
-        url_price = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
-        async with session.get(url_price, params={"symbol": symbol}, timeout=10) as r:
-            data = await r.json()
-            price = float(data["data"]["price"])
+def bingx_place_order(symbol: str, side: str, notional_usdt: float, leverage: int):
+    # Preis holen
+    url_price = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
+    r = requests.get(url_price, params={"symbol": symbol}, timeout=10)
+    price = float(r.json()["data"]["price"])
 
-        qty = round((notional_usdt / price), 6)
+    qty = round((notional_usdt / price), 6)
 
-        url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
-        params = {
-            "leverage": str(leverage),
-            "positionSide": "SHORT" if side.upper() == "SELL" else "LONG",
-            "quantity": str(qty),
-            "side": side.upper(),
-            "symbol": symbol,
-            "timestamp": str(ts_ms()),
-            "type": "MARKET"
-        }
+    url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
+    params = {
+        "leverage": str(leverage),
+        "positionSide": "SHORT" if side.upper() == "SELL" else "LONG",
+        "quantity": str(qty),
+        "side": side.upper(),
+        "symbol": symbol,
+        "timestamp": str(ts_ms()),
+        "type": "MARKET"
+    }
 
-        # Alphabetisch sortieren
-        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        signature = sign_query(query, API_SECRET)
-        params["signature"] = signature
+    # Alphabetisch sortieren
+    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    signature = sign_query(query, API_SECRET)
+    params["signature"] = signature
 
-        headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+    headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
 
-        async with session.post(url_order, data=params, headers=headers, timeout=10) as resp:
-            txt = await resp.text()
-            try:
-                data = await resp.json()
-                return {"status_code": resp.status, "data": data, "raw": txt}
-            except Exception:
-                return {"status_code": resp.status, "raw": txt}
+    resp = requests.post(url_order, data=params, headers=headers, timeout=10)
+    return {"status_code": resp.status_code, "raw": resp.text, "json": resp.json() if resp.text else None}
 
 # -------- Flask Webhook --------
 app = Flask(__name__)
@@ -92,7 +84,7 @@ def signal():
         return jsonify({"status": "error", "message": f"Payload parse error: {e}", "received": data}), 400
 
     try:
-        result = asyncio.run(bingx_place_order(symbol, side, size, lev))
+        result = bingx_place_order(symbol, side, size, lev)
         return jsonify({
             "status": "ok",
             "received": {"symbol": symbol, "side": side, "size": size, "leverage": lev},
