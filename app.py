@@ -5,8 +5,8 @@ import requests
 import os
 from flask import Flask, request, jsonify
 
-API_KEY = "DEIN_API_KEY"
-API_SECRET = "DEIN_API_SECRET"
+API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
+API_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
 BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
