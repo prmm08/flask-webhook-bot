@@ -4,32 +4,63 @@ import hashlib
 import requests
 import os
 import urllib.parse
+import threading
 from flask import Flask, request, jsonify
 
 # -------- API Keys --------
 API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
 API_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
-
 BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
 
 def sign_params(params):
-    # URL-encode + alphabetisch sortieren
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-@app.route("/", methods=["GET"])
-def home():
-    return {"status": "Server läuft", "routes": ["/ping (GET)", "/testorder (POST)"]}
-
-@app.route("/ping", methods=["GET"])
-def ping_bingx():
+def get_price(symbol="BTC-USDT"):
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
-    resp = requests.get(url, params={"symbol": "BTC-USDT"}, timeout=10)
-    return jsonify({"status": "ok", "bingx_response": resp.json()}), 200
+    r = requests.get(url, params={"symbol": symbol}, timeout=10)
+    return float(r.json()["data"]["price"])
 
-# -------- Flexible Testorder mit TP/SL --------
+def close_position(symbol, side, qty):
+    """Send Market Order in opposite direction to close"""
+    url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
+    headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+
+    close_side = "SELL" if side == "BUY" else "BUY"
+    params = {
+        "symbol": symbol,
+        "side": close_side,
+        "quantity": str(qty),
+        "type": "MARKET",
+        "timestamp": str(int(time.time() * 1000))
+    }
+    params["signature"] = sign_params(params)
+    resp = requests.post(url_order, data=params, headers=headers, timeout=10)
+    print("Close response:", resp.json())
+    return resp.json()
+
+def monitor_position(symbol, side, qty, entry_price, tp_price, sl_price, interval=5):
+    """Background loop to monitor price and close position"""
+    print(f"Monitoring {symbol} position... TP={tp_price}, SL={sl_price}")
+    while True:
+        current = get_price(symbol)
+        print("Current price:", current)
+
+        if side == "BUY":
+            if current >= tp_price or current <= sl_price:
+                print("Target reached, closing BUY position")
+                close_position(symbol, side, qty)
+                break
+        else:  # SELL
+            if current <= tp_price or current >= sl_price:
+                print("Target reached, closing SELL position")
+                close_position(symbol, side, qty)
+                break
+
+        time.sleep(interval)
+
 @app.route("/testorder", methods=["POST"])
 def test_order():
     try:
@@ -37,21 +68,17 @@ def test_order():
 
         symbol = str(data.get("symbol", "BTC-USDT")).upper()
         side = str(data.get("side", "SELL")).upper()
-        size = float(data.get("size", 35))       # USDT Notional (mindestens 31 für ETH)
-        leverage = int(data.get("leverage", 1))  # kleiner Hebel zum Testen
+        size = float(data.get("size", 20))       # USDT Notional
+        leverage = int(data.get("leverage", 20))
         tp_percent = float(data.get("tp_percent", 2.0))
         sl_percent = float(data.get("sl_percent", 1.0))
 
         # Preis holen
-        url_price = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
-        r = requests.get(url_price, params={"symbol": symbol}, timeout=10)
-        price = float(r.json()["data"]["price"])
-
+        price = get_price(symbol)
         qty = round(size / price, 6)
 
         headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
         url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
-        url_conditional = f"{BINGX_BASE}/openApi/swap/v2/trade/order/conditional"
 
         # Entry Market Order
         entry_params = {
@@ -70,37 +97,12 @@ def test_order():
         if side == "BUY":
             tp_price = round(price * (1 + tp_percent / 100), 2)
             sl_price = round(price * (1 - sl_percent / 100), 2)
-            tp_side = "SELL"
-            sl_side = "SELL"
         else:  # SELL
             tp_price = round(price * (1 - tp_percent / 100), 2)
             sl_price = round(price * (1 + sl_percent / 100), 2)
-            tp_side = "BUY"
-            sl_side = "BUY"
 
-        # TP Conditional Order
-        tp_params = {
-            "symbol": symbol,
-            "side": tp_side,
-            "quantity": str(qty),
-            "stopPrice": str(tp_price),
-            "timestamp": str(int(time.time() * 1000)),
-            "type": "TAKE_PROFIT_MARKET"
-        }
-        tp_params["signature"] = sign_params(tp_params)
-        tp_resp = requests.post(url_conditional, data=tp_params, headers=headers, timeout=10)
-
-        # SL Conditional Order
-        sl_params = {
-            "symbol": symbol,
-            "side": sl_side,
-            "quantity": str(qty),
-            "stopPrice": str(sl_price),
-            "timestamp": str(int(time.time() * 1000)),
-            "type": "STOP_MARKET"
-        }
-        sl_params["signature"] = sign_params(sl_params)
-        sl_resp = requests.post(url_conditional, data=sl_params, headers=headers, timeout=10)
+        # Hintergrundthread starten
+        threading.Thread(target=monitor_position, args=(symbol, side, qty, price, tp_price, sl_price)).start()
 
         return jsonify({
             "status": "ok",
@@ -115,9 +117,7 @@ def test_order():
             "entry_price": price,
             "tp_price": tp_price,
             "sl_price": sl_price,
-            "entry_response": entry_resp.json(),
-            "tp_response": tp_resp.json(),
-            "sl_response": sl_resp.json()
+            "entry_response": entry_resp.json()
         }), 200
 
     except Exception as e:
