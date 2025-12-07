@@ -5,7 +5,7 @@ import logging
 import requests
 from flask import Flask, request, jsonify
 
-# -------- API Keys direkt im Code --------
+# -------- API Keys (aus deinem Testskript) --------
 API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
 API_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
 
@@ -98,4 +98,7 @@ def signal():
         }), 400
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    # Render setzt automatisch $PORT, deshalb:
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
