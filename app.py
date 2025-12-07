@@ -24,6 +24,7 @@ def get_price(symbol="BTC-USDT"):
     return float(r.json()["data"]["price"])
 
 def get_positions():
+    """Fragt aktive Positionen ab"""
     url = f"{BINGX_BASE}/openApi/swap/v2/user/positions"
     headers = {"X-BX-APIKEY": API_KEY}
     params = {"timestamp": str(int(time.time() * 1000))}
@@ -32,6 +33,7 @@ def get_positions():
     return resp.json()
 
 def close_all_positions(symbol):
+    """Schließt alle offenen Positionen für ein Symbol"""
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions"
     headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
     params = {"symbol": symbol, "timestamp": str(int(time.time() * 1000))}
@@ -41,6 +43,7 @@ def close_all_positions(symbol):
     return resp.json()
 
 def monitor_position(symbol, position_side, entry_price, tp_price, sl_price, interval=5):
+    """Überwacht Preis und schließt Position bei TP oder SL"""
     print(f"Monitoring {symbol} {position_side}... TP={tp_price}, SL={sl_price}")
     while True:
         current = get_price(symbol)
@@ -74,17 +77,19 @@ def test_order():
             symbol = str(data.get("symbol", "BTC-USDT")).upper()
             side = str(data.get("side", "SELL")).upper()
 
-        size = float(data.get("size", 20))       # USDT Notional
-        leverage = int(data.get("leverage", 20))
-        tp_percent = float(data.get("tp_percent", 2.0))
-        sl_percent = float(data.get("sl_percent", 1.0))
+        size = float(data.get("size", 25))       # USDT Notional
+        leverage = int(data.get("leverage", 25))
+        tp_percent = float(data.get("tp_percent", 0.1))
+        sl_percent = float(data.get("sl_percent", 0.1))
 
+        # Preis holen
         price = get_price(symbol)
         qty = round(size / price, 6)
 
         headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
         url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
 
+        # Entry Market Order
         entry_params = {
             "leverage": str(leverage),
             "positionSide": "SHORT" if side == "SELL" else "LONG",
@@ -97,6 +102,7 @@ def test_order():
         entry_params["signature"] = sign_params(entry_params)
         entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
 
+        # TP/SL Preise berechnen
         if side == "BUY":
             tp_price = round(price * (1 + tp_percent / 100), 2)
             sl_price = round(price * (1 - sl_percent / 100), 2)
@@ -106,6 +112,7 @@ def test_order():
             sl_price = round(price * (1 + sl_percent / 100), 2)
             position_side = "SHORT"
 
+        # Hintergrundthread starten
         threading.Thread(
             target=monitor_position,
             args=(symbol, position_side, price, tp_price, sl_price)
