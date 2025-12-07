@@ -54,20 +54,38 @@ def test_order():
         if side == "BUY":
             tp_price = round(price * (1 + TP_PERCENT / 100), 2)
             sl_price = round(price * (1 - SL_PERCENT / 100), 2)
+            tp_side = "SELL"
+            sl_side = "SELL"
         else:  # SELL/SHORT
             tp_price = round(price * (1 - TP_PERCENT / 100), 2)
             sl_price = round(price * (1 + SL_PERCENT / 100), 2)
+            tp_side = "BUY"
+            sl_side = "BUY"
 
-        # Position API: TP/SL setzen
-        url_position = f"{BINGX_BASE}/openApi/swap/v2/trade/position"
-        pos_params = {
+        # Conditional Orders für TP/SL
+        url_cond = f"{BINGX_BASE}/openApi/swap/v2/trade/order/conditional"
+
+        tp_params = {
             "symbol": symbol,
-            "takeProfitPrice": str(tp_price),
-            "stopLossPrice": str(sl_price),
+            "side": tp_side,
+            "type": "TAKE_PROFIT_MARKET",
+            "triggerPrice": str(tp_price),
+            "quantity": str(qty),
             "timestamp": str(int(time.time() * 1000))
         }
-        pos_params["signature"] = sign_params(pos_params)
-        pos_resp = requests.post(url_position, data=pos_params, headers=headers, timeout=10)
+        tp_params["signature"] = sign_params(tp_params)
+        tp_resp = requests.post(url_cond, data=tp_params, headers=headers, timeout=10)
+
+        sl_params = {
+            "symbol": symbol,
+            "side": sl_side,
+            "type": "STOP_MARKET",
+            "triggerPrice": str(sl_price),
+            "quantity": str(qty),
+            "timestamp": str(int(time.time() * 1000))
+        }
+        sl_params["signature"] = sign_params(sl_params)
+        sl_resp = requests.post(url_cond, data=sl_params, headers=headers, timeout=10)
 
         return jsonify({
             "status": "ok",
@@ -81,7 +99,8 @@ def test_order():
             "tp_price": tp_price,
             "sl_price": sl_price,
             "main_order_response": main_resp.json(),
-            "position_update_response": pos_resp.json()
+            "tp_order_response": tp_resp.json(),
+            "sl_order_response": sl_resp.json()
         }), 200
 
     except Exception as e:
