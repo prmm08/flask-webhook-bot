@@ -25,9 +25,9 @@ def test_order():
         symbol = f"{currency}-USDT"
         side = str(data.get("side", "BUY")).upper()
         ORDER_SIZE_USDT = float(data.get("ORDER_SIZE_USDT", 10))
-        ORDER_LEVERAGE = int(data.get("ORDER_LEVERAGE", 10))
+        ORDER_LEVERAGE = int(data.get("ORDER_LEVERAGE", 5))
         TP_PERCENT = float(data.get("TP_PERCENT", 2.0))
-        SL_PERCENT = float(data.get("SL_PERCENT", 100.0))
+        SL_PERCENT = float(data.get("SL_PERCENT", 1.0))
 
         # Preis holen
         url_price = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
@@ -54,38 +54,20 @@ def test_order():
         if side == "BUY":
             tp_price = round(price * (1 + TP_PERCENT / 100), 2)
             sl_price = round(price * (1 - SL_PERCENT / 100), 2)
-            tp_side = "SELL"
-            sl_side = "SELL"
         else:  # SELL/SHORT
             tp_price = round(price * (1 - TP_PERCENT / 100), 2)
             sl_price = round(price * (1 + SL_PERCENT / 100), 2)
-            tp_side = "BUY"
-            sl_side = "BUY"
 
-        # TP Conditional Order
-        url_cond = f"{BINGX_BASE}/openApi/swap/v2/trade/conditionOrder"
-        tp_params = {
+        # Position API: TP/SL setzen
+        url_position = f"{BINGX_BASE}/openApi/swap/v2/trade/position"
+        pos_params = {
             "symbol": symbol,
-            "side": tp_side,
-            "type": "TAKE_PROFIT_MARKET",
-            "triggerPrice": str(tp_price),
-            "quantity": str(qty),
+            "takeProfitPrice": str(tp_price),
+            "stopLossPrice": str(sl_price),
             "timestamp": str(int(time.time() * 1000))
         }
-        tp_params["signature"] = sign_params(tp_params)
-        tp_resp = requests.post(url_cond, data=tp_params, headers=headers, timeout=10)
-
-        # SL Conditional Order
-        sl_params = {
-            "symbol": symbol,
-            "side": sl_side,
-            "type": "STOP_MARKET",
-            "triggerPrice": str(sl_price),
-            "quantity": str(qty),
-            "timestamp": str(int(time.time() * 1000))
-        }
-        sl_params["signature"] = sign_params(sl_params)
-        sl_resp = requests.post(url_cond, data=sl_params, headers=headers, timeout=10)
+        pos_params["signature"] = sign_params(pos_params)
+        pos_resp = requests.post(url_position, data=pos_params, headers=headers, timeout=10)
 
         return jsonify({
             "status": "ok",
@@ -99,8 +81,7 @@ def test_order():
             "tp_price": tp_price,
             "sl_price": sl_price,
             "main_order_response": main_resp.json(),
-            "tp_order_response": tp_resp.json(),
-            "sl_order_response": sl_resp.json()
+            "position_update_response": pos_resp.json()
         }), 200
 
     except Exception as e:
