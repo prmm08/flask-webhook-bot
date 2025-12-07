@@ -5,47 +5,49 @@ import requests
 import os
 from flask import Flask, request, jsonify
 
-# -------- API Keys --------
-API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
-API_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
-
+API_KEY = "DEIN_API_KEY"
+API_SECRET = "DEIN_API_SECRET"
 BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return {"status": "Server läuft", "routes": ["/ping (GET)", "/testorder (POST)"]}
+    return {"status": "Server läuft", "routes": ["/ping (GET)", "/webhook (POST)"]}
 
-# -------- Verbindungstest --------
 @app.route("/ping", methods=["GET"])
 def ping_bingx():
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
     resp = requests.get(url, params={"symbol": "BTC-USDT"}, timeout=10)
     return jsonify({"status": "ok", "bingx_response": resp.json()}), 200
 
-# -------- Flexible Testorder --------
-@app.route("/testorder", methods=["POST"])
-def test_order():
+@app.route("/webhook", methods=["POST"])
+def webhook():
     try:
         data = request.get_json(force=True)
 
-        symbol = str(data.get("symbol", "BTC-USDT")).upper()
-        side = str(data.get("side", "SELL")).upper()
-        size = float(data.get("size", 10))       # USDT Notional
-        leverage = int(data.get("leverage", 5))
+        # Currency aus dem Alert
+        currency = str(data.get("currency", "BTC")).upper()
+        symbol = f"{currency}-USDT"
+
+        # Trading Parameter im gewünschten Format
+        ORDER_SIZE_USDT = float(data.get("ORDER_SIZE_USDT", 10))
+        ORDER_LEVERAGE = int(data.get("ORDER_LEVERAGE", 5))
+        TP_PERCENT = float(data.get("TP_PERCENT", 2.0))
+        SL_PERCENT = float(data.get("SL_PERCENT", 100.0))
+        side = str(data.get("side", "BUY")).upper()
 
         # Preis holen
         url_price = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
         r = requests.get(url_price, params={"symbol": symbol}, timeout=10)
         price = float(r.json()["data"]["price"])
+        qty = round(ORDER_SIZE_USDT / price, 6)
 
-        qty = round(size / price, 6)
-
+        # Order vorbereiten
         url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
         params = {
-            "leverage": str(leverage),
-            "positionSide": "SHORT" if side == "SELL" else "LONG",
+            "leverage": str(ORDER_LEVERAGE),
+            "positionSide": "LONG" if side == "BUY" else "SHORT",
             "quantity": str(qty),
             "side": side,
             "symbol": symbol,
@@ -53,7 +55,7 @@ def test_order():
             "type": "MARKET"
         }
 
-        # Signatur erstellen
+        # Signatur
         query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
         params["signature"] = signature
@@ -63,9 +65,13 @@ def test_order():
 
         return jsonify({
             "status": "ok",
-            "received_signal": {"symbol": symbol, "side": side, "size": size, "leverage": leverage},
+            "received_currency": currency,
+            "ORDER_SIZE_USDT": ORDER_SIZE_USDT,
+            "ORDER_LEVERAGE": ORDER_LEVERAGE,
+            "TP_PERCENT": TP_PERCENT,
+            "SL_PERCENT": SL_PERCENT,
+            "side": side,
             "bingx_payload": params,
-            "bingx_status_code": resp.status_code,
             "bingx_response": resp.json()
         }), 200
     except Exception as e:
