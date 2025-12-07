@@ -9,8 +9,8 @@ import aiohttp
 from flask import Flask, request, jsonify
 
 # -------- API Keys aus Environment Variablen --------
-API_KEY = os.getenv("BINGX_API_KEY")
-API_SECRET = os.getenv("BINGX_SECRET")
+API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
+API_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
 
 # -------- Trading Parameter --------
 ORDER_SIZE_USDT = float(os.getenv("ORDER_SIZE_USDT", 10))
