@@ -78,7 +78,10 @@ async def bingx_place_order(session: aiohttp.ClientSession, symbol: str, side: s
     async with session.post(url, data=params, headers=headers, timeout=10) as resp:
         txt = await resp.text()
         logging.info(f"Market Order Response: {txt}")
-        return {"status_code": resp.status, "response": txt}
+        try:
+            return await resp.json()   # JSON zurückgeben
+        except:
+            return {"status_code": resp.status, "raw": txt}
 
 # -------- Flask Webhook --------
 app = Flask(__name__)
