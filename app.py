@@ -79,7 +79,7 @@ async def bingx_place_order(session: aiohttp.ClientSession, symbol: str, side: s
         logging.info(f"[BINGX] Market Order Response: {txt}")
         try:
             data = await resp.json()
-            return {"status_code": resp.status, "data": data}
+            return {"status_code": resp.status, "data": data, "raw": txt}
         except Exception:
             return {"status_code": resp.status, "raw": txt}
 
@@ -112,10 +112,18 @@ def signal():
 
     try:
         result = asyncio.run(_handle_signal(symbol, side, size, lev))
-        return jsonify({"status": "ok", "received": {"symbol": symbol, "side": side, "size": size, "leverage": lev}, "bingx_result": result}), 200
+        return jsonify({
+            "status": "ok",
+            "received": {"symbol": symbol, "side": side, "size": size, "leverage": lev},
+            "bingx_result": result
+        }), 200
     except Exception as e:
         logging.error(f"[WEBHOOK] Order Fehler: {e}")
-        return jsonify({"status": "error", "message": str(e), "received": {"symbol": symbol, "side": side, "size": size, "leverage": lev}}), 400
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "received": {"symbol": symbol, "side": side, "size": size, "leverage": lev}
+        }), 400
 
 async def _handle_signal(symbol, side, size, lev):
     async with aiohttp.ClientSession() as session:
