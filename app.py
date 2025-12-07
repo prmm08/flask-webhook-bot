@@ -26,3 +26,33 @@ def ping_bingx():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))  # Render setzt $PORT automatisch
     app.run(host="0.0.0.0", port=port)
+    
+    @app.route("/testorder", methods=["GET"])
+def test_order():
+    try:
+        url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
+        params = {
+            "leverage": "5",
+            "positionSide": "SHORT",
+            "quantity": "0.0001",
+            "side": "SELL",
+            "symbol": "BTC-USDT",
+            "timestamp": str(int(time.time() * 1000)),
+            "type": "MARKET"
+        }
+        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+        params["signature"] = signature
+
+        headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+        resp = requests.post(url_order, data=params, headers=headers, timeout=10)
+
+        return jsonify({
+            "status": "ok",
+            "bingx_status_code": resp.status_code,
+            "bingx_response": resp.json(),
+            "final_payload": params
+        }), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
