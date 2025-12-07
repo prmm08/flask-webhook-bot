@@ -54,34 +54,38 @@ def test_order():
         if side == "BUY":
             tp_price = round(price * (1 + TP_PERCENT / 100), 2)
             sl_price = round(price * (1 - SL_PERCENT / 100), 2)
+            tp_side = "SELL"
+            sl_side = "SELL"
         else:  # SELL/SHORT
             tp_price = round(price * (1 - TP_PERCENT / 100), 2)
             sl_price = round(price * (1 + SL_PERCENT / 100), 2)
+            tp_side = "BUY"
+            sl_side = "BUY"
 
-        # TP Order
-        url_stop = f"{BINGX_BASE}/openApi/swap/v2/trade/stopOrder"
+        # TP Conditional Order
+        url_cond = f"{BINGX_BASE}/openApi/swap/v2/trade/conditionOrder"
         tp_params = {
             "symbol": symbol,
-            "side": "SELL" if side == "BUY" else "BUY",
+            "side": tp_side,
             "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": str(tp_price),
+            "triggerPrice": str(tp_price),
             "quantity": str(qty),
             "timestamp": str(int(time.time() * 1000))
         }
         tp_params["signature"] = sign_params(tp_params)
-        tp_resp = requests.post(url_stop, data=tp_params, headers=headers, timeout=10)
+        tp_resp = requests.post(url_cond, data=tp_params, headers=headers, timeout=10)
 
-        # SL Order
+        # SL Conditional Order
         sl_params = {
             "symbol": symbol,
-            "side": "SELL" if side == "BUY" else "BUY",
+            "side": sl_side,
             "type": "STOP_MARKET",
-            "stopPrice": str(sl_price),
+            "triggerPrice": str(sl_price),
             "quantity": str(qty),
             "timestamp": str(int(time.time() * 1000))
         }
         sl_params["signature"] = sign_params(sl_params)
-        sl_resp = requests.post(url_stop, data=sl_params, headers=headers, timeout=10)
+        sl_resp = requests.post(url_cond, data=sl_params, headers=headers, timeout=10)
 
         return jsonify({
             "status": "ok",
