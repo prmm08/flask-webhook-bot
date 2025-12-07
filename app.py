@@ -7,11 +7,9 @@ import logging
 import aiohttp
 from flask import Flask, request, jsonify
 
-# -------- API Keys aus Environment Variablen --------
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_SECRET")
 
-# -------- Trading Parameter --------
 ORDER_SIZE_USDT = 10
 ORDER_LEVERAGE = 5
 TP_PERCENT = 2.0
@@ -20,7 +18,6 @@ SL_PERCENT = 100.0
 BINGX_BASE = "https://open-api.bingx.com"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-# -------- Utils --------
 def ts_ms():
     return int(time.time() * 1000)
 
@@ -31,7 +28,6 @@ def norm_symbol(sym: str) -> str:
     s = sym.upper().strip().replace("/", "-")
     return s if "-" in s else f"{s}-USDT"
 
-# -------- BingX API --------
 async def bingx_get_price(session: aiohttp.ClientSession, symbol: str) -> float | None:
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
     params = {"symbol": symbol}
@@ -78,12 +74,12 @@ async def bingx_place_order(session: aiohttp.ClientSession, symbol: str, side: s
     async with session.post(url, data=params, headers=headers, timeout=10) as resp:
         txt = await resp.text()
         logging.info(f"Market Order Response: {txt}")
+        # Versuche JSON, sonst Rohtext zurückgeben
         try:
-            return await resp.json()   # JSON zurückgeben
+            return await resp.json()
         except:
             return {"status_code": resp.status, "raw": txt}
 
-# -------- Flask Webhook --------
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
