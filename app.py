@@ -18,7 +18,8 @@ def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-def get_price(symbol="BTC-USDT"):
+def get_price(symbol):
+    """Preis für das übergebene Symbol holen"""
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
     return float(r.json()["data"]["price"])
@@ -43,20 +44,20 @@ def close_all_positions(symbol):
     return resp.json()
 
 def monitor_position(symbol, position_side, entry_price, tp_price, sl_price, interval=5):
-    """Überwacht Preis und schließt Position bei TP oder SL"""
+    """Überwacht Preis für das jeweilige Symbol und schließt Position bei TP oder SL"""
     print(f"Monitoring {symbol} {position_side}... TP={tp_price}, SL={sl_price}")
     while True:
-        current = get_price(symbol)
-        print("Current price:", current)
+        current = get_price(symbol)   # <-- nutzt jetzt das Symbol aus dem Alert
+        print(f"Current {symbol} price:", current)
 
         if position_side == "LONG":
             if current >= tp_price or current <= sl_price:
-                print("Target reached, closing LONG position")
+                print(f"Target reached, closing LONG {symbol} position")
                 close_all_positions(symbol)
                 break
         elif position_side == "SHORT":
             if current <= tp_price or current >= sl_price:
-                print("Target reached, closing SHORT position")
+                print(f"Target reached, closing SHORT {symbol} position")
                 close_all_positions(symbol)
                 break
 
