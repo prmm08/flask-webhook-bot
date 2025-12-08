@@ -83,8 +83,8 @@ def handle_alert():
 
         # Default Parameter für SELL Order
         side = "SELL"
-        size = 25          # USDT Notional
-        leverage = 25
+        size = 5          # USDT Notional
+        leverage = 5
         tp_percent = 0.05     # Take Profit %
         sl_percent = 0.05   # Stop Loss %
 
