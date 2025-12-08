@@ -7,9 +7,9 @@ import urllib.parse
 import threading
 from flask import Flask, request, jsonify
 
-# -------- API Keys --------
-API_KEY = "XeyESAWMvOPHPPlteKkem15yGzEPvHauxKj5LORpjrvOipxPza5DiWkGSMJGhWZyIKp0ZNQwhN17R3aon1RA"
-API_SECRET = "EKHC1rgjFzQVBO9noJa1CHaeoh9vJqv78EXg76aqozvejJbTknkaVr2G3fJyUcBZs1rCoSRA5vMQ6gZYmIg"
+# -------- API Keys aus Umgebungsvariablen --------
+API_KEY = os.getenv("BINGX_API_KEY")
+API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
