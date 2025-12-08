@@ -22,7 +22,10 @@ def get_price(symbol):
     """Preis für das übergebene Symbol holen"""
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
-    return float(r.json()["data"]["price"])
+    resp = r.json()
+    if "data" not in resp or "price" not in resp["data"]:
+        raise Exception(f"Preis für {symbol} nicht gefunden: {resp}")
+    return float(resp["data"]["price"])
 
 def get_positions():
     """Fragt aktive Positionen ab"""
@@ -67,8 +70,11 @@ def get_symbol_info(symbol):
     """Holt Infos zu einem Symbol (maxLeverage, minQty, minNotional)"""
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/symbols"
     r = requests.get(url, timeout=10)
-    data = r.json()["data"]
-    for s in data:
+    resp = r.json()
+    if "data" not in resp:
+        print("Symbol info error:", resp)
+        return None
+    for s in resp["data"]:
         if s["symbol"] == symbol:
             return s
     return None
@@ -91,7 +97,7 @@ def handle_alert():
         # Symbol-Infos holen
         info = get_symbol_info(symbol)
         if not info:
-            return jsonify({"status":"error","message":f"Symbol {symbol} not supported"}), 400
+            return jsonify({"status":"error","message":f"Symbol {symbol} not supported or API error"}), 400
 
         max_leverage = int(info.get("maxLeverage", 25))
         min_qty = float(info.get("minQty", 0))
