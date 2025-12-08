@@ -47,7 +47,7 @@ def monitor_position(symbol, position_side, entry_price, tp_price, sl_price, int
     """Überwacht Preis für das jeweilige Symbol und schließt Position bei TP oder SL"""
     print(f"Monitoring {symbol} {position_side}... TP={tp_price}, SL={sl_price}")
     while True:
-        current = get_price(symbol)   # <-- nutzt jetzt das Symbol aus dem Alert
+        current = get_price(symbol)
         print(f"Current {symbol} price:", current)
 
         if position_side == "LONG":
@@ -63,6 +63,10 @@ def monitor_position(symbol, position_side, entry_price, tp_price, sl_price, int
 
         time.sleep(interval)
 
+# -------- Cooldown Speicher --------
+cooldowns = {}  # speichert {symbol: timestamp}
+COOLDOWN_SECONDS = 2 * 60 * 60  # 2 Stunden
+
 # -------- Health Check --------
 @app.route("/", methods=["GET", "POST"])
 def health_check():
@@ -73,29 +77,35 @@ def handle_alert():
     try:
         data = request.get_json(force=True, silent=True) or {}
 
-        # Fallback für Verifizierung ohne Payload
         if not data.get("currency"):
             return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
-        # Wichtige Felder aus dem Alert
         currency = str(data.get("currency", "")).upper()
-        symbol = f"{currency}-USDT"   # BingX Symbol Standard
+        symbol = f"{currency}-USDT"
+
+        # --- Cooldown Check ---
+        now = time.time()
+        last_exec = cooldowns.get(symbol, 0)
+        if now - last_exec < COOLDOWN_SECONDS:
+            return jsonify({
+                "status": "cooldown",
+                "message": f"{symbol} ist noch im Cooldown, bitte warten.",
+                "remaining_seconds": int(COOLDOWN_SECONDS - (now - last_exec))
+            }), 200
 
         # Default Parameter für SELL Order
         side = "SELL"
-        size = 200          # USDT Notional
+        size = 200
         leverage = 50
-        tp_percent = 0.05     # Take Profit %
-        sl_percent = 0.05   # Stop Loss %
+        tp_percent = 0.05
+        sl_percent = 0.05
 
-        # Preis holen
         price = get_price(symbol)
         qty = round(size / price, 6)
 
         headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
         url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
 
-        # Entry Market Order
         entry_params = {
             "leverage": str(leverage),
             "positionSide": "SHORT",
@@ -108,15 +118,16 @@ def handle_alert():
         entry_params["signature"] = sign_params(entry_params)
         entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
 
-        # TP/SL Preise berechnen
         tp_price = round(price * (1 - tp_percent / 100), 2)
         sl_price = round(price * (1 + sl_percent / 100), 2)
 
-        # Hintergrundthread starten
         threading.Thread(
             target=monitor_position,
             args=(symbol, "SHORT", price, tp_price, sl_price)
         ).start()
+
+        # --- Cooldown setzen ---
+        cooldowns[symbol] = now
 
         return jsonify({
             "status": "ok",
