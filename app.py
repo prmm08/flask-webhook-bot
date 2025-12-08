@@ -67,6 +67,11 @@ def monitor_position(symbol, position_side, entry_price, tp_price, sl_price, int
                 break
 
         time.sleep(interval)
+        
+ # -------- Health Check --------
+@app.route("/", methods=["GET", "POST"])
+def health_check():
+    return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
 @app.route("/testorder", methods=["POST"])
 def handle_alert():
