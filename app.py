@@ -95,8 +95,8 @@ def handle_alert():
 
         # Default Parameter für SELL Order
         side = "SELL"
-        size = 200
-        leverage = 50
+        size = 20
+        leverage = 20
         tp_percent = 2
         sl_percent = 100
 
