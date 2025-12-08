@@ -27,7 +27,9 @@ def get_positions():
     """Fragt aktive Positionen ab"""
     url = f"{BINGX_BASE}/openApi/swap/v2/user/positions"
     headers = {"X-BX-APIKEY": API_KEY}
-    params = {"timestamp": str(int(time.time() * 1000))}
+    params = {
+        "timestamp": str(int(time.time() * 1000))
+    }
     params["signature"] = sign_params(params)
     resp = requests.get(url, params=params, headers=headers, timeout=10)
     return resp.json()
@@ -36,7 +38,11 @@ def close_all_positions(symbol):
     """Schließt alle offenen Positionen für ein Symbol"""
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions"
     headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
-    params = {"symbol": symbol, "timestamp": str(int(time.time() * 1000))}
+
+    params = {
+        "symbol": symbol,
+        "timestamp": str(int(time.time() * 1000))
+    }
     params["signature"] = sign_params(params)
     resp = requests.post(url, data=params, headers=headers, timeout=10)
     print("CloseAll response:", resp.json())
@@ -63,24 +69,20 @@ def monitor_position(symbol, position_side, entry_price, tp_price, sl_price, int
         time.sleep(interval)
 
 @app.route("/testorder", methods=["POST"])
-def test_order():
+def handle_alert():
     try:
         data = request.get_json(force=True)
 
-        # Wenn Alert von cryptocurrencyalerting.com kommt:
-        if "currency" in data:
-            currency = str(data.get("currency", "")).upper()
-            symbol = f"{currency}-USDT"
-            side = "SELL"
-        else:
-            # Fallback: manuelle Parameter
-            symbol = str(data.get("symbol", "BTC-USDT")).upper()
-            side = str(data.get("side", "SELL")).upper()
+        # Wichtige Felder aus dem Alert
+        currency = str(data.get("currency", "")).upper()
+        symbol = f"{currency}-USDT"   # BingX Symbol Standard
 
-        size = float(data.get("size", 25))       # USDT Notional
-        leverage = int(data.get("leverage", 25))
-        tp_percent = float(data.get("tp_percent", 0.1))
-        sl_percent = float(data.get("sl_percent", 0.1))
+        # Default Parameter für SELL Order
+        side = "SELL"
+        size = 25          # USDT Notional
+        leverage = 25
+        tp_percent = 0.1   # Take Profit %
+        sl_percent = 0.1   # Stop Loss %
 
         # Preis holen
         price = get_price(symbol)
@@ -92,7 +94,7 @@ def test_order():
         # Entry Market Order
         entry_params = {
             "leverage": str(leverage),
-            "positionSide": "SHORT" if side == "SELL" else "LONG",
+            "positionSide": "SHORT",
             "quantity": str(qty),
             "side": side,
             "symbol": symbol,
@@ -103,24 +105,18 @@ def test_order():
         entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
 
         # TP/SL Preise berechnen
-        if side == "BUY":
-            tp_price = round(price * (1 + tp_percent / 100), 2)
-            sl_price = round(price * (1 - sl_percent / 100), 2)
-            position_side = "LONG"
-        else:
-            tp_price = round(price * (1 - tp_percent / 100), 2)
-            sl_price = round(price * (1 + sl_percent / 100), 2)
-            position_side = "SHORT"
+        tp_price = round(price * (1 - tp_percent / 100), 2)
+        sl_price = round(price * (1 + sl_percent / 100), 2)
 
         # Hintergrundthread starten
         threading.Thread(
             target=monitor_position,
-            args=(symbol, position_side, price, tp_price, sl_price)
+            args=(symbol, "SHORT", price, tp_price, sl_price)
         ).start()
 
         return jsonify({
             "status": "ok",
-            "received_data": data,
+            "alert_received": data,
             "symbol": symbol,
             "side": side,
             "entry_price": price,
