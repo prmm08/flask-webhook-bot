@@ -27,9 +27,7 @@ def get_positions():
     """Fragt aktive Positionen ab"""
     url = f"{BINGX_BASE}/openApi/swap/v2/user/positions"
     headers = {"X-BX-APIKEY": API_KEY}
-    params = {
-        "timestamp": str(int(time.time() * 1000))
-    }
+    params = {"timestamp": str(int(time.time() * 1000))}
     params["signature"] = sign_params(params)
     resp = requests.get(url, params=params, headers=headers, timeout=10)
     return resp.json()
@@ -38,11 +36,7 @@ def close_all_positions(symbol):
     """Schließt alle offenen Positionen für ein Symbol"""
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions"
     headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
-
-    params = {
-        "symbol": symbol,
-        "timestamp": str(int(time.time() * 1000))
-    }
+    params = {"symbol": symbol, "timestamp": str(int(time.time() * 1000))}
     params["signature"] = sign_params(params)
     resp = requests.post(url, data=params, headers=headers, timeout=10)
     print("CloseAll response:", resp.json())
@@ -67,8 +61,8 @@ def monitor_position(symbol, position_side, entry_price, tp_price, sl_price, int
                 break
 
         time.sleep(interval)
-        
- # -------- Health Check --------
+
+# -------- Health Check --------
 @app.route("/", methods=["GET", "POST"])
 def health_check():
     return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
@@ -76,7 +70,11 @@ def health_check():
 @app.route("/testorder", methods=["POST"])
 def handle_alert():
     try:
-        data = request.get_json(force=True)
+        data = request.get_json(force=True, silent=True) or {}
+
+        # Fallback für Verifizierung ohne Payload
+        if not data.get("currency"):
+            return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
         # Wichtige Felder aus dem Alert
         currency = str(data.get("currency", "")).upper()
@@ -86,7 +84,7 @@ def handle_alert():
         side = "SELL"
         size = 25          # USDT Notional
         leverage = 25
-        tp_percent = 2   # Take Profit %
+        tp_percent = 2     # Take Profit %
         sl_percent = 100   # Stop Loss %
 
         # Preis holen
