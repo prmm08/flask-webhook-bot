@@ -18,8 +18,8 @@ def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
+"""Preis für das übergebene Symbol holen"""
 def get_price(symbol):
-    """Preis für das übergebene Symbol holen"""
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
     return float(r.json()["data"]["price"])
@@ -85,8 +85,8 @@ def handle_alert():
         side = "SELL"
         size = 25          # USDT Notional
         leverage = 25
-        tp_percent = 0.1     # Take Profit %
-        sl_percent = 0.1   # Stop Loss %
+        tp_percent = 0.05     # Take Profit %
+        sl_percent = 0.05   # Stop Loss %
 
         # Preis holen
         price = get_price(symbol)
