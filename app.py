@@ -81,8 +81,8 @@ def handle_alert():
         side = "SELL"
         size = 25          # USDT Notional
         leverage = 25
-        tp_percent = 0.1   # Take Profit %
-        sl_percent = 0.1   # Stop Loss %
+        tp_percent = 2   # Take Profit %
+        sl_percent = 100   # Stop Loss %
 
         # Preis holen
         price = get_price(symbol)
