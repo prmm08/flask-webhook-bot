@@ -97,8 +97,8 @@ def handle_alert():
         side = "SELL"
         size = 20
         leverage = 20
-        tp_percent = 2
-        sl_percent = 100
+        tp_percent = 3
+        sl_percent = 1.5
 
         price = get_price(symbol)
         qty = round(size / price, 6)
