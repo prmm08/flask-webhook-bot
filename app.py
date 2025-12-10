@@ -18,8 +18,8 @@ def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-"""Preis für das übergebene Symbol holen"""
 def get_price(symbol):
+    """Preis für das übergebene Symbol holen"""
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
     return float(r.json()["data"]["price"])
@@ -43,25 +43,48 @@ def close_all_positions(symbol):
     print("CloseAll response:", resp.json())
     return resp.json()
 
-def monitor_position(symbol, position_side, entry_price, tp_price, sl_price, interval=5):
+# -------- Hilfsfunktion für dynamische Rundung --------
+def dynamic_round(price, value):
+    """
+    Rundet TP/SL abhängig vom Preis.
+    - Hohe Preise (BTC, ETH): 2 Nachkommastellen
+    - Mittlere Preise: 4 Nachkommastellen
+    - Sehr kleine Preise: 6 Nachkommastellen
+    """
+    if price > 1000:
+        decimals = 2
+    elif price > 1:
+        decimals = 4
+    else:
+        decimals = 6
+    return round(value, decimals)
+
+# -------- Monitor-Thread Verwaltung --------
+active_monitors = {}  # speichert {symbol: True/False}
+
+def monitor_position(symbol, position_side, entry_price, tp_price, sl_price, interval=1):
     """Überwacht Preis für das jeweilige Symbol und schließt Position bei TP oder SL"""
     print(f"Monitoring {symbol} {position_side}... TP={tp_price}, SL={sl_price}")
-    while True:
-        current = get_price(symbol)
-        print(f"Current {symbol} price:", current)
+    active_monitors[symbol] = True
+    try:
+        while True:
+            current = get_price(symbol)
+            print(f"Current {symbol} price:", current)
 
-        if position_side == "LONG":
-            if current >= tp_price or current <= sl_price:
-                print(f"Target reached, closing LONG {symbol} position")
-                close_all_positions(symbol)
-                break
-        elif position_side == "SHORT":
-            if current <= tp_price or current >= sl_price:
-                print(f"Target reached, closing SHORT {symbol} position")
-                close_all_positions(symbol)
-                break
+            if position_side == "LONG":
+                if current >= tp_price or current <= sl_price:
+                    print(f"Target reached, closing LONG {symbol} position")
+                    close_all_positions(symbol)
+                    break
+            elif position_side == "SHORT":
+                if current <= tp_price or current >= sl_price:
+                    print(f"Target reached, closing SHORT {symbol} position")
+                    close_all_positions(symbol)
+                    break
 
-        time.sleep(interval)
+            time.sleep(interval)
+    finally:
+        active_monitors[symbol] = False
 
 # -------- Cooldown Speicher --------
 cooldowns = {}  # speichert {symbol: timestamp}
@@ -118,13 +141,15 @@ def handle_alert():
         entry_params["signature"] = sign_params(entry_params)
         entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
 
-        tp_price = round(price * (1 - tp_percent / 100), 2)
-        sl_price = round(price * (1 + sl_percent / 100), 2)
+        tp_price = dynamic_round(price, price * (1 - tp_percent / 100))
+        sl_price = dynamic_round(price, price * (1 + sl_percent / 100))
 
-        threading.Thread(
-            target=monitor_position,
-            args=(symbol, "SHORT", price, tp_price, sl_price)
-        ).start()
+        # --- Monitor nur starten, wenn keiner aktiv ---
+        if not active_monitors.get(symbol, False):
+            threading.Thread(
+                target=monitor_position,
+                args=(symbol, "SHORT", price, tp_price, sl_price)
+            ).start()
 
         # --- Cooldown setzen ---
         cooldowns[symbol] = now
