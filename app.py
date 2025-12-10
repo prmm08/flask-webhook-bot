@@ -1,4 +1,4 @@
-# -------- VER 1.7: Auto Orders / TP / SL / Monitoring / Cooldown / BE --------
+# -------- VER 1.7: Auto Orders/TP/SL/Monitoring/Cooldown/BE --------
 
 import time
 import hmac
@@ -57,7 +57,7 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
     print(f"Monitoring SHORT {symbol}... TP={tp_price}, SL={sl_price}")
     active_monitors[symbol] = True
     try:
-        trailing_percent = 0.02  # 2%
+        trailing_percent = 0.025  # 2%
         be_set = False
 
         while True:
@@ -109,7 +109,7 @@ def handle_alert():
         side = "SELL"
         size = 20
         leverage = 20
-        tp_percent = 4
+        tp_percent = 5
         sl_percent = 2
 
         price = get_price(symbol)
