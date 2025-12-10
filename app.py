@@ -1,3 +1,5 @@
+# -------- VER 1.7: Auto Orders / TP / SL / Monitoring / Cooldown / BE --------
+
 import time
 import hmac
 import hashlib
@@ -7,7 +9,6 @@ import urllib.parse
 import threading
 from flask import Flask, request, jsonify
 
-# -------- API Keys aus Umgebungsvariablen --------
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
@@ -19,13 +20,11 @@ def sign_params(params):
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 def get_price(symbol):
-    """Preis für das übergebene Symbol holen"""
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
     return float(r.json()["data"]["price"])
 
 def get_positions():
-    """Fragt aktive Positionen ab"""
     url = f"{BINGX_BASE}/openApi/swap/v2/user/positions"
     headers = {"X-BX-APIKEY": API_KEY}
     params = {"timestamp": str(int(time.time() * 1000))}
@@ -34,7 +33,6 @@ def get_positions():
     return resp.json()
 
 def close_all_positions(symbol):
-    """Schließt alle offenen Positionen für ein Symbol"""
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions"
     headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
     params = {"symbol": symbol, "timestamp": str(int(time.time() * 1000))}
@@ -43,14 +41,7 @@ def close_all_positions(symbol):
     print("CloseAll response:", resp.json())
     return resp.json()
 
-# -------- Hilfsfunktion für dynamische Rundung --------
 def dynamic_round(price, value):
-    """
-    Rundet TP/SL abhängig vom Preis.
-    - Hohe Preise (BTC, ETH): 2 Nachkommastellen
-    - Mittlere Preise: 4 Nachkommastellen
-    - Sehr kleine Preise: 6 Nachkommastellen
-    """
     if price > 1000:
         decimals = 2
     elif price > 1:
@@ -59,38 +50,39 @@ def dynamic_round(price, value):
         decimals = 6
     return round(value, decimals)
 
-# -------- Monitor-Thread Verwaltung --------
-active_monitors = {}  # speichert {symbol: True/False}
+active_monitors = {}
 
-def monitor_position(symbol, position_side, entry_price, tp_price, sl_price, interval=1):
-    """Überwacht Preis für das jeweilige Symbol und schließt Position bei TP oder SL"""
-    print(f"Monitoring {symbol} {position_side}... TP={tp_price}, SL={sl_price}")
+def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
+    """Überwacht SHORT-Position mit einmaligem BE-TSL"""
+    print(f"Monitoring SHORT {symbol}... TP={tp_price}, SL={sl_price}")
     active_monitors[symbol] = True
     try:
+        trailing_percent = 0.02  # 2%
+        be_set = False
+
         while True:
             current = get_price(symbol)
             print(f"Current {symbol} price:", current)
 
-            if position_side == "LONG":
-                if current >= tp_price or current <= sl_price:
-                    print(f"Target reached, closing LONG {symbol} position")
-                    close_all_positions(symbol)
-                    break
-            elif position_side == "SHORT":
-                if current <= tp_price or current >= sl_price:
-                    print(f"Target reached, closing SHORT {symbol} position")
-                    close_all_positions(symbol)
-                    break
+            # Break-Even setzen bei +2% Gewinn
+            if not be_set and current <= entry_price * (1 - trailing_percent):
+                sl_price = entry_price
+                be_set = True
+                print(f"BE aktiviert für SHORT {symbol}: SL={sl_price}")
+
+            # Schließen bei TP oder SL
+            if current <= tp_price or current >= sl_price:
+                print(f"Target reached, closing SHORT {symbol} position")
+                close_all_positions(symbol)
+                break
 
             time.sleep(interval)
     finally:
         active_monitors[symbol] = False
 
-# -------- Cooldown Speicher --------
-cooldowns = {}  # speichert {symbol: timestamp}
-COOLDOWN_SECONDS = 2 * 60 * 60  # 2 Stunden
+cooldowns = {}
+COOLDOWN_SECONDS = 2 * 60 * 60
 
-# -------- Health Check --------
 @app.route("/", methods=["GET", "POST"])
 def health_check():
     return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
@@ -99,14 +91,12 @@ def health_check():
 def handle_alert():
     try:
         data = request.get_json(force=True, silent=True) or {}
-
         if not data.get("currency"):
             return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
         currency = str(data.get("currency", "")).upper()
         symbol = f"{currency}-USDT"
 
-        # --- Cooldown Check ---
         now = time.time()
         last_exec = cooldowns.get(symbol, 0)
         if now - last_exec < COOLDOWN_SECONDS:
@@ -116,7 +106,6 @@ def handle_alert():
                 "remaining_seconds": int(COOLDOWN_SECONDS - (now - last_exec))
             }), 200
 
-        # Default Parameter für SELL Order
         side = "SELL"
         size = 20
         leverage = 20
@@ -144,14 +133,12 @@ def handle_alert():
         tp_price = dynamic_round(price, price * (1 - tp_percent / 100))
         sl_price = dynamic_round(price, price * (1 + sl_percent / 100))
 
-        # --- Monitor nur starten, wenn keiner aktiv ---
         if not active_monitors.get(symbol, False):
             threading.Thread(
                 target=monitor_position,
-                args=(symbol, "SHORT", price, tp_price, sl_price)
+                args=(symbol, price, tp_price, sl_price)
             ).start()
 
-        # --- Cooldown setzen ---
         cooldowns[symbol] = now
 
         return jsonify({
@@ -172,3 +159,4 @@ def handle_alert():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
