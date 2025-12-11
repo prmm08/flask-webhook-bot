@@ -1,9 +1,10 @@
-# -------- VER 2.0: BingX Pump-Bot + KuCoin Futures Bot in einem Flask-Service --------
-#
-# BingX Bot (Pump + 45 Minuten Watcher, TP/SL/BE, Monitoring, Cooldown)
-# KuCoin Futures Bot (Spread/Orderbook Check, Market Short, TP/SL/BE, Monitoring, Cooldown)
-# Weiterleitung vom BingX Webhook zur KuCoin Route
-# Kompakte Logs + robustere KuCoin-API-Checks + dynamische Orderbook-Tiefe
+#/ -------- VER 1.8: Pump-Trigger + 45-Minuten-Watcher + Compact Logs --------
+#✅ 45‑Minuten‑Watcher (statt 30) 
+#✅ jede Minute erneute Prüfung 
+#✅ Pump wird NICHT erneut geprüft 
+#✅ Pump ist nur der Trigger 
+#✅ Watcher prüft NUR die anderen Bedingungen 
+#✅ kompakte Logs 
 
 import time
 import hmac
@@ -13,8 +14,6 @@ import os
 import urllib.parse
 import threading
 import logging
-import base64
-import json
 from flask import Flask, request, jsonify
 
 # ---------------- FLASK + LOGGING SETUP ----------------
@@ -26,57 +25,19 @@ handler = logging.StreamHandler()
 handler.setLevel(logging.INFO)
 app.logger.addHandler(handler)
 
-# ---------------- BINGX CONFIG ----------------
+# ---------------- API KEYS ----------------
 
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
-# ---------------- KUCOIN FUTURES CONFIG ----------------
-
-KUCOIN_FUTURES_BASE = "https://api-futures.kucoin.com"
-
-KUCOIN_API_KEY = os.getenv("KUCOIN_API_KEY")
-KUCOIN_API_SECRET = os.getenv("KUCOIN_API_SECRET")            # plain text secret
-KUCOIN_API_PASSPHRASE = os.getenv("KUCOIN_API_PASSPHRASE")    # plain text passphrase
-
-# ---------------- COMMON HELPERS ----------------
+# ---------------- SIGNING ----------------
 
 def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-def kucoin_futures_sign(method, endpoint, query_string, body=""):
-    now = int(time.time() * 1000)
-    pre_sign = str(now) + method + endpoint + query_string + body
-    signature = base64.b64encode(
-        hmac.new(KUCOIN_API_SECRET.encode(), pre_sign.encode(), hashlib.sha256).digest()
-    ).decode()
-
-    passphrase = base64.b64encode(
-        hmac.new(KUCOIN_API_SECRET.encode(), KUCOIN_API_PASSPHRASE.encode(), hashlib.sha256).digest()
-    ).decode()
-
-    headers = {
-        "KC-API-KEY": KUCOIN_API_KEY,
-        "KC-API-SIGN": signature,
-        "KC-API-TIMESTAMP": str(now),
-        "KC-API-PASSPHRASE": passphrase,
-        "KC-API-KEY-VERSION": "2",
-        "Content-Type": "application/json"
-    }
-    return headers
-
-def dynamic_round(price, value):
-    if price > 1000:
-        decimals = 2
-    elif price > 1:
-        decimals = 4
-    else:
-        decimals = 6
-    return round(value, decimals)
-
-# ---------------- BINGX PRICE + POSITIONS ----------------
+# ---------------- PRICE + POSITIONS ----------------
 
 def get_price(symbol):
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
@@ -100,7 +61,18 @@ def close_all_positions(symbol):
     app.logger.info(f"[CLOSE] {resp.json()}")
     return resp.json()
 
-# ---------------- BINGX OHLCV + RSI ----------------
+# ---------------- DYNAMIC ROUND ----------------
+
+def dynamic_round(price, value):
+    if price > 1000:
+        decimals = 2
+    elif price > 1:
+        decimals = 4
+    else:
+        decimals = 6
+    return round(value, decimals)
+
+# ---------------- OHLCV + RSI ----------------
 
 def get_ohlcv(symbol, interval="1m", limit=10):
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
@@ -123,10 +95,10 @@ def calc_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ---------------- BINGX FILTER OHNE PUMP (für Watcher) ----------------
+# ---------------- FILTER OHNE PUMP (für Watcher) ----------------
 
 def check_reversal_conditions(symbol, logger):
-    ohlcv = get_ohlcv(symbol, "1m", 100)
+    ohlcv = get_ohlcv(symbol, "1m", 10)
     if len(ohlcv) < 6:
         return False, "NO (Nicht genug OHLCV)"
 
@@ -168,7 +140,7 @@ def check_reversal_conditions(symbol, logger):
 
     return True, "YES"
 
-# ---------------- BINGX 45-MINUTEN WATCHER ----------------
+# ---------------- 45-MINUTEN WATCHER ----------------
 
 def pump_watcher(symbol, pump_percent):
     app.logger.info(f"[WATCHER] gestartet für {symbol} (45 Minuten)")
@@ -188,11 +160,7 @@ def pump_watcher(symbol, pump_percent):
 
     app.logger.info(f"[WATCHER END] Keine Bedingungen erfüllt nach 45 Minuten")
 
-# ---------------- BINGX SHORT AUSLÖSEN + MONITORING ----------------
-
-active_monitors = {}
-cooldowns = {}
-COOLDOWN_SECONDS = 2 * 60 * 60
+# ---------------- SHORT AUSLÖSEN ----------------
 
 def trigger_short(symbol):
     side = "SELL"
@@ -230,8 +198,11 @@ def trigger_short(symbol):
 
     cooldowns[symbol] = time.time()
 
-    app.logger.info(f"[SHORT] {symbol} eröffnet bei {price} TP={tp_price} SL={sl_price}")
-    return entry_resp.json(), price, tp_price, sl_price
+    app.logger.info(f"[SHORT] {symbol} eröffnet bei {price}")
+
+# ---------------- POSITION MONITOR ----------------
+
+active_monitors = {}
 
 def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
     app.logger.info(f"[MONITOR] {symbol} gestartet")
@@ -258,212 +229,24 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
     finally:
         active_monitors[symbol] = False
 
-# ---------------- KUCOIN FUTURES HELPERS ----------------
+# ---------------- COOLDOWN ----------------
 
-def kucoin_symbol_from_currency(currency):
-    mapping = {
-        "BTC": "XBTUSDTM",
-        "XBT": "XBTUSDTM",
-        "ETH": "ETHUSDTM",
-        "SOL": "SOLUSDTM",
-        "XRP": "XRPUSDTM",
-        "DOGE": "DOGEUSDTM",
-        "ADA": "ADAUSDTM",
+cooldowns = {}
+COOLDOWN_SECONDS = 2 * 60 * 60
 
-        # ✅ wichtig für dich:
-        "JCT": "JCTUSDTM",
-    }
-    return mapping.get(currency, f"{currency}USDTM")
-
-
-def kucoin_futures_get_mark_price(symbol):
-    # 1) Versuch: offizieller Mark Price
-    endpoint = "/api/v1/mark-price"
-    query = f"symbol={symbol}"
-    url = KUCOIN_FUTURES_BASE + endpoint + "?" + query
-    r = requests.get(url, timeout=10)
-    data = r.json()
-
-    # Wenn Mark Price existiert → nutzen
-    if "data" in data and data["data"] and "value" in data["data"]:
-        return float(data["data"]["value"])
-
-    # 2) Fallback: Orderbook holen
-    app.logger.info(f"[KUCOIN INFO] Kein Mark Price für {symbol}, nutze Mid-Price")
-    ob = kucoin_futures_get_orderbook(symbol)
-    if not ob:
-        raise Exception("KuCoin Mark Price API returned no data AND Orderbook empty")
-
-    bids = ob.get("bids", [])
-    asks = ob.get("asks", [])
-
-    if not bids or not asks:
-        raise Exception("KuCoin Mark Price API returned no data AND no bids/asks")
-
-    best_bid = float(bids[0][0])
-    best_ask = float(asks[0][0])
-
-    # Mid-Price als Ersatz
-    return (best_bid + best_ask) / 2
-
-
-def kucoin_futures_get_orderbook(symbol):
-    endpoint = "/api/v1/level2/depth20"
-    query = f"symbol={symbol}"
-    url = KUCOIN_FUTURES_BASE + endpoint + "?" + query
-    r = requests.get(url, timeout=10)
-    data = r.json()
-    if "data" not in data:
-        app.logger.error(f"[KUCOIN ERROR] Orderbook Response: {data}")
-        return None
-    return data["data"]
-
-# ---------------- KUCOIN FUTURES SPREAD-/ORDERBOOK-STRATEGIE ----------------
-
-def kucoin_check_conditions(symbol, logger):
-    ob = kucoin_futures_get_orderbook(symbol)
-    if not ob:
-        return False, "NO (Orderbook leer)"
-
-    bids = ob.get("bids", [])
-    asks = ob.get("asks", [])
-
-    if len(bids) == 0 or len(asks) == 0:
-        return False, "NO (Keine Bids/Asks)"
-
-    best_bid = float(bids[0][0])
-    best_ask = float(asks[0][0])
-
-    spread = (best_ask - best_bid) / best_bid * 100
-
-    bid_depth = sum(float(b[1]) for b in bids[:5])
-    ask_depth = sum(float(a[1]) for a in asks[:5])
-
-    # ✅ dynamische Mindesttiefe: 0.1% vom Preis, aber mindestens 5 Kontrakte
-    mark_price = kucoin_futures_get_mark_price(symbol)
-    min_depth = max(5, mark_price * 0.001)
-
-    logger.info(
-        f"[KUCOIN CHECK] {symbol} | Spread={spread:.3f}% | "
-        f"BidDepth={bid_depth:.2f} | AskDepth={ask_depth:.2f} | MinDepth={min_depth:.2f}"
-    )
-
-    if spread > 0.15:
-        return False, f"NO (Spread {spread:.3f}% > 0.15%)"
-
-    if bid_depth < min_depth:
-        return False, f"NO (Bid-Tiefe {bid_depth:.2f} < {min_depth:.2f})"
-
-    if ask_depth < min_depth:
-        return False, f"NO (Ask-Tiefe {ask_depth:.2f} < {min_depth:.2f})"
-
-    return True, "YES"
-
-
-# ---------------- KUCOIN FUTURES ORDERS + MONITORING ----------------
-
-kucoin_cooldowns = {}
-KUCOIN_COOLDOWN_SECONDS = 2 * 60 * 60
-kucoin_active_monitors = {}
-
-def kucoin_futures_place_short(symbol, logger):
-    side = "sell"
-    leverage = 20
-    size_usdt = 100
-    tp_percent = 5
-    sl_percent = 2
-
-    mark_price = kucoin_futures_get_mark_price(symbol)
-    qty = int(size_usdt / mark_price)
-    if qty < 1:
-       qty = 1
-
-
-    endpoint = "/api/v1/orders"
-    url = KUCOIN_FUTURES_BASE + endpoint
-
-    body_dict = {
-    "symbol": symbol,
-    "side": side,
-    "leverage": str(leverage),
-    "type": "market",
-    "size": str(qty),
-    "clientOid": str(int(time.time() * 1000)),
-    
-}
-
-
-    body = json.dumps(body_dict)
-    headers = kucoin_futures_sign("POST", endpoint, "", body)
-
-    r = requests.post(url, headers=headers, data=body, timeout=10)
-    resp = r.json()
-    logger.info(f"[KUCOIN ORDER] {resp}")
-
-    entry_price = mark_price
-    tp_price = round(entry_price * (1 - tp_percent / 100), 4)
-    sl_price = round(entry_price * (1 + sl_percent / 100), 4)
-
-    if not kucoin_active_monitors.get(symbol, False):
-        threading.Thread(
-            target=kucoin_monitor_position,
-            args=(symbol, entry_price, tp_price, sl_price)
-        ).start()
-
-    kucoin_cooldowns[symbol] = time.time()
-
-    logger.info(f"[KUCOIN SHORT] {symbol} eröffnet bei {entry_price}, TP={tp_price}, SL={sl_price}")
-    return resp, entry_price, tp_price, sl_price
-
-def kucoin_futures_close_all(symbol, logger):
-    endpoint = "/api/v1/position/close-position"
-    url = KUCOIN_FUTURES_BASE + endpoint
-
-    body_dict = {"symbol": symbol}
-    body = json.dumps(body_dict)
-    headers = kucoin_futures_sign("POST", endpoint, "", body)
-
-    r = requests.post(url, headers=headers, data=body, timeout=10)
-    resp = r.json()
-    logger.info(f"[KUCOIN CLOSE] {resp}")
-    return resp
-
-def kucoin_monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
-    app.logger.info(f"[KUCOIN MONITOR] {symbol} gestartet")
-    kucoin_active_monitors[symbol] = True
-    try:
-        trailing_percent = 0.025
-        be_set = False
-
-        while True:
-            current = kucoin_futures_get_mark_price(symbol)
-            app.logger.info(f"[KUCOIN PRICE] {symbol} = {current}")
-
-            if not be_set and current <= entry_price * (1 - trailing_percent):
-                sl_price = entry_price
-                be_set = True
-                app.logger.info(f"[KUCOIN BE] Break-Even aktiviert für {symbol}")
-
-            if current <= tp_price or current >= sl_price:
-                app.logger.info(f"[KUCOIN EXIT] {symbol} TP/SL erreicht")
-                kucoin_futures_close_all(symbol, app.logger)
-                break
-
-            time.sleep(interval)
-    finally:
-        kucoin_active_monitors[symbol] = False
-
-# ---------------- HEALTH + DEBUG ----------------
+# ---------------- HEALTH CHECK ----------------
 
 @app.route("/", methods=["GET", "POST"])
 def health_check():
     return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
+# ---------------- DEBUG ROUTE ----------------
+
 @app.route("/debug", methods=["GET"])
 def debug_logs():
     return "Bitte Render Dashboard → Logs öffnen.", 200
 
-# ---------------- BINGX MAIN WEBHOOK ----------------
+# ---------------- MAIN WEBHOOK ----------------
 
 @app.route("/testorder", methods=["POST"])
 def handle_alert():
@@ -478,13 +261,6 @@ def handle_alert():
             app.logger.error(f"[JSON ERROR] {e}")
             return jsonify({"status": "error", "message": "JSON Fehler"}), 400
 
-        # Weiterleitung an KuCoin-Route im selben Service
-        try:
-            requests.post("https://flask-webhook-bot-1.onrender.com/kucoin", json=data, timeout=3)
-            app.logger.info("[FORWARD] Signal an KuCoin weitergeleitet")
-        except Exception as e:
-            app.logger.error(f"[FORWARD ERROR] {e}")
-
         if not data or "currency" not in data or "percent" not in data:
             app.logger.warning("[IGNORED] Ungültiges JSON")
             return jsonify({"status": "ignored", "reason": "Ungültiges JSON"}), 200
@@ -498,105 +274,21 @@ def handle_alert():
         if pump_percent < 5:
             return jsonify({"status": "ignored", "reason": "Pump < 5%"}), 200
 
-        # Cooldown prüfen
-        now = time.time()
-        last_exec = cooldowns.get(symbol, 0)
-        if now - last_exec < COOLDOWN_SECONDS:
-            remaining = int(COOLDOWN_SECONDS - (now - last_exec))
-            app.logger.info(f"[COOLDOWN] {symbol} {remaining}s")
-            return jsonify({"status": "cooldown", "remaining_seconds": remaining}), 200
-
-        # Sofortige Prüfung der Reversal-Bedingungen
+        # Sofortige Prüfung
         ok, reason = check_reversal_conditions(symbol, app.logger)
         app.logger.info(f"[RESULT] {reason}")
 
         if ok:
-            entry_resp, entry_price, tp_price, sl_price = trigger_short(symbol)
-            return jsonify({
-                "status": "ok",
-                "reason": "Sofort ausgelöst",
-                "symbol": symbol,
-                "entry_price": entry_price,
-                "tp_price": tp_price,
-                "sl_price": sl_price,
-                "entry_response": entry_resp,
-                "positions_response": get_positions()
-            }), 200
+            trigger_short(symbol)
+            return jsonify({"status": "ok", "reason": "Sofort ausgelöst"}), 200
 
-        # Watcher starten (45 Minuten)
+        # Watcher starten
         threading.Thread(target=pump_watcher, args=(symbol, pump_percent)).start()
 
         return jsonify({"status": "watching", "reason": "Watcher gestartet (45 Minuten)"}), 200
 
     except Exception as e:
         app.logger.error(f"[ERROR] {e}")
-        return jsonify({"status": "error", "message": str(e)}), 400
-
-# ---------------- KUCOIN FUTURES WEBHOOK ----------------
-
-@app.route("/kucoin", methods=["POST"])
-def kucoin_handler():
-    try:
-        raw = request.data
-        app.logger.info(f"[KUCOIN RAW] {raw}")
-
-        try:
-            data = request.get_json(force=True)
-            app.logger.info(f"[KUCOIN JSON] {data}")
-        except Exception as e:
-            app.logger.error(f"[KUCOIN JSON ERROR] {e}")
-            return jsonify({"status": "error", "message": "JSON Fehler"}), 400
-
-        if not data or "currency" not in data or "percent" not in data:
-            app.logger.warning("[KUCOIN IGNORED] Ungültiges JSON")
-            return jsonify({"status": "ignored", "reason": "Ungültiges JSON"}), 200
-
-        currency = str(data["currency"]).upper()
-        fut_symbol = kucoin_symbol_from_currency(currency)
-        pump_percent = float(data["percent"])
-
-        app.logger.info(f"[KUCOIN RECEIVED] {fut_symbol} Pump={pump_percent}%")
-
-        # Cooldown prüfen
-        now = time.time()
-        last_exec = kucoin_cooldowns.get(fut_symbol, 0)
-        if now - last_exec < KUCOIN_COOLDOWN_SECONDS:
-            remaining = int(KUCOIN_COOLDOWN_SECONDS - (now - last_exec))
-            app.logger.info(f"[KUCOIN COOLDOWN] {fut_symbol} {remaining}s")
-            return jsonify({
-                "status": "cooldown",
-                "exchange": "kucoin_futures",
-                "symbol": fut_symbol,
-                "remaining_seconds": remaining
-            }), 200
-
-        # Spread + Orderbook-Strategie
-        ok, reason = kucoin_check_conditions(fut_symbol, app.logger)
-        app.logger.info(f"[KUCOIN RESULT] {reason}")
-
-        if not ok:
-            return jsonify({
-                "status": "ignored",
-                "exchange": "kucoin_futures",
-                "symbol": fut_symbol,
-                "reason": reason
-            }), 200
-
-        # Market-Short + TP/SL/BE + Monitoring
-        order_resp, entry_price, tp_price, sl_price = kucoin_futures_place_short(fut_symbol, app.logger)
-
-        return jsonify({
-            "status": "ok",
-            "exchange": "kucoin_futures",
-            "symbol": fut_symbol,
-            "entry_price": entry_price,
-            "tp_price": tp_price,
-            "sl_price": sl_price,
-            "order_response": order_resp
-        }), 200
-
-    except Exception as e:
-        app.logger.error(f"[KUCOIN ERROR] {e}")
         return jsonify({"status": "error", "message": str(e)}), 400
 
 # ---------------- RUN ----------------
