@@ -130,6 +130,11 @@ def check_reversal_conditions(symbol, logger):
     time.sleep(0.4)
     p3 = get_price(symbol)
     momentum_falling = p3 < p2 < p1
+    
+        logger.info(f"[RSI DEBUG] len(closes)={len(closes)} | last_closes={closes[-5:]}")
+    rsi = calc_rsi(closes)
+    logger.info(f"[RSI RAW] {rsi}")
+
 
     rsi = calc_rsi(closes)
 
