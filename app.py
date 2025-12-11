@@ -172,7 +172,7 @@ COOLDOWN_SECONDS = 2 * 60 * 60
 
 # ---------------- HEALTH CHECK ----------------
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/testorder", methods=["GET", "POST"])
 def health_check():
     return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
