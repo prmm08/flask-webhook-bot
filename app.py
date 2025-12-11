@@ -1,9 +1,10 @@
-# -------- VER 1.9: BingX Pump-Bot + KuCoin Futures Bot in einem Flask-Service --------
-#
-# BingX Bot (Pump + 45 Minuten Watcher, TP/SL/BE, Monitoring, Cooldown)
-# KuCoin Futures Bot (Spread/Orderbook Check, Market Short, TP/SL/BE, Monitoring, Cooldown)
-# Weiterleitung vom BingX Webhook zur KuCoin Route
-# Kompakte Logs + robustere KuCoin-API-Checks + dynamische Orderbook-Tiefe
+#/ -------- VER 1.8: Pump-Trigger + 45-Minuten-Watcher + Compact Logs --------
+#✅ 45‑Minuten‑Watcher (statt 30) 
+#✅ jede Minute erneute Prüfung 
+#✅ Pump wird NICHT erneut geprüft 
+#✅ Pump ist nur der Trigger 
+#✅ Watcher prüft NUR die anderen Bedingungen 
+#✅ kompakte Logs 
 
 import time
 import hmac
@@ -13,8 +14,6 @@ import os
 import urllib.parse
 import threading
 import logging
-import base64
-import json
 from flask import Flask, request, jsonify
 
 # ---------------- FLASK + LOGGING SETUP ----------------
@@ -26,28 +25,19 @@ handler = logging.StreamHandler()
 handler.setLevel(logging.INFO)
 app.logger.addHandler(handler)
 
-# ---------------- BINGX CONFIG ----------------
+# ---------------- API KEYS ----------------
 
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
+# ---------------- SIGNING ----------------
 
+def sign_params(params):
+    query = urllib.parse.urlencode(sorted(params.items()))
+    return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-# ---------------- COMMON HELPERS ----------------
-
-
-
-def dynamic_round(price, value):
-    if price > 1000:
-        decimals = 2
-    elif price > 1:
-        decimals = 4
-    else:
-        decimals = 6
-    return round(value, decimals)
-
-# ---------------- BINGX PRICE + POSITIONS ----------------
+# ---------------- PRICE + POSITIONS ----------------
 
 def get_price(symbol):
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
@@ -71,7 +61,18 @@ def close_all_positions(symbol):
     app.logger.info(f"[CLOSE] {resp.json()}")
     return resp.json()
 
-# ---------------- BINGX OHLCV + RSI ----------------
+# ---------------- DYNAMIC ROUND ----------------
+
+def dynamic_round(price, value):
+    if price > 1000:
+        decimals = 2
+    elif price > 1:
+        decimals = 4
+    else:
+        decimals = 6
+    return round(value, decimals)
+
+# ---------------- OHLCV + RSI ----------------
 
 def get_ohlcv(symbol, interval="1m", limit=10):
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
@@ -94,10 +95,11 @@ def calc_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ---------------- BINGX FILTER OHNE PUMP (für Watcher) ----------------
+
+# ---------------- FILTER OHNE PUMP (für Watcher) ----------------
 
 def check_reversal_conditions(symbol, logger):
-    ohlcv = get_ohlcv(symbol, "1m", 100)
+    ohlcv = get_ohlcv(symbol, "1m", 50)
     if len(ohlcv) < 6:
         return False, "NO (Nicht genug OHLCV)"
 
@@ -139,7 +141,7 @@ def check_reversal_conditions(symbol, logger):
 
     return True, "YES"
 
-# ---------------- BINGX 45-MINUTEN WATCHER ----------------
+# ---------------- 45-MINUTEN WATCHER ----------------
 
 def pump_watcher(symbol, pump_percent):
     app.logger.info(f"[WATCHER] gestartet für {symbol} (45 Minuten)")
@@ -159,11 +161,7 @@ def pump_watcher(symbol, pump_percent):
 
     app.logger.info(f"[WATCHER END] Keine Bedingungen erfüllt nach 45 Minuten")
 
-# ---------------- BINGX SHORT AUSLÖSEN + MONITORING ----------------
-
-active_monitors = {}
-cooldowns = {}
-COOLDOWN_SECONDS = 2 * 60 * 60
+# ---------------- SHORT AUSLÖSEN ----------------
 
 def trigger_short(symbol):
     side = "SELL"
@@ -201,8 +199,11 @@ def trigger_short(symbol):
 
     cooldowns[symbol] = time.time()
 
-    app.logger.info(f"[SHORT] {symbol} eröffnet bei {price} TP={tp_price} SL={sl_price}")
-    return entry_resp.json(), price, tp_price, sl_price
+    app.logger.info(f"[SHORT] {symbol} eröffnet bei {price}")
+
+# ---------------- POSITION MONITOR ----------------
+
+active_monitors = {}
 
 def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
     app.logger.info(f"[MONITOR] {symbol} gestartet")
@@ -229,19 +230,24 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
     finally:
         active_monitors[symbol] = False
 
+# ---------------- COOLDOWN ----------------
 
+cooldowns = {}
+COOLDOWN_SECONDS = 2 * 60 * 60
 
-# ---------------- HEALTH + DEBUG ----------------
+# ---------------- HEALTH CHECK ----------------
 
 @app.route("/", methods=["GET", "POST"])
 def health_check():
     return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
+# ---------------- DEBUG ROUTE ----------------
+
 @app.route("/debug", methods=["GET"])
 def debug_logs():
     return "Bitte Render Dashboard → Logs öffnen.", 200
 
-# ---------------- BINGX MAIN WEBHOOK ----------------
+# ---------------- MAIN WEBHOOK ----------------
 
 @app.route("/testorder", methods=["POST"])
 def handle_alert():
@@ -256,34 +262,29 @@ def handle_alert():
             app.logger.error(f"[JSON ERROR] {e}")
             return jsonify({"status": "error", "message": "JSON Fehler"}), 400
 
-       
+        if not data or "currency" not in data or "percent" not in data:
+            app.logger.warning("[IGNORED] Ungültiges JSON")
+            return jsonify({"status": "ignored", "reason": "Ungültiges JSON"}), 200
 
-        # Cooldown prüfen
-        now = time.time()
-        last_exec = cooldowns.get(symbol, 0)
-        if now - last_exec < COOLDOWN_SECONDS:
-            remaining = int(COOLDOWN_SECONDS - (now - last_exec))
-            app.logger.info(f"[COOLDOWN] {symbol} {remaining}s")
-            return jsonify({"status": "cooldown", "remaining_seconds": remaining}), 200
+        currency = str(data["currency"]).upper()
+        symbol = f"{currency}-USDT"
+        pump_percent = float(data["percent"])
 
-        # Sofortige Prüfung der Reversal-Bedingungen
+        app.logger.info(f"[RECEIVED] {symbol} Pump={pump_percent}%")
+
+        if pump_percent < 2.5:
+            return jsonify({"status": "ignored", "reason": "Pump < 2.5%"}), 200
+
+
+        # Sofortige Prüfung
         ok, reason = check_reversal_conditions(symbol, app.logger)
         app.logger.info(f"[RESULT] {reason}")
 
         if ok:
-            entry_resp, entry_price, tp_price, sl_price = trigger_short(symbol)
-            return jsonify({
-                "status": "ok",
-                "reason": "Sofort ausgelöst",
-                "symbol": symbol,
-                "entry_price": entry_price,
-                "tp_price": tp_price,
-                "sl_price": sl_price,
-                "entry_response": entry_resp,
-                "positions_response": get_positions()
-            }), 200
+            trigger_short(symbol)
+            return jsonify({"status": "ok", "reason": "Sofort ausgelöst"}), 200
 
-        # Watcher starten (45 Minuten)
+        # Watcher starten
         threading.Thread(target=pump_watcher, args=(symbol, pump_percent)).start()
 
         return jsonify({"status": "watching", "reason": "Watcher gestartet (45 Minuten)"}), 200
@@ -291,8 +292,6 @@ def handle_alert():
     except Exception as e:
         app.logger.error(f"[ERROR] {e}")
         return jsonify({"status": "error", "message": str(e)}), 400
-
-
 
 # ---------------- RUN ----------------
 
