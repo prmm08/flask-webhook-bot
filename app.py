@@ -1,4 +1,10 @@
-# -------- VER 2.0: Auto Orders + Pump-Filter + JSON-Fix + Render-Logging + Compact Logs --------
+#/ -------- VER 1.8: Pump-Trigger + 45-Minuten-Watcher + Compact Logs --------
+#✅ 45‑Minuten‑Watcher (statt 30) 
+#✅ jede Minute erneute Prüfung 
+#✅ Pump wird NICHT erneut geprüft 
+#✅ Pump ist nur der Trigger 
+#✅ Watcher prüft NUR die anderen Bedingungen 
+#✅ kompakte Logs 
 
 import time
 import hmac
@@ -14,7 +20,6 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Logging für Render aktivieren
 app.logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setLevel(logging.INFO)
@@ -90,9 +95,9 @@ def calc_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ---------------- PUMP FILTER LOGIC (KOMPAKTES LOGGING) ----------------
+# ---------------- FILTER OHNE PUMP (für Watcher) ----------------
 
-def check_short_conditions(symbol, pump_percent, logger):
+def check_reversal_conditions(symbol, logger):
     ohlcv = get_ohlcv(symbol, "1m", 10)
     if len(ohlcv) < 6:
         return False, "NO (Nicht genug OHLCV)"
@@ -120,29 +125,80 @@ def check_short_conditions(symbol, pump_percent, logger):
 
     rsi = calc_rsi(closes)
 
-    current_price = closes[-1]
-    previous_price = closes[-2]
-    real_pump = (current_price - previous_price) / previous_price * 100
-
-    # ✅ Kompakte Analyse-Zeile
     logger.info(
-        f"[SHORT] {symbol} | Pump={pump_percent}% | Real={real_pump:.2f}% | "
-        f"Vol={vol_spike} | Wick={wick_reversal} | Mom={momentum_falling} | RSI={rsi:.1f}"
+        f"[CHECK] {symbol} | Vol={vol_spike} | Wick={wick_reversal} | Mom={momentum_falling} | RSI={rsi:.1f}"
     )
 
-    # ✅ Ergebnis
-    if real_pump < pump_percent:
-        return False, f"NO (Real {real_pump:.2f}% < {pump_percent}%)"
     if not vol_spike:
-        return False, "NO (Volumen-Spike fehlt)"
+        return False, "NO (Volumen fehlt)"
     if not wick_reversal:
-        return False, "NO (Wick-Reversal fehlt)"
+        return False, "NO (Wick fehlt)"
     if not momentum_falling:
         return False, "NO (Momentum nicht gedreht)"
     if rsi <= 80:
         return False, f"NO (RSI {rsi:.1f} nicht überkauft)"
 
     return True, "YES"
+
+# ---------------- 45-MINUTEN WATCHER ----------------
+
+def pump_watcher(symbol, pump_percent):
+    app.logger.info(f"[WATCHER] gestartet für {symbol} (45 Minuten)")
+
+    start = time.time()
+    max_duration = 45 * 60  # 45 Minuten
+
+    while time.time() - start < max_duration:
+        ok, reason = check_reversal_conditions(symbol, app.logger)
+
+        if ok:
+            app.logger.info(f"[WATCHER RESULT] Bedingungen erfüllt → SHORT")
+            trigger_short(symbol)
+            return
+
+        time.sleep(60)
+
+    app.logger.info(f"[WATCHER END] Keine Bedingungen erfüllt nach 45 Minuten")
+
+# ---------------- SHORT AUSLÖSEN ----------------
+
+def trigger_short(symbol):
+    side = "SELL"
+    size = 100
+    leverage = 20
+    tp_percent = 5
+    sl_percent = 2
+
+    price = get_price(symbol)
+    qty = round(size / price, 6)
+
+    headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+    url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
+
+    entry_params = {
+        "leverage": str(leverage),
+        "positionSide": "SHORT",
+        "quantity": str(qty),
+        "side": side,
+        "symbol": symbol,
+        "timestamp": str(int(time.time() * 1000)),
+        "type": "MARKET"
+    }
+    entry_params["signature"] = sign_params(entry_params)
+    entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
+
+    tp_price = dynamic_round(price, price * (1 - tp_percent / 100))
+    sl_price = dynamic_round(price, price * (1 + sl_percent / 100))
+
+    if not active_monitors.get(symbol, False):
+        threading.Thread(
+            target=monitor_position,
+            args=(symbol, price, tp_price, sl_price)
+        ).start()
+
+    cooldowns[symbol] = time.time()
+
+    app.logger.info(f"[SHORT] {symbol} eröffnet bei {price}")
 
 # ---------------- POSITION MONITOR ----------------
 
@@ -218,63 +274,18 @@ def handle_alert():
         if pump_percent < 5:
             return jsonify({"status": "ignored", "reason": "Pump < 5%"}), 200
 
-        ok, reason = check_short_conditions(symbol, pump_percent, app.logger)
+        # Sofortige Prüfung
+        ok, reason = check_reversal_conditions(symbol, app.logger)
         app.logger.info(f"[RESULT] {reason}")
 
-        if not ok:
-            return jsonify({"status": "ignored", "reason": reason}), 200
+        if ok:
+            trigger_short(symbol)
+            return jsonify({"status": "ok", "reason": "Sofort ausgelöst"}), 200
 
-        now = time.time()
-        last_exec = cooldowns.get(symbol, 0)
-        if now - last_exec < COOLDOWN_SECONDS:
-            remaining = int(COOLDOWN_SECONDS - (now - last_exec))
-            app.logger.info(f"[COOLDOWN] {symbol} {remaining}s")
-            return jsonify({"status": "cooldown", "remaining_seconds": remaining}), 200
+        # Watcher starten
+        threading.Thread(target=pump_watcher, args=(symbol, pump_percent)).start()
 
-        side = "SELL"
-        size = 100
-        leverage = 20
-        tp_percent = 5
-        sl_percent = 2
-
-        price = get_price(symbol)
-        qty = round(size / price, 6)
-
-        headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
-        url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
-
-        entry_params = {
-            "leverage": str(leverage),
-            "positionSide": "SHORT",
-            "quantity": str(qty),
-            "side": side,
-            "symbol": symbol,
-            "timestamp": str(int(time.time() * 1000)),
-            "type": "MARKET"
-        }
-        entry_params["signature"] = sign_params(entry_params)
-        entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
-
-        tp_price = dynamic_round(price, price * (1 - tp_percent / 100))
-        sl_price = dynamic_round(price, price * (1 + sl_percent / 100))
-
-        if not active_monitors.get(symbol, False):
-            threading.Thread(
-                target=monitor_position,
-                args=(symbol, price, tp_price, sl_price)
-            ).start()
-
-        cooldowns[symbol] = now
-
-        return jsonify({
-            "status": "ok",
-            "symbol": symbol,
-            "entry_price": price,
-            "tp_price": tp_price,
-            "sl_price": sl_price,
-            "entry_response": entry_resp.json(),
-            "positions_response": get_positions()
-        }), 200
+        return jsonify({"status": "watching", "reason": "Watcher gestartet (45 Minuten)"}), 200
 
     except Exception as e:
         app.logger.error(f"[ERROR] {e}")
