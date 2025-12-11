@@ -3,7 +3,7 @@
 #✅ jede Minute erneute Prüfung 
 #✅ Pump wird NICHT erneut geprüft 
 #✅ Pump ist nur der Trigger 
-#✅ Watcher prüft NUR die anderen Bedingungen 
+#✅ Watcher prüft NUR die anderen Bedingungen: Wick, Momentum
 #✅ kompakte Logs 
 
 import time
@@ -83,17 +83,24 @@ def get_ohlcv(symbol, interval="1m", limit=10):
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50
-    gains, losses = [], []
+
+    gains = []
+    losses = []
+
     for i in range(1, period + 1):
         diff = closes[-i] - closes[-i - 1]
-        if diff >= 0:
+        if diff > 0:
             gains.append(diff)
         else:
             losses.append(abs(diff))
+
     avg_gain = sum(gains) / period if gains else 0.00001
     avg_loss = sum(losses) / period if losses else 0.00001
+
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi
 
 
 # ---------------- FILTER OHNE PUMP (für Watcher) ----------------
@@ -104,7 +111,6 @@ def check_reversal_conditions(symbol, logger):
         return False, "NO (Nicht genug OHLCV)"
 
     closes = [float(c["close"]) for c in ohlcv]
-    volumes = [float(c["volume"]) for c in ohlcv]
 
     last = ohlcv[-1]
     open_p = float(last["open"])
@@ -113,10 +119,10 @@ def check_reversal_conditions(symbol, logger):
     wick = high_p - max(open_p, close_p)
     body = abs(close_p - open_p)
 
-    avg_vol = sum(volumes[-6:-1]) / 5
-    vol_spike = volumes[-1] > avg_vol * 2
+    # ✅ Wick-Reversal
     wick_reversal = wick > body * 1.3
 
+    # ✅ Momentum-Drehung
     p1 = get_price(symbol)
     time.sleep(0.4)
     p2 = get_price(symbol)
@@ -124,22 +130,19 @@ def check_reversal_conditions(symbol, logger):
     p3 = get_price(symbol)
     momentum_falling = p3 < p2 < p1
 
-    rsi = calc_rsi(closes)
-
+    # ✅ Kompaktes Logging ohne Volumen & RSI
     logger.info(
-        f"[CHECK] {symbol} | Vol={vol_spike} | Wick={wick_reversal} | Mom={momentum_falling} | RSI={rsi:.1f}"
+        f"[CHECK] {symbol} | Wick={wick_reversal} | Mom={momentum_falling}"
     )
 
-    if not vol_spike:
-        return False, "NO (Volumen fehlt)"
+    # ✅ Nur noch 2 Bedingungen
     if not wick_reversal:
         return False, "NO (Wick fehlt)"
     if not momentum_falling:
         return False, "NO (Momentum nicht gedreht)"
-    if rsi <= 80:
-        return False, f"NO (RSI {rsi:.1f} nicht überkauft)"
 
     return True, "YES"
+
 
 # ---------------- 45-MINUTEN WATCHER ----------------
 
