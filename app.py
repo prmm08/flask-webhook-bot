@@ -107,7 +107,7 @@ def handle_alert():
             }), 200
 
         side = "SELL"
-        size = 20
+        size = 40
         leverage = 20
         tp_percent = 5
         sl_percent = 2
