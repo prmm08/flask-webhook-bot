@@ -389,7 +389,7 @@ def kucoin_futures_place_short(symbol, logger):
     "type": "market",
     "size": str(qty),
     "clientOid": str(int(time.time() * 1000)),
-    "marginMode": "cross"   # ✅ WICHTIG: Margin Mode explizit setzen
+    
 }
 
 
