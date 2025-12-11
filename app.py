@@ -263,7 +263,7 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
 
 def kucoin_symbol_from_currency(currency):
     # ggf. an KuCoin-Namen anpassen (z.B. PEPEUSDTM etc.)
-    return f"{currency}USDT"
+    return f"{currency}USDTM"
 
 def kucoin_futures_get_mark_price(symbol):
     endpoint = "/api/v1/mark-price"
