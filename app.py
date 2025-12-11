@@ -83,22 +83,30 @@ def get_ohlcv(symbol, interval="1m", limit=10):
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50
-    gains, losses = [], []
+
+    gains = []
+    losses = []
+
     for i in range(1, period + 1):
         diff = closes[-i] - closes[-i - 1]
-        if diff >= 0:
+        if diff > 0:
             gains.append(diff)
         else:
             losses.append(abs(diff))
+
     avg_gain = sum(gains) / period if gains else 0.00001
     avg_loss = sum(losses) / period if losses else 0.00001
+
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi
+
 
 # ---------------- FILTER OHNE PUMP (für Watcher) ----------------
 
 def check_reversal_conditions(symbol, logger):
-    ohlcv = get_ohlcv(symbol, "1m", 10)
+    ohlcv = get_ohlcv(symbol, "1m", 50)
     if len(ohlcv) < 6:
         return False, "NO (Nicht genug OHLCV)"
 
