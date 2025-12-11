@@ -261,7 +261,6 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
 # ---------------- KUCOIN FUTURES HELPERS ----------------
 
 def kucoin_symbol_from_currency(currency):
-    # Mapping auf KuCoin-Futures-Symbole
     mapping = {
         "BTC": "XBTUSDTM",
         "XBT": "XBTUSDTM",
@@ -270,21 +269,43 @@ def kucoin_symbol_from_currency(currency):
         "XRP": "XRPUSDTM",
         "DOGE": "DOGEUSDTM",
         "ADA": "ADAUSDTM",
+
+        # ✅ wichtig für dich:
+        "JCT": "JCTUSDTM",
     }
     return mapping.get(currency, f"{currency}USDTM")
 
+
 def kucoin_futures_get_mark_price(symbol):
+    # 1) Versuch: offizieller Mark Price
     endpoint = "/api/v1/mark-price"
     query = f"symbol={symbol}"
     url = KUCOIN_FUTURES_BASE + endpoint + "?" + query
     r = requests.get(url, timeout=10)
     data = r.json()
 
-    if "data" not in data or "value" not in data["data"]:
-        app.logger.error(f"[KUCOIN ERROR] Mark Price Response: {data}")
-        raise Exception("KuCoin Mark Price API returned no data")
+    # Wenn Mark Price existiert → nutzen
+    if "data" in data and data["data"] and "value" in data["data"]:
+        return float(data["data"]["value"])
 
-    return float(data["data"]["value"])
+    # 2) Fallback: Orderbook holen
+    app.logger.warning(f"[KUCOIN WARNING] Kein Mark Price für {symbol}, nutze Mid-Price")
+    ob = kucoin_futures_get_orderbook(symbol)
+    if not ob:
+        raise Exception("KuCoin Mark Price API returned no data AND Orderbook empty")
+
+    bids = ob.get("bids", [])
+    asks = ob.get("asks", [])
+
+    if not bids or not asks:
+        raise Exception("KuCoin Mark Price API returned no data AND no bids/asks")
+
+    best_bid = float(bids[0][0])
+    best_ask = float(asks[0][0])
+
+    # Mid-Price als Ersatz
+    return (best_bid + best_ask) / 2
+
 
 def kucoin_futures_get_orderbook(symbol):
     endpoint = "/api/v1/level2/depth20"
@@ -318,7 +339,7 @@ def kucoin_check_conditions(symbol, logger):
     bid_depth = sum(float(b[1]) for b in bids[:5])
     ask_depth = sum(float(a[1]) for a in asks[:5])
 
-    # Dynamische Mindesttiefe: 0.1% vom Preis, aber mindestens 5 Kontrakte
+    # ✅ dynamische Mindesttiefe: 0.1% vom Preis, aber mindestens 5 Kontrakte
     mark_price = kucoin_futures_get_mark_price(symbol)
     min_depth = max(5, mark_price * 0.001)
 
@@ -337,6 +358,7 @@ def kucoin_check_conditions(symbol, logger):
         return False, f"NO (Ask-Tiefe {ask_depth:.2f} < {min_depth:.2f})"
 
     return True, "YES"
+
 
 # ---------------- KUCOIN FUTURES ORDERS + MONITORING ----------------
 
