@@ -168,9 +168,9 @@ def pump_watcher(symbol, pump_percent):
 
 def trigger_short(symbol):
     side = "SELL"
-    size = 100
+    size = 20
     leverage = 20
-    tp_percent = 5
+    tp_percent = 4
     sl_percent = 2
 
     price = get_price(symbol)
