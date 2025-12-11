@@ -1,10 +1,4 @@
-#/ -------- VER 1.8: Pump-Trigger + 45-Minuten-Watcher + Compact Logs --------
-#✅ 45‑Minuten‑Watcher (statt 30) 
-#✅ jede Minute erneute Prüfung 
-#✅ Pump wird NICHT erneut geprüft 
-#✅ Pump ist nur der Trigger 
-#✅ Watcher prüft NUR die anderen Bedingungen: Wick, Momentum
-#✅ kompakte Logs 
+# -------- VER 1.7: Auto Orders/TP/SL/Monitoring/Cooldown/BE --------
 
 import time
 import hmac
@@ -13,31 +7,17 @@ import requests
 import os
 import urllib.parse
 import threading
-import logging
 from flask import Flask, request, jsonify
-
-# ---------------- FLASK + LOGGING SETUP ----------------
-
-app = Flask(__name__)
-
-app.logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setLevel(logging.INFO)
-app.logger.addHandler(handler)
-
-# ---------------- API KEYS ----------------
 
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
-# ---------------- SIGNING ----------------
+app = Flask(__name__)
 
 def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-
-# ---------------- PRICE + POSITIONS ----------------
 
 def get_price(symbol):
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
@@ -58,10 +38,8 @@ def close_all_positions(symbol):
     params = {"symbol": symbol, "timestamp": str(int(time.time() * 1000))}
     params["signature"] = sign_params(params)
     resp = requests.post(url, data=params, headers=headers, timeout=10)
-    app.logger.info(f"[CLOSE] {resp.json()}")
+    print("CloseAll response:", resp.json())
     return resp.json()
-
-# ---------------- DYNAMIC ROUND ----------------
 
 def dynamic_round(price, value):
     if price > 1000:
@@ -72,160 +50,29 @@ def dynamic_round(price, value):
         decimals = 6
     return round(value, decimals)
 
-# ---------------- OHLCV + RSI ----------------
-
-def get_ohlcv(symbol, interval="1m", limit=10):
-    url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=10)
-    return r.json().get("data", [])
-
-def calc_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50
-
-    gains = []
-    losses = []
-
-    for i in range(1, period + 1):
-        diff = closes[-i] - closes[-i - 1]
-        if diff > 0:
-            gains.append(diff)
-        else:
-            losses.append(abs(diff))
-
-    avg_gain = sum(gains) / period if gains else 0.00001
-    avg_loss = sum(losses) / period if losses else 0.00001
-
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-
-    return rsi
-
-
-# ---------------- FILTER OHNE PUMP (für Watcher) ----------------
-
-def check_reversal_conditions(symbol, logger):
-    ohlcv = get_ohlcv(symbol, "1m", 50)
-    if len(ohlcv) < 6:
-        return False, "NO (Nicht genug OHLCV)"
-
-    closes = [float(c["close"]) for c in ohlcv]
-
-    last = ohlcv[-1]
-    open_p = float(last["open"])
-    close_p = float(last["close"])
-    high_p = float(last["high"])
-    wick = high_p - max(open_p, close_p)
-    body = abs(close_p - open_p)
-
-    # ✅ Wick-Reversal
-    wick_reversal = wick > body * 1.3
-
-    # ✅ Momentum-Drehung
-    p1 = get_price(symbol)
-    time.sleep(0.4)
-    p2 = get_price(symbol)
-    time.sleep(0.4)
-    p3 = get_price(symbol)
-    momentum_falling = p3 < p2 < p1
-
-    # ✅ Kompaktes Logging ohne Volumen & RSI
-    logger.info(
-        f"[CHECK] {symbol} | Wick={wick_reversal} | Mom={momentum_falling}"
-    )
-
-    # ✅ Nur noch 2 Bedingungen
-    if not wick_reversal:
-        return False, "NO (Wick fehlt)"
-    if not momentum_falling:
-        return False, "NO (Momentum nicht gedreht)"
-
-    return True, "YES"
-
-
-# ---------------- 45-MINUTEN WATCHER ----------------
-
-def pump_watcher(symbol, pump_percent):
-    app.logger.info(f"[WATCHER] gestartet für {symbol} (45 Minuten)")
-
-    start = time.time()
-    max_duration = 45 * 60  # 45 Minuten
-
-    while time.time() - start < max_duration:
-        ok, reason = check_reversal_conditions(symbol, app.logger)
-
-        if ok:
-            app.logger.info(f"[WATCHER RESULT] Bedingungen erfüllt → SHORT")
-            trigger_short(symbol)
-            return
-
-        time.sleep(60)
-
-    app.logger.info(f"[WATCHER END] Keine Bedingungen erfüllt nach 45 Minuten")
-
-# ---------------- SHORT AUSLÖSEN ----------------
-
-def trigger_short(symbol):
-    side = "SELL"
-    size = 20
-    leverage = 20
-    tp_percent = 4
-    sl_percent = 2
-
-    price = get_price(symbol)
-    qty = round(size / price, 6)
-
-    headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
-    url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
-
-    entry_params = {
-        "leverage": str(leverage),
-        "positionSide": "SHORT",
-        "quantity": str(qty),
-        "side": side,
-        "symbol": symbol,
-        "timestamp": str(int(time.time() * 1000)),
-        "type": "MARKET"
-    }
-    entry_params["signature"] = sign_params(entry_params)
-    entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
-
-    tp_price = dynamic_round(price, price * (1 - tp_percent / 100))
-    sl_price = dynamic_round(price, price * (1 + sl_percent / 100))
-
-    if not active_monitors.get(symbol, False):
-        threading.Thread(
-            target=monitor_position,
-            args=(symbol, price, tp_price, sl_price)
-        ).start()
-
-    cooldowns[symbol] = time.time()
-
-    app.logger.info(f"[SHORT] {symbol} eröffnet bei {price}")
-
-# ---------------- POSITION MONITOR ----------------
-
 active_monitors = {}
 
 def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
-    app.logger.info(f"[MONITOR] {symbol} gestartet")
+    """Überwacht SHORT-Position mit einmaligem BE-TSL"""
+    print(f"Monitoring SHORT {symbol}... TP={tp_price}, SL={sl_price}")
     active_monitors[symbol] = True
     try:
-        trailing_percent = 0.025
+        trailing_percent = 0.025  # 2%
         be_set = False
 
         while True:
             current = get_price(symbol)
-            app.logger.info(f"[PRICE] {symbol} = {current}")
+            print(f"Current {symbol} price:", current)
 
+            # Break-Even setzen bei +2% Gewinn
             if not be_set and current <= entry_price * (1 - trailing_percent):
                 sl_price = entry_price
                 be_set = True
-                app.logger.info(f"[BE] Break-Even aktiviert für {symbol}")
+                print(f"BE aktiviert für SHORT {symbol}: SL={sl_price}")
 
+            # Schließen bei TP oder SL
             if current <= tp_price or current >= sl_price:
-                app.logger.info(f"[EXIT] {symbol} TP/SL erreicht")
+                print(f"Target reached, closing SHORT {symbol} position")
                 close_all_positions(symbol)
                 break
 
@@ -233,71 +80,83 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
     finally:
         active_monitors[symbol] = False
 
-# ---------------- COOLDOWN ----------------
-
 cooldowns = {}
 COOLDOWN_SECONDS = 2 * 60 * 60
-
-# ---------------- HEALTH CHECK ----------------
 
 @app.route("/", methods=["GET", "POST"])
 def health_check():
     return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
-# ---------------- DEBUG ROUTE ----------------
-
-@app.route("/debug", methods=["GET"])
-def debug_logs():
-    return "Bitte Render Dashboard → Logs öffnen.", 200
-
-# ---------------- MAIN WEBHOOK ----------------
-
 @app.route("/testorder", methods=["POST"])
 def handle_alert():
     try:
-        raw = request.data
-        app.logger.info(f"[RAW] {raw}")
+        data = request.get_json(force=True, silent=True) or {}
+        if not data.get("currency"):
+            return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
-        try:
-            data = request.get_json(force=True)
-            app.logger.info(f"[JSON] {data}")
-        except Exception as e:
-            app.logger.error(f"[JSON ERROR] {e}")
-            return jsonify({"status": "error", "message": "JSON Fehler"}), 400
-
-        if not data or "currency" not in data or "percent" not in data:
-            app.logger.warning("[IGNORED] Ungültiges JSON")
-            return jsonify({"status": "ignored", "reason": "Ungültiges JSON"}), 200
-
-        currency = str(data["currency"]).upper()
+        currency = str(data.get("currency", "")).upper()
         symbol = f"{currency}-USDT"
-        pump_percent = float(data["percent"])
 
-        app.logger.info(f"[RECEIVED] {symbol} Pump={pump_percent}%")
+        now = time.time()
+        last_exec = cooldowns.get(symbol, 0)
+        if now - last_exec < COOLDOWN_SECONDS:
+            return jsonify({
+                "status": "cooldown",
+                "message": f"{symbol} ist noch im Cooldown, bitte warten.",
+                "remaining_seconds": int(COOLDOWN_SECONDS - (now - last_exec))
+            }), 200
 
-        if pump_percent < 2.5:
-            return jsonify({"status": "ignored", "reason": "Pump < 2.5%"}), 200
+        side = "SELL"
+        size = 20
+        leverage = 20
+        tp_percent = 4
+        sl_percent = 2
 
+        price = get_price(symbol)
+        qty = round(size / price, 6)
 
-        # Sofortige Prüfung
-        ok, reason = check_reversal_conditions(symbol, app.logger)
-        app.logger.info(f"[RESULT] {reason}")
+        headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+        url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
 
-        if ok:
-            trigger_short(symbol)
-            return jsonify({"status": "ok", "reason": "Sofort ausgelöst"}), 200
+        entry_params = {
+            "leverage": str(leverage),
+            "positionSide": "SHORT",
+            "quantity": str(qty),
+            "side": side,
+            "symbol": symbol,
+            "timestamp": str(int(time.time() * 1000)),
+            "type": "MARKET"
+        }
+        entry_params["signature"] = sign_params(entry_params)
+        entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
 
-        # Watcher starten
-        threading.Thread(target=pump_watcher, args=(symbol, pump_percent)).start()
+        tp_price = dynamic_round(price, price * (1 - tp_percent / 100))
+        sl_price = dynamic_round(price, price * (1 + sl_percent / 100))
 
-        return jsonify({"status": "watching", "reason": "Watcher gestartet (45 Minuten)"}), 200
+        if not active_monitors.get(symbol, False):
+            threading.Thread(
+                target=monitor_position,
+                args=(symbol, price, tp_price, sl_price)
+            ).start()
+
+        cooldowns[symbol] = now
+
+        return jsonify({
+            "status": "ok",
+            "alert_received": data,
+            "symbol": symbol,
+            "side": side,
+            "entry_price": price,
+            "tp_price": tp_price,
+            "sl_price": sl_price,
+            "entry_response": entry_resp.json(),
+            "positions_response": get_positions()
+        }), 200
 
     except Exception as e:
-        app.logger.error(f"[ERROR] {e}")
         return jsonify({"status": "error", "message": str(e)}), 400
-
-# ---------------- RUN ----------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
