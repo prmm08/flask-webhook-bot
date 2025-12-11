@@ -271,8 +271,9 @@ def handle_alert():
 
         app.logger.info(f"[RECEIVED] {symbol} Pump={pump_percent}%")
 
-        if pump_percent < 5:
-            return jsonify({"status": "ignored", "reason": "Pump < 5%"}), 200
+        if pump_percent < 2.5:
+            return jsonify({"status": "ignored", "reason": "Pump < 2.5%"}), 200
+
 
         # Sofortige Prüfung
         ok, reason = check_reversal_conditions(symbol, app.logger)
