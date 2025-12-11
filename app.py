@@ -289,7 +289,7 @@ def kucoin_futures_get_mark_price(symbol):
         return float(data["data"]["value"])
 
     # 2) Fallback: Orderbook holen
-    app.logger.warning(f"[KUCOIN WARNING] Kein Mark Price für {symbol}, nutze Mid-Price")
+    app.logger.info(f"[KUCOIN INFO] Kein Mark Price für {symbol}, nutze Mid-Price")
     ob = kucoin_futures_get_orderbook(symbol)
     if not ob:
         raise Exception("KuCoin Mark Price API returned no data AND Orderbook empty")
