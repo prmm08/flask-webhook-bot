@@ -1,4 +1,4 @@
-# -------- VER 1.9: Auto Orders + Pump-Filter + JSON-Fix + Render-Logging --------
+# -------- VER 2.0: Auto Orders + Pump-Filter + JSON-Fix + Render-Logging + Compact Logs --------
 
 import time
 import hmac
@@ -90,14 +90,12 @@ def calc_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ---------------- PUMP FILTER LOGIC ----------------
+# ---------------- PUMP FILTER LOGIC (KOMPAKTES LOGGING) ----------------
 
 def check_short_conditions(symbol, pump_percent, logger):
-    logger.info(f"[CHECK] SHORT-Analyse für {symbol} bei Pump {pump_percent}% gestartet")
-
     ohlcv = get_ohlcv(symbol, "1m", 10)
     if len(ohlcv) < 6:
-        return False, "Nicht genug OHLCV"
+        return False, "NO (Nicht genug OHLCV)"
 
     closes = [float(c["close"]) for c in ohlcv]
     volumes = [float(c["volume"]) for c in ohlcv]
@@ -111,7 +109,6 @@ def check_short_conditions(symbol, pump_percent, logger):
 
     avg_vol = sum(volumes[-6:-1]) / 5
     vol_spike = volumes[-1] > avg_vol * 2
-
     wick_reversal = wick > body * 1.3
 
     p1 = get_price(symbol)
@@ -122,29 +119,30 @@ def check_short_conditions(symbol, pump_percent, logger):
     momentum_falling = p3 < p2 < p1
 
     rsi = calc_rsi(closes)
-    rsi_overbought = rsi > 80
 
     current_price = closes[-1]
     previous_price = closes[-2]
     real_pump = (current_price - previous_price) / previous_price * 100
 
+    # ✅ Kompakte Analyse-Zeile
     logger.info(
-        f"[DATA] Pump={real_pump:.2f}% | VolSpike={vol_spike} | Wick={wick_reversal} | "
-        f"Momentum={momentum_falling} | RSI={rsi:.1f}"
+        f"[SHORT] {symbol} | Pump={pump_percent}% | Real={real_pump:.2f}% | "
+        f"Vol={vol_spike} | Wick={wick_reversal} | Mom={momentum_falling} | RSI={rsi:.1f}"
     )
 
+    # ✅ Ergebnis
     if real_pump < pump_percent:
-        return False, f"Pump nicht bestätigt ({real_pump:.2f}% < {pump_percent}%)"
+        return False, f"NO (Real {real_pump:.2f}% < {pump_percent}%)"
     if not vol_spike:
-        return False, "Kein Volumen-Spike"
+        return False, "NO (Volumen-Spike fehlt)"
     if not wick_reversal:
-        return False, "Kein Wick-Reversal"
+        return False, "NO (Wick-Reversal fehlt)"
     if not momentum_falling:
-        return False, "Momentum noch stark"
-    if not rsi_overbought:
-        return False, f"RSI {rsi:.1f} nicht überkauft"
+        return False, "NO (Momentum nicht gedreht)"
+    if rsi <= 80:
+        return False, f"NO (RSI {rsi:.1f} nicht überkauft)"
 
-    return True, f"SHORT bestätigt: Pump {pump_percent}%, Volumen, Wick, Momentum, RSI"
+    return True, "YES"
 
 # ---------------- POSITION MONITOR ----------------
 
