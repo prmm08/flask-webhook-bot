@@ -383,12 +383,14 @@ def kucoin_futures_place_short(symbol, logger):
     url = KUCOIN_FUTURES_BASE + endpoint
 
     body_dict = {
-        "symbol": symbol,
-        "side": side,
-        "leverage": str(leverage),
-        "type": "market",
-        "size": str(qty)
-    }
+    "symbol": symbol,
+    "side": side,
+    "leverage": str(leverage),
+    "type": "market",
+    "size": str(qty),
+    "clientOid": str(int(time.time() * 1000))  # eindeutige Order-ID
+}
+
 
     body = json.dumps(body_dict)
     headers = kucoin_futures_sign("POST", endpoint, "", body)
