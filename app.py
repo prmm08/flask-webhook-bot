@@ -1,10 +1,9 @@
-# -------- VER 1.9: BingX Pump-Bot + KuCoin Futures Bot in einem Flask-Service --------
-
+# -------- VER 2.0: BingX Pump-Bot + KuCoin Futures Bot in einem Flask-Service --------
+#
 # BingX Bot (Pump + 45 Minuten Watcher, TP/SL/BE, Monitoring, Cooldown)
 # KuCoin Futures Bot (Spread/Orderbook Check, Market Short, TP/SL/BE, Monitoring, Cooldown)
 # Weiterleitung vom BingX Webhook zur KuCoin Route
-# Kompakten Logs
-
+# Kompakte Logs + robustere KuCoin-API-Checks + dynamische Orderbook-Tiefe
 
 import time
 import hmac
@@ -262,8 +261,17 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
 # ---------------- KUCOIN FUTURES HELPERS ----------------
 
 def kucoin_symbol_from_currency(currency):
-    # ggf. an KuCoin-Namen anpassen (z.B. PEPEUSDTM etc.)
-    return f"{currency}USDTM"
+    # Mapping auf KuCoin-Futures-Symbole
+    mapping = {
+        "BTC": "XBTUSDTM",
+        "XBT": "XBTUSDTM",
+        "ETH": "ETHUSDTM",
+        "SOL": "SOLUSDTM",
+        "XRP": "XRPUSDTM",
+        "DOGE": "DOGEUSDTM",
+        "ADA": "ADAUSDTM",
+    }
+    return mapping.get(currency, f"{currency}USDTM")
 
 def kucoin_futures_get_mark_price(symbol):
     endpoint = "/api/v1/mark-price"
@@ -271,6 +279,11 @@ def kucoin_futures_get_mark_price(symbol):
     url = KUCOIN_FUTURES_BASE + endpoint + "?" + query
     r = requests.get(url, timeout=10)
     data = r.json()
+
+    if "data" not in data or "value" not in data["data"]:
+        app.logger.error(f"[KUCOIN ERROR] Mark Price Response: {data}")
+        raise Exception("KuCoin Mark Price API returned no data")
+
     return float(data["data"]["value"])
 
 def kucoin_futures_get_orderbook(symbol):
@@ -280,6 +293,7 @@ def kucoin_futures_get_orderbook(symbol):
     r = requests.get(url, timeout=10)
     data = r.json()
     if "data" not in data:
+        app.logger.error(f"[KUCOIN ERROR] Orderbook Response: {data}")
         return None
     return data["data"]
 
@@ -304,18 +318,23 @@ def kucoin_check_conditions(symbol, logger):
     bid_depth = sum(float(b[1]) for b in bids[:5])
     ask_depth = sum(float(a[1]) for a in asks[:5])
 
+    # Dynamische Mindesttiefe: 0.1% vom Preis, aber mindestens 5 Kontrakte
+    mark_price = kucoin_futures_get_mark_price(symbol)
+    min_depth = max(5, mark_price * 0.001)
+
     logger.info(
-        f"[KUCOIN CHECK] {symbol} | Spread={spread:.3f}% | BidDepth={bid_depth:.2f} | AskDepth={ask_depth:.2f}"
+        f"[KUCOIN CHECK] {symbol} | Spread={spread:.3f}% | "
+        f"BidDepth={bid_depth:.2f} | AskDepth={ask_depth:.2f} | MinDepth={min_depth:.2f}"
     )
 
     if spread > 0.15:
         return False, f"NO (Spread {spread:.3f}% > 0.15%)"
 
-    if bid_depth < 50:
-        return False, "NO (Bid-Tiefe zu gering)"
+    if bid_depth < min_depth:
+        return False, f"NO (Bid-Tiefe {bid_depth:.2f} < {min_depth:.2f})"
 
-    if ask_depth < 50:
-        return False, "NO (Ask-Tiefe zu gering)"
+    if ask_depth < min_depth:
+        return False, f"NO (Ask-Tiefe {ask_depth:.2f} < {min_depth:.2f})"
 
     return True, "YES"
 
