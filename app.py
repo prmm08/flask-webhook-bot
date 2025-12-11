@@ -374,7 +374,10 @@ def kucoin_futures_place_short(symbol, logger):
     sl_percent = 2
 
     mark_price = kucoin_futures_get_mark_price(symbol)
-    qty = round(size_usdt / mark_price, 4)
+    qty = int(size_usdt / mark_price)
+    if qty < 1:
+       qty = 1
+
 
     endpoint = "/api/v1/orders"
     url = KUCOIN_FUTURES_BASE + endpoint
