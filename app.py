@@ -15,50 +15,6 @@ BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
 
-def to_binance_symbol(currency):
-    return f"{currency.upper()}USDT"
-
-
-
-def get_funding_rate(symbol="BTCUSDT"):
-    url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=1"
-    try:
-        r = requests.get(url, timeout=10).json()
-        return float(r[0]["fundingRate"])
-    except:
-        return 0.0
-
-def get_open_interest(symbol="BTCUSDT"):
-    url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=1"
-    try:
-        r = requests.get(url, timeout=10).json()
-        return float(r[0]["sumOpenInterest"])
-    except:
-        return 0.0
-
-
-def get_price_change(symbol):
-    # 5-Minuten-Preisänderung
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1m&limit=6"
-    try:
-        r = requests.get(url, timeout=10).json()
-        old_price = float(r[0][4])   # Close vor 5 Minuten
-        new_price = float(r[-1][4])  # Aktueller Close
-        return (new_price - old_price) / old_price
-    except:
-        return 0.0
-
-
-
-def is_fake_pump(funding_rate, price_change, oi_change):
-    # Funding stark positiv → Longs überhebelt
-    # Preis steigt → Pump
-    # OI steigt NICHT → kein echtes Kapital → Fake Pump
-    if funding_rate > 0.01 and price_change > 0 and oi_change <= 0:
-        return True
-    return False
-
-
 def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -125,9 +81,7 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
         active_monitors[symbol] = False
 
 cooldowns = {}
-COOLDOWN_SECONDS = 0.5 * 60 * 60
-
-
+COOLDOWN_SECONDS = 2 * 60 * 60
 
 @app.route("/", methods=["GET", "POST"])
 def health_check():
@@ -152,57 +106,11 @@ def handle_alert():
                 "remaining_seconds": int(COOLDOWN_SECONDS - (now - last_exec))
             }), 200
 
-        # --- SIMPLE ALTCOIN PUMP FILTER (NO BTC MARKET FILTER) ---
-
-        # 1. Altcoin price change (5m) via BingX (approx)
-        price_now = get_price(symbol)
-        prev_price = getattr(app, f"prev_price_{symbol}", price_now)
-        app.__setattr__(f"prev_price_{symbol}", price_now)
-
-        alt_price_change = (price_now - prev_price) / prev_price if prev_price > 0 else 0.0
-
-        # 2. Altcoin OI (if available on Binance)
-        binance_symbol = f"{currency.upper()}USDT"
-        oi_now = get_open_interest(binance_symbol)
-
-        oi_prev = getattr(app, f"oi_prev_{symbol}", oi_now)
-        app.__setattr__(f"oi_prev_{symbol}", oi_now)
-        oi_change = oi_now - oi_prev
-
-        # 3. Fake pump logic
-        fake_pump = False
-
-        # Condition A: Altcoin pumps strongly
-        if alt_price_change > 0.03:  # +3% in 5m
-            # Condition B: OI does NOT rise → no real money → fake pump
-            if oi_change <= 0:
-                fake_pump = True
-
-        # --- LOGGING ---
-        print("========== SIMPLE PUMP FILTER ==========")
-        print(f"Symbol: {symbol}")
-        print(f"Binance Symbol: {binance_symbol}")
-        print(f"Alt Price Now: {price_now}")
-        print(f"Alt Price Prev: {prev_price}")
-        print(f"Alt Price Change (5m approx): {alt_price_change}")
-        print(f"OI Change (5m): {oi_change}")
-        print(f"Fake Pump Detected: {fake_pump}")
-        print("========================================")
-
-        if not fake_pump:
-            return jsonify({
-                "status": "ignored",
-                "reason": "Kein Fake Pump – kein Short geöffnet",
-                "alt_price_change": alt_price_change,
-                "oi_change": oi_change
-            }), 200
-
-        # --- Order kommt HIER ---
         side = "SELL"
         size = 20
         leverage = 20
         tp_percent = 3
-        sl_percent = 1.5
+        sl_percent = 1
 
         price = get_price(symbol)
         qty = round(size / price, 6)
@@ -246,7 +154,9 @@ def handle_alert():
         }), 200
 
     except Exception as e:
-        print("ERROR in handle_alert:", e)
         return jsonify({"status": "error", "message": str(e)}), 400
 
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
 
