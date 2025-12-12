@@ -198,46 +198,43 @@ def handle_alert():
             ).start()
 
         cooldowns[symbol] = now
-        
-        # --- Fake Pump Check ---
-funding = get_funding_rate("BTCUSDT")
-oi_now = get_open_interest("BTCUSDT")
-price_change = get_price_change("BTCUSDT")
+    
+                # --- Fake Pump Check ---
+        funding = get_funding_rate("BTCUSDT")
+        oi_now = get_open_interest("BTCUSDT")
+        price_change = get_price_change("BTCUSDT")
 
-oi_prev = getattr(app, "oi_prev", oi_now)
-app.oi_prev = oi_now
-oi_change = oi_now - oi_prev
+        oi_prev = getattr(app, "oi_prev", oi_now)
+        app.oi_prev = oi_now
+        oi_change = oi_now - oi_prev
 
-# --- DETAILED LOGGING FOR RENDER ---
-print("========== FAKE PUMP CHECK ==========")
-print(f"Funding Rate: {funding}")
-print(f"Price Change (1m): {price_change}")
-print(f"OI Change (5m): {oi_change}")
+        # --- DETAILED LOGGING FOR RENDER ---
+        print("========== FAKE PUMP CHECK ==========")
+        print(f"Funding Rate: {funding}")
+        print(f"Price Change (1m): {price_change}")
+        print(f"OI Change (5m): {oi_change}")
 
-# Einzelne Gründe loggen
-if funding <= 0.01:
-    print("Reason: Funding too low (no overleveraged longs)")
+        if funding <= 0.01:
+            print("Reason: Funding too low (no overleveraged longs)")
 
-if price_change <= 0:
-    print("Reason: Price not rising (no pump)")
+        if price_change <= 0:
+            print("Reason: Price not rising (no pump)")
 
-if oi_change > 0:
-    print("Reason: OI rising (real money entering, pump not fake)")
+        if oi_change > 0:
+            print("Reason: OI rising (real money entering, pump not fake)")
 
-# Gesamtergebnis
-decision = is_fake_pump(funding, price_change, oi_change)
-print(f"Fake Pump Detected: {decision}")
-print("=====================================")
+        decision = is_fake_pump(funding, price_change, oi_change)
+        print(f"Fake Pump Detected: {decision}")
+        print("=====================================")
 
-if not decision:
-    return jsonify({
-        "status": "ignored",
-        "reason": "Pump nicht fake – kein Short geöffnet",
-        "funding": funding,
-        "price_change": price_change,
-        "oi_change": oi_change
-    }), 200
-
+        if not decision:
+            return jsonify({
+                "status": "ignored",
+                "reason": "Pump nicht fake – kein Short geöffnet",
+                "funding": funding,
+                "price_change": price_change,
+                "oi_change": oi_change
+            }), 200
 
 
         return jsonify({
