@@ -151,15 +151,15 @@ def handle_alert():
                 "message": f"{symbol} ist noch im Cooldown, bitte warten.",
                 "remaining_seconds": int(COOLDOWN_SECONDS - (now - last_exec))
             }), 200
-            
+
         # --- SIMPLE ALTCOIN PUMP FILTER (NO BTC MARKET FILTER) ---
 
-        # 1. Altcoin price change (5m) via BingX
+        # 1. Altcoin price change (5m) via BingX (approx)
         price_now = get_price(symbol)
         prev_price = getattr(app, f"prev_price_{symbol}", price_now)
         app.__setattr__(f"prev_price_{symbol}", price_now)
 
-        alt_price_change = (price_now - prev_price) / prev_price if prev_price > 0 else 0
+        alt_price_change = (price_now - prev_price) / prev_price if prev_price > 0 else 0.0
 
         # 2. Altcoin OI (if available on Binance)
         binance_symbol = f"{currency.upper()}USDT"
@@ -176,52 +176,27 @@ def handle_alert():
         if alt_price_change > 0.03:  # +3% in 5m
             # Condition B: OI does NOT rise → no real money → fake pump
             if oi_change <= 0:
-               fake_pump = True
-
-
-
-        if not fake_pump:
-            return jsonify({
-        "status": "ignored",
-        "reason": "Kein Fake Pump – kein Short geöffnet",
-        "alt_price_change": alt_price_change,
-        "oi_change": oi_change
-         }), 200
-
+                fake_pump = True
 
         # --- LOGGING ---
         print("========== SIMPLE PUMP FILTER ==========")
         print(f"Symbol: {symbol}")
-        print(f"Alt Price Change (5m): {alt_price_change}")
+        print(f"Binance Symbol: {binance_symbol}")
+        print(f"Alt Price Now: {price_now}")
+        print(f"Alt Price Prev: {prev_price}")
+        print(f"Alt Price Change (5m approx): {alt_price_change}")
         print(f"OI Change (5m): {oi_change}")
         print(f"Fake Pump Detected: {fake_pump}")
         print("========================================")
 
-        if funding <= 0.01:
-            print("Reason: Funding too low (no overleveraged longs)")
-
-        if price_change <= 0:
-            print("Reason: Price not rising (no pump)")
-
-        if oi_change > 0:
-            print("Reason: OI rising (real money entering, pump not fake)")
-
-        decision = is_fake_pump(funding, price_change, oi_change)
-        print(f"Fake Pump Detected: {decision}")
-        print("=====================================")
-
-        if not decision:
+        if not fake_pump:
             return jsonify({
                 "status": "ignored",
-                "reason": "Pump nicht fake – kein Short geöffnet",
-                "funding": funding,
-                "price_change": price_change,
+                "reason": "Kein Fake Pump – kein Short geöffnet",
+                "alt_price_change": alt_price_change,
                 "oi_change": oi_change
             }), 200
 
-            
-            
-                    
         # --- Order kommt HIER ---
         side = "SELL"
         size = 20
@@ -257,8 +232,6 @@ def handle_alert():
             ).start()
 
         cooldowns[symbol] = now
-    
-               
 
         return jsonify({
             "status": "ok",
@@ -273,9 +246,7 @@ def handle_alert():
         }), 200
 
     except Exception as e:
+        print("ERROR in handle_alert:", e)
         return jsonify({"status": "error", "message": str(e)}), 400
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
 
