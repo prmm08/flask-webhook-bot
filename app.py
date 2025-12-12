@@ -38,14 +38,16 @@ def get_open_interest(symbol="BTCUSDT"):
 
 
 def get_price_change(symbol):
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1m&limit=2"
+    # 5-Minuten-Preisänderung
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1m&limit=6"
     try:
         r = requests.get(url, timeout=10).json()
-        old_price = float(r[0][4])
-        new_price = float(r[1][4])
+        old_price = float(r[0][4])   # Close vor 5 Minuten
+        new_price = float(r[-1][4])  # Aktueller Close
         return (new_price - old_price) / old_price
     except:
         return 0.0
+
 
 
 def is_fake_pump(funding_rate, price_change, oi_change):
@@ -166,7 +168,7 @@ def handle_alert():
         print("========== FAKE PUMP CHECK ==========")
         print(f"Symbol: {symbol}")
         print(f"Funding Rate: {funding}")
-        print(f"Price Change (1m): {price_change}")
+        print(f"Price Change (5m): {price_change}")
         print(f"OI Change (5m): {oi_change}")
 
         if funding <= 0.01:
