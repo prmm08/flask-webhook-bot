@@ -156,6 +156,7 @@ def handle_alert():
 
         # --- DETAILED LOGGING FOR RENDER ---
         print("========== FAKE PUMP CHECK ==========")
+        print(f"Symbol: {symbol}")
         print(f"Funding Rate: {funding}")
         print(f"Price Change (1m): {price_change}")
         print(f"OI Change (5m): {oi_change}")
