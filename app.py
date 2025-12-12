@@ -152,25 +152,50 @@ def handle_alert():
                 "remaining_seconds": int(COOLDOWN_SECONDS - (now - last_exec))
             }), 200
             
-        # --- Fake Pump Check ---
-        binance_symbol = to_binance_symbol(currency)
+        # --- SIMPLE ALTCOIN PUMP FILTER (NO BTC MARKET FILTER) ---
 
-        funding = get_funding_rate(binance_symbol)
+        # 1. Altcoin price change (5m) via BingX
+        price_now = get_price(symbol)
+        prev_price = getattr(app, f"prev_price_{symbol}", price_now)
+        app.__setattr__(f"prev_price_{symbol}", price_now)
+
+        alt_price_change = (price_now - prev_price) / prev_price if prev_price > 0 else 0
+
+        # 2. Altcoin OI (if available on Binance)
+        binance_symbol = f"{currency.upper()}USDT"
         oi_now = get_open_interest(binance_symbol)
-        price_change = get_price_change(binance_symbol)
 
-
-
-        oi_prev = getattr(app, "oi_prev", oi_now)
-        app.oi_prev = oi_now
+        oi_prev = getattr(app, f"oi_prev_{symbol}", oi_now)
+        app.__setattr__(f"oi_prev_{symbol}", oi_now)
         oi_change = oi_now - oi_prev
 
-        # --- DETAILED LOGGING FOR RENDER ---
-        print("========== FAKE PUMP CHECK ==========")
-        print(f"Symbol: {binance_symbol}")
-        print(f"Funding Rate: {funding}")
-        print(f"Price Change (5m): {price_change}")
+        # 3. Fake pump logic
+        fake_pump = False
+
+        # Condition A: Altcoin pumps strongly
+        if alt_price_change > 0.03:  # +3% in 5m
+            # Condition B: OI does NOT rise → no real money → fake pump
+            if oi_change <= 0:
+               fake_pump = True
+
+
+
+        if not fake_pump:
+            return jsonify({
+        "status": "ignored",
+        "reason": "Kein Fake Pump – kein Short geöffnet",
+        "alt_price_change": alt_price_change,
+        "oi_change": oi_change
+         }), 200
+
+
+        # --- LOGGING ---
+        print("========== SIMPLE PUMP FILTER ==========")
+        print(f"Symbol: {symbol}")
+        print(f"Alt Price Change (5m): {alt_price_change}")
         print(f"OI Change (5m): {oi_change}")
+        print(f"Fake Pump Detected: {fake_pump}")
+        print("========================================")
 
         if funding <= 0.01:
             print("Reason: Funding too low (no overleveraged longs)")
