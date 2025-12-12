@@ -145,24 +145,7 @@ def handle_alert():
                 "remaining_seconds": int(COOLDOWN_SECONDS - (now - last_exec))
             }), 200
             
-                    # --- Fake Pump Check ---
-        funding = get_funding_rate("BTCUSDT")
-        oi_now = get_open_interest("BTCUSDT")
-        price_change = get_price_change("BTCUSDT")
-
-        oi_prev = getattr(app, "oi_prev", oi_now)
-        app.oi_prev = oi_now
-        oi_change = oi_now - oi_prev
-
-        if not is_fake_pump(funding, price_change, oi_change):
-            return jsonify({
-                "status": "ignored",
-                "reason": "Pump nicht fake – kein Short geöffnet",
-                "funding": funding,
-                "price_change": price_change,
-                "oi_change": oi_change
-            }), 200
-
+                    
 
         side = "SELL"
         size = 20
