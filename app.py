@@ -15,6 +15,11 @@ BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
 
+def to_binance_symbol(symbol):
+    # Beispiel: "BEAT-USDT" → "BEATUSDT"
+    return symbol.replace("-", "").upper()
+
+
 def get_funding_rate(symbol="BTCUSDT"):
     url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=1"
     try:
@@ -146,9 +151,12 @@ def handle_alert():
             }), 200
             
         # --- Fake Pump Check ---
-        funding = get_funding_rate("BTCUSDT")
-        oi_now = get_open_interest("BTCUSDT")
-        price_change = get_price_change("BTCUSDT")
+        binance_symbol = to_binance_symbol(symbol)
+
+        funding = get_funding_rate(binance_symbol)
+        oi_now = get_open_interest(binance_symbol)
+        price_change = get_price_change(binance_symbol)
+
 
         oi_prev = getattr(app, "oi_prev", oi_now)
         app.oi_prev = oi_now
