@@ -145,44 +145,7 @@ def handle_alert():
                 "remaining_seconds": int(COOLDOWN_SECONDS - (now - last_exec))
             }), 200
             
-                    
-
-        side = "SELL"
-        size = 20
-        leverage = 20
-        tp_percent = 3
-        sl_percent = 1.5
-
-        price = get_price(symbol)
-        qty = round(size / price, 6)
-
-        headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
-        url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
-
-        entry_params = {
-            "leverage": str(leverage),
-            "positionSide": "SHORT",
-            "quantity": str(qty),
-            "side": side,
-            "symbol": symbol,
-            "timestamp": str(int(time.time() * 1000)),
-            "type": "MARKET"
-        }
-        entry_params["signature"] = sign_params(entry_params)
-        entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
-
-        tp_price = dynamic_round(price, price * (1 - tp_percent / 100))
-        sl_price = dynamic_round(price, price * (1 + sl_percent / 100))
-
-        if not active_monitors.get(symbol, False):
-            threading.Thread(
-                target=monitor_position,
-                args=(symbol, price, tp_price, sl_price)
-            ).start()
-
-        cooldowns[symbol] = now
-    
-                # --- Fake Pump Check ---
+        # --- Fake Pump Check ---
         funding = get_funding_rate("BTCUSDT")
         oi_now = get_open_interest("BTCUSDT")
         price_change = get_price_change("BTCUSDT")
@@ -219,6 +182,46 @@ def handle_alert():
                 "oi_change": oi_change
             }), 200
 
+            
+            
+                    
+        # --- Order kommt HIER ---
+        side = "SELL"
+        size = 20
+        leverage = 20
+        tp_percent = 3
+        sl_percent = 1.5
+
+        price = get_price(symbol)
+        qty = round(size / price, 6)
+
+        headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+        url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
+
+        entry_params = {
+            "leverage": str(leverage),
+            "positionSide": "SHORT",
+            "quantity": str(qty),
+            "side": side,
+            "symbol": symbol,
+            "timestamp": str(int(time.time() * 1000)),
+            "type": "MARKET"
+        }
+        entry_params["signature"] = sign_params(entry_params)
+        entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
+
+        tp_price = dynamic_round(price, price * (1 - tp_percent / 100))
+        sl_price = dynamic_round(price, price * (1 + sl_percent / 100))
+
+        if not active_monitors.get(symbol, False):
+            threading.Thread(
+                target=monitor_position,
+                args=(symbol, price, tp_price, sl_price)
+            ).start()
+
+        cooldowns[symbol] = now
+    
+               
 
         return jsonify({
             "status": "ok",
