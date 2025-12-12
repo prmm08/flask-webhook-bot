@@ -15,6 +15,43 @@ BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
 
+def get_funding_rate(symbol="BTCUSDT"):
+    url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=1"
+    try:
+        r = requests.get(url, timeout=10).json()
+        return float(r[0]["fundingRate"])
+    except:
+        return 0.0
+
+def get_open_interest(symbol="BTCUSDT"):
+    url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=1"
+    try:
+        r = requests.get(url, timeout=10).json()
+        return float(r[0]["sumOpenInterest"])
+    except:
+        return 0.0
+
+
+def get_price_change(symbol):
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1m&limit=2"
+    try:
+        r = requests.get(url, timeout=10).json()
+        old_price = float(r[0][4])
+        new_price = float(r[1][4])
+        return (new_price - old_price) / old_price
+    except:
+        return 0.0
+
+
+def is_fake_pump(funding_rate, price_change, oi_change):
+    # Funding stark positiv → Longs überhebelt
+    # Preis steigt → Pump
+    # OI steigt NICHT → kein echtes Kapital → Fake Pump
+    if funding_rate > 0.01 and price_change > 0 and oi_change <= 0:
+        return True
+    return False
+
+
 def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -81,7 +118,27 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
         active_monitors[symbol] = False
 
 cooldowns = {}
-COOLDOWN_SECONDS = 2 * 60 * 60
+COOLDOWN_SECONDS = 0.5 * 60 * 60
+
+
+funding = get_funding_rate("BTCUSDT")
+oi_now = get_open_interest("BTCUSDT")
+price_change = get_price_change("BTCUSDT")
+
+# OI Vergleich: vorher/nachher
+oi_prev = getattr(app, "oi_prev", oi_now)
+app.oi_prev = oi_now
+oi_change = oi_now - oi_prev
+
+if not is_fake_pump(funding, price_change, oi_change):
+    return jsonify({
+        "status": "ignored",
+        "reason": "Pump nicht fake – kein Short geöffnet",
+        "funding": funding,
+        "price_change": price_change,
+        "oi_change": oi_change
+    }), 200
+
 
 @app.route("/", methods=["GET", "POST"])
 def health_check():
