@@ -184,15 +184,29 @@ def handle_alert():
 
         # --- Pump-Filter: OI Monitoring starten ---
         oi_at_signal = get_open_interest(symbol)
+        print(f"[Pump-Filter] Pump-Signal empfangen für {symbol}, OI_at_signal={oi_at_signal}")
+
         if oi_at_signal is None:
             return jsonify({
                 "status": "error",
                 "message": f"OI konnte für {symbol} nicht geladen werden"
             }), 200
 
+        threading.Thread(
+            target=monitor_oi_for_short,
+            args=(symbol, oi_at_signal)
+        ).start()
+
+        return jsonify({
+            "status": "ok",
+            "message": f"Pump erkannt → OI-Monitoring für {symbol} gestartet",
+            "oi_at_signal": oi_at_signal
+        }), 200
 
     except Exception as e:
+        print("ERROR in handle_alert:", e)
         return jsonify({"status": "error", "message": str(e)}), 400
+
 
 
 
