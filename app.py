@@ -106,7 +106,7 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
 
         while True:
             current = get_price(symbol)
-            print(f"Current {symbol} price:", current)
+            #print(f"Current {symbol} price:", current)
 
             # Break-Even setzen bei +2% Gewinn
             if not be_set and current <= entry_price * (1 - trailing_percent):
