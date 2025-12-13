@@ -16,17 +16,20 @@ BINGX_BASE = "https://open-api.bingx.com"
 app = Flask(__name__)
 
 def get_open_interest(symbol):
-    """Holt den aktuellen Open Interest von BingX"""
-    oi_symbol = symbol.replace("-", "_")  # BTC-USDT → BTC_USDT
-    url = f"{BINGX_BASE}/openApi/swap/v2/market/openInterest"
-    r = requests.get(url, params={"symbol": oi_symbol}, timeout=10)
+    """Holt Open Interest von Binance Futures (ohne API-Key)."""
+    binance_symbol = symbol.replace("-", "")  # BTC-USDT → BTCUSDT
+    url = "https://fapi.binance.com/futures/data/openInterestHist"
+    params = {"symbol": binance_symbol, "period": "5m", "limit": 1}
+
+    r = requests.get(url, params=params, timeout=10)
     resp = r.json()
 
-    if "data" not in resp or "openInterest" not in resp["data"]:
-        print(f"[OI] Fehlerhafte OI-Antwort für {symbol}: {resp}")
+    if not isinstance(resp, list) or len(resp) == 0:
+        print(f"[OI] Binance OI Fehler: {resp}")
         return None
 
-    return float(resp["data"]["openInterest"])
+    return float(resp[0]["sumOpenInterest"])
+
 
 
 def monitor_oi_for_short(symbol, oi_at_signal, window_minutes=15, interval=30):
