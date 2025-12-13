@@ -170,7 +170,7 @@ def handle_alert():
 
         currency = str(data.get("currency", "")).upper()
         symbol = f"{currency}-USDT"
-        
+
         # --- Pump-Filter: OI Monitoring starten ---
         oi_at_signal = get_open_interest(symbol)
         print(f"[Pump-Filter] Pump-Signal empfangen für {symbol}, OI_at_signal={oi_at_signal}")
@@ -181,10 +181,14 @@ def handle_alert():
         ).start()
 
         return jsonify({
-        "status": "ok",
-        "message": f"Pump erkannt → OI-Monitoring für {symbol} gestartet",
-        "oi_at_signal": oi_at_signal
+            "status": "ok",
+            "message": f"Pump erkannt → OI-Monitoring für {symbol} gestartet",
+            "oi_at_signal": oi_at_signal
         }), 200
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
 
 
         now = time.time()
