@@ -15,6 +15,39 @@ BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
 
+def get_open_interest(symbol):
+    """Holt den aktuellen Open Interest von BingX"""
+    url = f"{BINGX_BASE}/openApi/swap/v2/market/openInterest"
+    r = requests.get(url, params={"symbol": symbol}, timeout=10)
+    return float(r.json()["data"]["openInterest"])
+
+def monitor_oi_for_short(symbol, oi_at_signal, window_minutes=15, interval=30):
+    """
+    Beobachtet OI nach Pump-Signal.
+    Wenn OI innerhalb des Fensters fällt → SHORT wird ausgeführt.
+    """
+    print(f"[OI-Monitor] Starte OI-Überwachung für {symbol} für {window_minutes} Minuten...")
+    deadline = time.time() + window_minutes * 60
+
+    while time.time() < deadline:
+        try:
+            current_oi = get_open_interest(symbol)
+            print(f"[OI-Monitor] {symbol} OI aktuell: {current_oi}, OI_at_signal: {oi_at_signal}")
+
+            if current_oi < oi_at_signal:
+                print(f"[OI-Monitor] OI gefallen → SHORT wird ausgelöst für {symbol}")
+                execute_short_order(symbol)
+                return True
+
+        except Exception as e:
+            print(f"[OI-Monitor] Fehler beim OI-Check: {e}")
+
+        time.sleep(interval)
+
+    print(f"[OI-Monitor] OI ist NICHT gefallen → Kein Short für {symbol}")
+    return False
+
+
 def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -83,6 +116,47 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
 cooldowns = {}
 COOLDOWN_SECONDS = 2 * 60 * 60
 
+def execute_short_order(symbol):
+    """Führt den SHORT aus, identisch wie dein aktueller Code."""
+    side = "SELL"
+    size = 20
+    leverage = 20
+    tp_percent = 4
+    sl_percent = 2
+
+    price = get_price(symbol)
+    qty = round(size / price, 6)
+
+    headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+    url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
+
+    entry_params = {
+        "leverage": str(leverage),
+        "positionSide": "SHORT",
+        "quantity": str(qty),
+        "side": side,
+        "symbol": symbol,
+        "timestamp": str(int(time.time() * 1000)),
+        "type": "MARKET"
+    }
+    entry_params["signature"] = sign_params(entry_params)
+    entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
+
+    tp_price = dynamic_round(price, price * (1 - tp_percent / 100))
+    sl_price = dynamic_round(price, price * (1 + sl_percent / 100))
+
+    if not active_monitors.get(symbol, False):
+        threading.Thread(
+            target=monitor_position,
+            args=(symbol, price, tp_price, sl_price)
+        ).start()
+
+    cooldowns[symbol] = time.time()
+
+    print(f"[ORDER] SHORT ausgeführt für {symbol} @ {price}")
+    return entry_resp.json()
+
+
 @app.route("/", methods=["GET", "POST"])
 def health_check():
     return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
@@ -96,6 +170,22 @@ def handle_alert():
 
         currency = str(data.get("currency", "")).upper()
         symbol = f"{currency}-USDT"
+        
+        # --- Pump-Filter: OI Monitoring starten ---
+        oi_at_signal = get_open_interest(symbol)
+        print(f"[Pump-Filter] Pump-Signal empfangen für {symbol}, OI_at_signal={oi_at_signal}")
+
+        threading.Thread(
+            target=monitor_oi_for_short,
+            args=(symbol, oi_at_signal)
+        ).start()
+
+return jsonify({
+    "status": "ok",
+    "message": f"Pump erkannt → OI-Monitoring für {symbol} gestartet",
+    "oi_at_signal": oi_at_signal
+}), 200
+
 
         now = time.time()
         last_exec = cooldowns.get(symbol, 0)
@@ -109,7 +199,7 @@ def handle_alert():
         side = "SELL"
         size = 20
         leverage = 20
-        tp_percent = 6
+        tp_percent = 4
         sl_percent = 2
 
         price = get_price(symbol)
