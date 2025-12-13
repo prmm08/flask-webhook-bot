@@ -17,9 +17,17 @@ app = Flask(__name__)
 
 def get_open_interest(symbol):
     """Holt den aktuellen Open Interest von BingX"""
+    oi_symbol = symbol.replace("-", "_")  # BTC-USDT → BTC_USDT
     url = f"{BINGX_BASE}/openApi/swap/v2/market/openInterest"
-    r = requests.get(url, params={"symbol": symbol}, timeout=10)
-    return float(r.json()["data"]["openInterest"])
+    r = requests.get(url, params={"symbol": oi_symbol}, timeout=10)
+    resp = r.json()
+
+    if "data" not in resp or "openInterest" not in resp["data"]:
+        print(f"[OI] Fehlerhafte OI-Antwort für {symbol}: {resp}")
+        return None
+
+    return float(resp["data"]["openInterest"])
+
 
 def monitor_oi_for_short(symbol, oi_at_signal, window_minutes=15, interval=30):
     """
@@ -173,18 +181,12 @@ def handle_alert():
 
         # --- Pump-Filter: OI Monitoring starten ---
         oi_at_signal = get_open_interest(symbol)
-        print(f"[Pump-Filter] Pump-Signal empfangen für {symbol}, OI_at_signal={oi_at_signal}")
+        if oi_at_signal is None:
+            return jsonify({
+                "status": "error",
+                "message": f"OI konnte für {symbol} nicht geladen werden"
+            }), 200
 
-        threading.Thread(
-            target=monitor_oi_for_short,
-            args=(symbol, oi_at_signal)
-        ).start()
-
-        return jsonify({
-            "status": "ok",
-            "message": f"Pump erkannt → OI-Monitoring für {symbol} gestartet",
-            "oi_at_signal": oi_at_signal
-        }), 200
 
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
