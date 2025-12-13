@@ -12,23 +12,45 @@ from flask import Flask, request, jsonify
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
+COINGLASS_API_KEY = "77dff3b02cde4dc2959a9bf601af2d8a"
+
 
 app = Flask(__name__)
 
+
 def get_open_interest(symbol):
-    """Holt Open Interest von Binance Futures (ohne API-Key)."""
-    binance_symbol = symbol.replace("-", "")  # BTC-USDT → BTCUSDT
-    url = "https://fapi.binance.com/futures/data/openInterestHist"
-    params = {"symbol": binance_symbol, "period": "5m", "limit": 1}
+    """
+    Holt das Open Interest von Coinglass.
+    symbol: 'BTC-USDT' → Coinglass erwartet 'BTC'
+    """
+    base = symbol.split("-")[0]  # BTC-USDT → BTC
 
-    r = requests.get(url, params=params, timeout=10)
-    resp = r.json()
+    url = "https://open-api.coinglass.com/public/v2/open_interest"
 
-    if not isinstance(resp, list) or len(resp) == 0:
-        print(f"[OI] Binance OI Fehler: {resp}")
+    headers = {
+        "accept": "application/json",
+        "coinglassSecret": COINGLASS_API_KEY
+    }
+
+    params = {
+        "symbol": base,
+        "currency": "USD"
+    }
+
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=5)
+        data = r.json()
+
+        # Coinglass liefert OI in data["data"]["openInterest"]
+        if "data" in data and data["data"]:
+            return float(data["data"]["openInterest"])
+
+        print("[OI] Coinglass liefert keine Daten:", data)
         return None
 
-    return float(resp[0]["sumOpenInterest"])
+    except Exception as e:
+        print("[OI] Coinglass Fehler:", e)
+        return None
 
 
 
