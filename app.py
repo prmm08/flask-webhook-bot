@@ -180,11 +180,11 @@ def handle_alert():
             args=(symbol, oi_at_signal)
         ).start()
 
-return jsonify({
-    "status": "ok",
-    "message": f"Pump erkannt → OI-Monitoring für {symbol} gestartet",
-    "oi_at_signal": oi_at_signal
-}), 200
+        return jsonify({
+        "status": "ok",
+        "message": f"Pump erkannt → OI-Monitoring für {symbol} gestartet",
+        "oi_at_signal": oi_at_signal
+        }), 200
 
 
         now = time.time()
