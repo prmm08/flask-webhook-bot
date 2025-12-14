@@ -1,4 +1,3 @@
-# -------- VER 3.10: FULL HYBRID SCRIPT (BINGX & KUCOIN ISOLATED FIX) --------
 import time
 import hmac
 import hashlib
@@ -27,8 +26,6 @@ active_monitors = {}
 cooldowns = {}
 COOLDOWN_SECONDS = 2 * 60 * 60
 
-# --- HILFSFUNKTIONEN ---
-
 def kucoin_headers(method, endpoint, body=""):
     now = str(int(time.time() * 1000))
     sig_str = f"{now}{method.upper()}{endpoint}{body}"
@@ -51,121 +48,97 @@ def get_price_generic(exchange, symbol):
             return float(r["data"]["price"])
     except: return None
 
-# --- BINGX LOGIK ---
-def sign_bingx(params):
-    query = urllib.parse.urlencode(sorted(params.items()))
-    return hmac.new(BINGX_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 def is_pos_open_bingx(symbol):
-    url = f"{BINGX_BASE}/openApi/swap/v2/user/positions"
-    params = {"symbol": symbol, "timestamp": str(int(time.time() * 1000))}
-    params["signature"] = sign_bingx(params)
     try:
-        r = requests.get(url, params=params, headers={"X-BX-APIKEY": BINGX_API_KEY}, timeout=10).json()
+        ts = str(int(time.time() * 1000))
+        params = {"symbol": symbol, "timestamp": ts}
+        query = urllib.parse.urlencode(sorted(params.items()))
+        sig = hmac.new(BINGX_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+        params["signature"] = sig
+        r = requests.get(f"{BINGX_BASE}/openApi/swap/v2/user/positions", params=params, headers={"X-BX-APIKEY": BINGX_API_KEY}, timeout=10).json()
         return any(float(p.get("positionAmt", 0)) != 0 for p in r.get("data", []))
-    except: return True
+    except: return False
+
+def is_pos_open_kucoin(symbol):
+    try:
+        endpoint = f"/api/v1/position?symbol={symbol}"
+        r = requests.get(KUCOIN_BASE + endpoint, headers=kucoin_headers("GET", endpoint), timeout=10).json()
+        return float(r["data"].get("currentQty", 0)) != 0
+    except: return False
+
 def execute_long_bingx(symbol):
+    print(f"[BINGX] Starte Order für {symbol}")
     price = get_price_generic("BINGX", symbol)
     if not price: return
     qty = round(20 / price, 6)
-    params = {
-        "leverage": "20", "positionSide": "LONG", "quantity": str(qty),
-        "side": "BUY", "symbol": symbol, "timestamp": str(int(time.time() * 1000)), "type": "MARKET"
-    }
-    params["signature"] = sign_bingx(params)
-    requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=params, headers={"X-BX-APIKEY": BINGX_API_KEY})
-    tp, sl = price * 1.04, price * 0.98
-    threading.Thread(target=monitor_generic, args=(symbol, price, tp, sl, "BINGX")).start()
-    cooldowns[f"BINGX_{symbol}"] = time.time()
-
-# --- KUCOIN LOGIK ---
-def is_pos_open_kucoin(symbol):
-    endpoint = f"/api/v1/position?symbol={symbol}"
-    try:
-        # Füge einen Timeout hinzu, um Hängenbleiben zu vermeiden
-        r = requests.get(KUCOIN_BASE + endpoint, headers=kucoin_headers("GET", endpoint), timeout=10).json()
-        if 'data' in r and r['data']:
-             return float(r["data"].get("currentQty", 0)) != 0
-        return False # Wenn keine Daten zurückkommen, gibt es keine offene Position
-    except: return True # Bei jedem Fehler blockieren wir sicherheitshalber
+    ts = str(int(time.time() * 1000))
+    params = {"leverage": "20", "positionSide": "LONG", "quantity": str(qty), "side": "BUY", "symbol": symbol, "timestamp": ts, "type": "MARKET"}
+    query = urllib.parse.urlencode(sorted(params.items()))
+    params["signature"] = hmac.new(BINGX_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    resp = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=params, headers={"X-BX-APIKEY": BINGX_API_KEY}, timeout=10).json()
+    print(f"[BINGX] Response: {resp}")
+    threading.Thread(target=monitor_generic, args=(symbol, price, price*1.04, price*0.98, "BINGX")).start()
 
 def execute_long_kucoin(symbol):
+    print(f"[KUCOIN] Starte Order für {symbol}")
     price = get_price_generic("KUCOIN", symbol)
     if not price: return
     
-    # NEU: Hebelwirkung muss explizit gesetzt werden, bevor die Order platziert wird
-    set_leverage_endpoint = f"/api/v1/position-settings"
-    set_leverage_payload = json.dumps({"symbol": symbol, "leverage": "20", "marginMode": "isolated"})
-    requests.post(KUCOIN_BASE + set_leverage_endpoint, data=set_leverage_payload, headers=kucoin_headers("POST", set_leverage_endpoint, set_leverage_payload), timeout=10)
+    # 1. Margin Mode Isolated sicherstellen
+    set_ep = "/api/v1/position-settings"
+    set_data = json.dumps({"symbol": symbol, "marginMode": "ISOLATED", "leverage": "20"})
+    requests.post(KUCOIN_BASE + set_ep, data=set_data, headers=kucoin_headers("POST", set_ep, set_data), timeout=10)
 
-    # Order platzieren (jetzt wo Leverage gesetzt ist)
-    endpoint = "/api/v1/orders"
-    payload = {
-        "clientOid": str(uuid.uuid4()), 
-        "side": "buy", 
-        "symbol": symbol, 
-        "type": "market", 
-        "leverage": "20", 
-        "size": "1", 
-        "marginMode": "isolated"
-    }
+    # 2. Order senden
+    ord_ep = "/api/v1/orders"
+    payload = {"clientOid": str(uuid.uuid4()), "side": "buy", "symbol": symbol, "type": "market", "size": "1", "leverage": "20"}
     body = json.dumps(payload)
-    resp = requests.post(KUCOIN_BASE + endpoint, data=body, headers=kucoin_headers("POST", endpoint, body), timeout=10).json()
-    print(f"[KUCOIN] Order-Antwort: {resp}")
-    
-    tp, sl = price * 1.04, price * 0.98
-    threading.Thread(target=monitor_generic, args=(symbol, price, tp, sl, "KUCOIN")).start()
-    cooldowns[f"KUCOIN_{symbol}"] = time.time()
+    resp = requests.post(KUCOIN_BASE + ord_ep, data=body, headers=kucoin_headers("POST", ord_ep, body), timeout=10).json()
+    print(f"[KUCOIN] Response: {resp}")
+    threading.Thread(target=monitor_generic, args=(symbol, price, price*1.04, price*0.98, "KUCOIN")).start()
 
-# --- MONITORING (1 SEKUNDE INTERVALL) ---
 def monitor_generic(symbol, entry, tp, sl, exchange):
     key = f"{exchange}_{symbol}"
     active_monitors[key] = True
-    be_set = False
+    print(f"[MONITOR START] {key} | Entry: {entry}")
     try:
+        be_set = False
         while True:
             curr = get_price_generic(exchange, symbol)
             if not curr: time.sleep(1); continue
-            if not be_set and curr >= (entry * 1.02): sl, be_set = entry, True
-            if curr >= tp: break
-            if curr <= sl: break
+            if not be_set and curr >= entry * 1.02:
+                sl, be_set = entry, True
+                print(f"[BE] {key} aktiviert")
+            if curr >= tp or curr <= sl:
+                print(f"[EXIT] {key} bei {curr}")
+                break
             time.sleep(1)
-    except: pass
-    finally:
-        active_monitors[key] = False
-
-# --- WEBHOOK HANDLER ---
+    finally: active_monitors[key] = False
 
 @app.route("/testorder", methods=["POST"])
 def handle_alert():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        currency = str(data.get("currency", "")).upper()
-        if not currency: return jsonify({"status": "error"}), 400
+    data = request.get_json(force=True, silent=True) or {}
+    currency = str(data.get("currency", "")).upper()
+    if not currency: return jsonify({"error": "no currency"}), 400
 
-        symbol_bx = f"{currency}-USDT"
-        symbol_kc = f"XBTUSDTM" if currency == "BTC" else f"{currency}USDTM"
+    print(f"\n--- SIGNAL: {currency} ---")
+    
+    s_bx = f"{currency}-USDT"
+    s_kc = "XBTUSDTM" if currency == "BTC" else f"{currency}USDTM"
 
-        # BINGX PROZESS
-        bx_key = f"BINGX_{symbol_bx}"
-        if not active_monitors.get(bx_key) and not is_pos_open_bingx(symbol_bx):
-            if time.time() - cooldowns.get(bx_key, 0) > COOLDOWN_SECONDS:
-                threading.Thread(target=execute_long_bingx, args=(symbol_bx,)).start()
+    # BingX Check & Start
+    if not is_pos_open_bingx(s_bx) and not active_monitors.get(f"BINGX_{s_bx}"):
+        threading.Thread(target=execute_long_bingx, args=(s_bx,)).start()
+    
+    # KuCoin Check & Start
+    if not is_pos_open_kucoin(s_kc) and not active_monitors.get(f"KUCOIN_{s_kc}"):
+        threading.Thread(target=execute_long_kucoin, args=(s_kc,)).start()
 
-        # KUCOIN PROZESS
-        kc_key = f"KUCOIN_{symbol_kc}"
-        if not active_monitors.get(kc_key) and not is_pos_open_kucoin(symbol_kc):
-            if time.time() - cooldowns.get(kc_key, 0) > COOLDOWN_SECONDS:
-                threading.Thread(target=execute_long_kucoin, args=(kc_key,)).start()
+    return jsonify({"status": "monitoring_started", "currency": currency}), 200
 
-        return jsonify({"status": "monitoring_started", "currency": currency}), 200
-
-    except Exception as e:
-        print(f"[FATAL ERROR] {e}")
-        return jsonify({"status": "error", "message": str(e)}), 400
-
-@app.route("/", methods=["GET"])
-def health():
-    return "Bot Online", 200
+@app.route("/")
+def health(): return "OK", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
