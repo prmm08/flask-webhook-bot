@@ -68,7 +68,7 @@ def execute_long_bingx(symbol):
     trade_size_usdt = 20 # Positionsgröße in USDT
     leverage = 20
     tp_percent = 0.5
-    sl_percent = 1
+    sl_percent = 0.5
     
     qty = round(trade_size_usdt / price, 6)
     ts = str(int(time.time() * 1000))
