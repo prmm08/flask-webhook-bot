@@ -1,5 +1,4 @@
-# -------- VER 3.5: Dual-Exchange - High-Precision Monitoring & BE-Fix --------
-
+# -------- VER 3.6: FULL HYBRID SCRIPT (BINGX & KUCOIN) --------
 import time
 import hmac
 import hashlib
@@ -24,24 +23,30 @@ KUCOIN_BASE = "https://api-futures.kucoin.com"
 
 app = Flask(__name__)
 
+# Speicher für Zustände
 active_monitors = {}
 cooldowns = {}
 COOLDOWN_SECONDS = 2 * 60 * 60
 
-# --- Hilfsfunktionen ---
+# --- HILFSFUNKTIONEN ---
 
 def kucoin_headers(method, endpoint, body=""):
+    """Erzeugt Authentifizierungs-Header für KuCoin."""
     now = str(int(time.time() * 1000))
     sig_str = f"{now}{method.upper()}{endpoint}{body}"
     sig = base64.b64encode(hmac.new(KUCOIN_API_SECRET.encode(), sig_str.encode(), hashlib.sha256).digest()).decode()
     pass_sig = base64.b64encode(hmac.new(KUCOIN_API_SECRET.encode(), KUCOIN_API_PASSPHRASE.encode(), hashlib.sha256).digest()).decode()
     return {
-        "KC-API-KEY": KUCOIN_API_KEY, "KC-API-SIGN": sig, "KC-API-TIMESTAMP": now,
-        "KC-API-PASSPHRASE": pass_sig, "KC-API-KEY-VERSION": "2", "Content-Type": "application/json"
+        "KC-API-KEY": KUCOIN_API_KEY,
+        "KC-API-SIGN": sig,
+        "KC-API-TIMESTAMP": now,
+        "KC-API-PASSPHRASE": pass_sig,
+        "KC-API-KEY-VERSION": "2",
+        "Content-Type": "application/json"
     }
 
 def get_price_generic(exchange, symbol):
-    """Holt Preis mit hoher Präzision (8 Dezimalstellen)."""
+    """Holt aktuellen Preis mit hoher Präzision."""
     try:
         if exchange == "BINGX":
             url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
@@ -79,7 +84,8 @@ def execute_long_bingx(symbol):
         "side": "BUY", "symbol": symbol, "timestamp": str(int(time.time() * 1000)), "type": "MARKET"
     }
     params["signature"] = sign_bingx(params)
-    requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=params, headers={"X-BX-APIKEY": BINGX_API_KEY})
+    resp = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=params, headers={"X-BX-APIKEY": BINGX_API_KEY}, timeout=10).json()
+    print(f"[BINGX] Order-Antwort: {resp}")
     
     tp, sl = price * 1.04, price * 0.98
     threading.Thread(target=monitor_generic, args=(symbol, price, tp, sl, "BINGX")).start()
@@ -91,31 +97,38 @@ def is_pos_open_kucoin(symbol):
     endpoint = f"/api/v1/position?symbol={symbol}"
     try:
         r = requests.get(KUCOIN_BASE + endpoint, headers=kucoin_headers("GET", endpoint), timeout=10).json()
-        return float(r["data"].get("currentQty", 0)) != 0
+        if "data" in r:
+            return float(r["data"].get("currentQty", 0)) != 0
+        return True
     except: return True
 
 def execute_long_kucoin(symbol):
     price = get_price_generic("KUCOIN", symbol)
     if not price: return
+    endpoint = "/api/v1/orders"
     payload = {
-        "clientOid": str(uuid.uuid4()), "side": "buy", "symbol": symbol,
-        "type": "market", "leverage": "20", "size": "1", "marginMode": "isolated"
+        "clientOid": str(uuid.uuid4()), 
+        "side": "buy", 
+        "symbol": symbol, 
+        "type": "market", 
+        "leverage": "20", 
+        "size": "1", 
+        "marginMode": "isolated"
     }
     body = json.dumps(payload)
-    requests.post(KUCOIN_BASE + "/api/v1/orders", data=body, headers=kucoin_headers("POST", "/api/v1/orders", body))
+    resp = requests.post(KUCOIN_BASE + endpoint, data=body, headers=kucoin_headers("POST", endpoint, body), timeout=10).json()
+    print(f"[KUCOIN] Order-Antwort: {resp}")
     
     tp, sl = price * 1.04, price * 0.98
     threading.Thread(target=monitor_generic, args=(symbol, price, tp, sl, "KUCOIN")).start()
     cooldowns[f"KUCOIN_{symbol}"] = time.time()
 
-# --- HIGH-PRECISION MONITORING ---
+# --- MONITORING (1 SEKUNDE INTERVALL) ---
 
 def monitor_generic(symbol, entry, tp, sl, exchange):
     key = f"{exchange}_{symbol}"
     active_monitors[key] = True
     be_set = False
-    
-    # Präzises Logging für Setup
     print(f"[START {exchange}] {symbol} | Entry: {entry:.8f} | TP: {tp:.8f} | SL: {sl:.8f}")
     
     try:
@@ -125,24 +138,21 @@ def monitor_generic(symbol, entry, tp, sl, exchange):
                 time.sleep(1)
                 continue
 
-            # Break-Even Logik: Wenn Preis 2% über Einstieg, setze SL auf Einstieg
+            # Break-Even: Preis steigt 2% über Entry
             if not be_set and curr >= (entry * 1.02):
                 sl = entry
                 be_set = True
-                print(f"[BE ACTIVE] {exchange} {symbol} | Preis {curr:.8f} >= {entry*1.02:.8f}. SL auf {sl:.8f}")
+                print(f"[BE ACTIVE] {exchange} {symbol} | Preis {curr:.8f} >= {entry*1.02:.8f}. SL auf Entry {sl:.8f}")
 
-            # Exit Bedingungen
+            # Exit Ziele
             if curr >= tp:
                 print(f"[EXIT TP] {exchange} {symbol} bei {curr:.8f}")
-                # Optional: Hier automatischen Close-Befehl einfügen
                 break
             
             if curr <= sl:
                 print(f"[EXIT SL/BE] {exchange} {symbol} bei {curr:.8f}")
-                # Optional: Hier automatischen Close-Befehl einfügen
                 break
             
-            # 1 Sekunde Intervall für maximale Genauigkeit
             time.sleep(1)
             
     except Exception as e:
@@ -151,28 +161,57 @@ def monitor_generic(symbol, entry, tp, sl, exchange):
         active_monitors[key] = False
         print(f"[MONITOR END] {exchange} {symbol}")
 
-# --- WEBHOOK ---
+# --- WEBHOOK HANDLER ---
 
 @app.route("/testorder", methods=["POST"])
 def handle_alert():
-    data = request.get_json(force=True, silent=True) or {}
-    currency = str(data.get("currency", "")).upper()
-    if not currency: return jsonify({"status": "error"}), 400
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        currency = str(data.get("currency", "")).upper()
+        if not currency: return jsonify({"status": "error", "message": "No currency"}), 400
 
-    symbol_bx = f"{currency}-USDT"
-    symbol_kc = f"XBTUSDTM" if currency == "BTC" else f"{currency}USDTM"
+        symbol_bx = f"{currency}-USDT"
+        symbol_kc = f"XBTUSDTM" if currency == "BTC" else f"{currency}USDTM"
 
-    # BingX
-    if not active_monitors.get(f"BINGX_{symbol_bx}") and not is_pos_open_bingx(symbol_bx):
-        if time.time() - cooldowns.get(f"BINGX_{symbol_bx}", 0) > COOLDOWN_SECONDS:
-            threading.Thread(target=execute_long_bingx, args=(symbol_bx,)).start()
+        print(f"\n--- SIGNAL EMPFANGEN: {currency} ---")
 
-    # KuCoin
-    if not active_monitors.get(f"KUCOIN_{symbol_kc}") and not is_pos_open_kucoin(symbol_kc):
-        if time.time() - cooldowns.get(f"KUCOIN_{symbol_kc}", 0) > COOLDOWN_SECONDS:
-            threading.Thread(target=execute_long_kucoin, args=(symbol_kc,)).start()
+        # --- DIAGNOSE LOG FÜR KUCOIN ---
+        # Dies zeigt uns im Render-Log, ob KuCoin die Anfrage überhaupt akzeptiert
+        diag_endpoint = f"/api/v1/position?symbol={symbol_kc}"
+        diag_res = requests.get(KUCOIN_BASE + diag_endpoint, headers=kucoin_headers("GET", diag_endpoint), timeout=10).json()
+        print(f"[DIAGNOSE KUCOIN API] Response: {diag_res}")
 
-    return jsonify({"status": "monitoring", "currency": currency}), 200
+        # BINGX PROZESS
+        bx_key = f"BINGX_{symbol_bx}"
+        if not active_monitors.get(bx_key) and not is_pos_open_bingx(symbol_bx):
+            if time.time() - cooldowns.get(bx_key, 0) > COOLDOWN_SECONDS:
+                threading.Thread(target=execute_long_bingx, args=(symbol_bx,)).start()
+                print("[LOG] BingX Order gestartet.")
+            else:
+                print("[LOG] BingX Cooldown aktiv.")
+        else:
+            print("[LOG] BingX bereits aktiv.")
+
+        # KUCOIN PROZESS
+        kc_key = f"KUCOIN_{symbol_kc}"
+        if not active_monitors.get(kc_key) and not is_pos_open_kucoin(symbol_kc):
+            if time.time() - cooldowns.get(kc_key, 0) > COOLDOWN_SECONDS:
+                threading.Thread(target=execute_long_kucoin, args=(symbol_kc,)).start()
+                print("[LOG] KuCoin Order gestartet.")
+            else:
+                print("[LOG] KuCoin Cooldown aktiv.")
+        else:
+            print("[LOG] KuCoin bereits aktiv oder Check blockiert.")
+
+        return jsonify({"status": "monitoring_started", "currency": currency}), 200
+
+    except Exception as e:
+        print(f"[FATAL ERROR] {e}")
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+@app.route("/", methods=["GET"])
+def health():
+    return "Bot Online", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
