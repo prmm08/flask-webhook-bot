@@ -67,7 +67,7 @@ def execute_long_bingx(symbol):
     # Risk Management Settings
     trade_size_usdt = 20 # Positionsgröße in USDT
     leverage = 20
-    tp_percent = 1
+    tp_percent = 0.5
     sl_percent = 1
     
     qty = round(trade_size_usdt / price, 6)
