@@ -1,4 +1,4 @@
-# -------- VER 1.8: Auto Orders LONG/TP/SL/Monitoring/Cooldown/BE --------
+# -------- VER 1.9: Auto Orders LONG - Mit Positions-Check (No Double Entry) --------
 
 import time
 import hmac
@@ -15,46 +15,68 @@ BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
 
-def get_open_interest(symbol):
-    """Holt Open Interest von Binance Futures."""
-    binance_symbol = symbol.replace("-", "")
-    url = "https://fapi.binance.com/futures/data/openInterestHist"
-    params = {"symbol": binance_symbol, "period": "5m", "limit": 1}
-
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        resp = r.json()
-        if not isinstance(resp, list) or len(resp) == 0:
-            return None
-        return float(resp[0]["sumOpenInterest"])
-    except:
-        return None
-
-def monitor_oi_for_long(symbol, oi_at_signal, window_minutes=15, interval=30):
-    """
-    Beobachtet OI nach Signal.
-    Wenn OI innerhalb des Fensters STEIGT -> LONG wird ausgeführt.
-    """
-    print(f"[OI-Monitor] Starte OI-Überwachung für {symbol} (LONG-Trigger) für {window_minutes} Min...")
-    deadline = time.time() + window_minutes * 60
-
-    while time.time() < deadline:
-        try:
-            current_oi = get_open_interest(symbol)
-            if current_oi and current_oi > oi_at_signal:
-                print(f"[OI-Monitor] OI gestiegen -> LONG wird ausgelöst für {symbol}")
-                execute_long_order(symbol)
-                return True
-        except Exception as e:
-            print(f"[OI-Monitor] Fehler: {e}")
-        time.sleep(interval)
-
-    print(f"[OI-Monitor] OI nicht gestiegen -> Kein Long für {symbol}")
-    return False
+# Globaler Status für aktive Überwachungen
+active_monitors = {}
+cooldowns = {}
+COOLDOWN_SECONDS = 2 * 60 * 60
 
 def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+
+def get_open_interest(symbol):
+    binance_symbol = symbol.replace("-", "")
+    url = "fapi.binance.com"
+    params = {"symbol": binance_symbol, "period": "5m", "limit": 1}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        resp = r.json()
+        return float(resp[0]["sumOpenInterest"]) if resp else None
+    except:
+        return None
+
+def is_position_open(symbol):
+    """Prüft via API, ob aktuell eine Position für dieses Symbol offen ist."""
+    url = f"{BINGX_BASE}/openApi/swap/v2/user/positions"
+    headers = {"X-BX-APIKEY": API_KEY}
+    params = {"symbol": symbol, "timestamp": str(int(time.time() * 1000))}
+    params["signature"] = sign_params(params)
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=10).json()
+        positions = resp.get("data", [])
+        for pos in positions:
+            # Wenn die Position-Size ungleich 0 ist, ist sie offen
+            if float(pos.get("positionAmt", 0)) != 0:
+                return True
+        return False
+    except Exception as e:
+        print(f"Fehler beim Positions-Check: {e}")
+        return True # Im Zweifel True, um Doppel-Orders zu vermeiden
+
+def monitor_oi_for_long(symbol, oi_at_signal, window_minutes=15, interval=30):
+    """Wartet auf OI-Anstieg, bricht aber ab, wenn Position bereits existiert."""
+    print(f"[OI-Monitor] Starte... {symbol}")
+    deadline = time.time() + window_minutes * 60
+
+    while time.time() < deadline:
+        # Sicherheitscheck: Falls Position bereits offen (z.B. durch anderes Signal oder manuell)
+        if is_position_open(symbol):
+            print(f"[OI-Monitor] {symbol} bereits offen. Breche Monitoring ab.")
+            active_monitors[symbol] = False
+            return False
+
+        try:
+            current_oi = get_open_interest(symbol)
+            if current_oi and current_oi > oi_at_signal:
+                print(f"[OI-Monitor] Trigger! OI gestiegen für {symbol}")
+                execute_long_order(symbol)
+                return True
+        except Exception as e:
+            print(f"Fehler: {e}")
+        time.sleep(interval)
+
+    active_monitors[symbol] = False
+    return False
 
 def get_price(symbol):
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
@@ -66,113 +88,89 @@ def close_all_positions(symbol):
     headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
     params = {"symbol": symbol, "timestamp": str(int(time.time() * 1000))}
     params["signature"] = sign_params(params)
-    resp = requests.post(url, data=params, headers=headers, timeout=10)
-    return resp.json()
+    return requests.post(url, data=params, headers=headers, timeout=10).json()
 
 def dynamic_round(price, value):
     decimals = 2 if price > 1000 else 4 if price > 1 else 6
     return round(value, decimals)
 
-active_monitors = {}
-cooldowns = {}
-COOLDOWN_SECONDS = 2 * 60 * 60
-
-def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
-    """Überwacht LONG-Position mit BE-TSL"""
-    print(f"Monitoring LONG {symbol}... TP={tp_price}, SL={sl_price}")
+def monitor_position(symbol, entry_price, tp_price, sl_price):
     active_monitors[symbol] = True
     try:
-        trailing_percent = 0.02 # 2% Gewinn für Break-Even
         be_set = False
-
         while True:
             current = get_price(symbol)
-            
-            # Break-Even setzen bei +2% Gewinn (Preis steigt)
-            if not be_set and current >= entry_price * (1 + trailing_percent):
+            if not be_set and current >= entry_price * 1.02:
                 sl_price = entry_price
                 be_set = True
-                print(f"BE aktiviert für LONG {symbol}: SL auf Entry ({sl_price})")
+                print(f"BE aktiv für {symbol}")
 
-            # Schließen bei TP (Preis >= TP) oder SL (Preis <= SL)
             if current >= tp_price or current <= sl_price:
-                print(f"Target reached, closing LONG {symbol}")
                 close_all_positions(symbol)
+                print(f"Position {symbol} geschlossen.")
                 break
-
-            time.sleep(interval)
+            time.sleep(2)
     finally:
         active_monitors[symbol] = False
 
 def execute_long_order(symbol):
-    """Führt den LONG aus."""
-    side = "BUY"
-    size = 20 # USDT
-    leverage = 20
-    tp_percent = 4
-    sl_percent = 2
-
     price = get_price(symbol)
-    qty = round(size / price, 6)
-
+    qty = round(20 / price, 6) # 20 USDT Size
+    
     headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
     url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
 
-    entry_params = {
-        "leverage": str(leverage),
+    params = {
+        "leverage": "20",
         "positionSide": "LONG",
         "quantity": str(qty),
-        "side": side,
+        "side": "BUY",
         "symbol": symbol,
         "timestamp": str(int(time.time() * 1000)),
         "type": "MARKET"
     }
-    entry_params["signature"] = sign_params(entry_params)
-    entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
+    params["signature"] = sign_params(params)
+    resp = requests.post(url_order, data=params, headers=headers, timeout=10)
 
-    # TP liegt ÜBER Preis, SL liegt UNTER Preis
-    tp_price = dynamic_round(price, price * (1 + tp_percent / 100))
-    sl_price = dynamic_round(price, price * (1 - sl_percent / 100))
+    tp_price = dynamic_round(price, price * 1.04)
+    sl_price = dynamic_round(price, price * 0.98)
 
-    if not active_monitors.get(symbol, False):
-        threading.Thread(
-            target=monitor_position,
-            args=(symbol, price, tp_price, sl_price)
-        ).start()
-
+    threading.Thread(target=monitor_position, args=(symbol, price, tp_price, sl_price)).start()
     cooldowns[symbol] = time.time()
-    print(f"[ORDER] LONG ausgeführt für {symbol} @ {price}")
-    return entry_resp.json()
-
-@app.route("/", methods=["GET", "POST"])
-def health_check():
-    return jsonify({"status": "ok"}), 200
+    return resp.json()
 
 @app.route("/testorder", methods=["POST"])
 def handle_alert():
     try:
         data = request.get_json(force=True, silent=True) or {}
         currency = str(data.get("currency", "")).upper()
-        if not currency:
-            return jsonify({"error": "No currency"}), 400
-            
+        if not currency: return jsonify({"status": "ignored"}), 200
+        
         symbol = f"{currency}-USDT"
 
-        # Cooldown Check
-        now = time.time()
-        if now - cooldowns.get(symbol, 0) < COOLDOWN_SECONDS:
+        # 1. Check: Läuft bereits ein Monitoring oder eine Position für dieses Symbol?
+        if active_monitors.get(symbol, False):
+            print(f"[Signal] Ignoriert: {symbol} wird bereits überwacht/ist offen.")
+            return jsonify({"status": "blocked", "reason": "already_active"}), 200
+
+        # 2. Check: Besteht eine echte Position auf BingX?
+        if is_position_open(symbol):
+            print(f"[Signal] Ignoriert: Position für {symbol} bereits auf BingX offen.")
+            active_monitors[symbol] = True # Status synchronisieren
+            return jsonify({"status": "blocked", "reason": "position_exists"}), 200
+
+        # 3. Cooldown Check
+        if time.time() - cooldowns.get(symbol, 0) < COOLDOWN_SECONDS:
             return jsonify({"status": "cooldown"}), 200
 
         oi_at_signal = get_open_interest(symbol)
-        if oi_at_signal is None:
-            return jsonify({"status": "error", "message": "OI fail"}), 200
+        if oi_at_signal is None: return jsonify({"status": "error"}), 200
 
-        threading.Thread(
-            target=monitor_oi_for_long,
-            args=(symbol, oi_at_signal)
-        ).start()
+        # Monitoring starten
+        active_monitors[symbol] = True
+        threading.Thread(target=monitor_oi_for_long, args=(symbol, oi_at_signal)).start()
 
-        return jsonify({"status": "monitoring_long", "symbol": symbol}), 200
+        return jsonify({"status": "monitoring_started", "symbol": symbol}), 200
 
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
