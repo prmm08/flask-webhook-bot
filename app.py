@@ -101,7 +101,7 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
 
 # -------- Cooldown --------
 cooldowns = {}
-COOLDOWN_SECONDS = 2 * 60 * 60  # 2 Stunden
+COOLDOWN_SECONDS = 0.5 * 60 * 60  # 2 Stunden
 
 # -------- Health Check --------
 @app.route("/", methods=["GET", "POST"])
@@ -133,8 +133,8 @@ def handle_alert():
         side = "SELL"
         size = 20
         leverage = 20
-        tp_percent = 4.0
-        sl_percent = 2.0
+        tp_percent = 1.0
+        sl_percent = 1.0
 
         # Vorab-Preis für Menge
         pre_price = get_price(symbol)
