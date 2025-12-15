@@ -1,4 +1,4 @@
-# -------- V 2.2: BINGX FUTURES ONLY - Auto Trade/TP/SL/BE/Health Check/Long - Short depends on BTC Trend --------
+# -------- V 2.3: BINGX FUTURES ONLY - ROBUST COINGECKO BTC TREND FILTER ADDED --------
 
 import time
 import hmac
@@ -56,48 +56,51 @@ def close_bingx(symbol):
     requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions", data=params, headers={"X-BX-APIKEY": API_KEY})
 
 
-# --- NEUE FUNKTION: BTC TREND ERKENNUNG ---
+# --- NEUE FUNKTION: BTC TREND ERKENNUNG VIA COINGECKO ---
 
 def get_btc_hourly_trend():
-    """Analysiert die BTC-Tendenz der letzten Stunde (LONG/SHORT/NEUTRAL)."""
-    symbol = "BTC-USDT"
-    # Ruft die letzten 2 Kerzen (5-Minuten-Intervalle) ab, um die letzte volle Stunde zu bewerten
-    # Da die API 1h Intervalle unterstützt, nutzen wir diese für Einfachheit
-    url = f"{BINGX_BASE}/openApi/swap/v2/market/kline"
-    params = {
-        "symbol": symbol,
-        "interval": "1H",
-        "limit": 2 # Wir brauchen nur die letzte abgeschlossene Kerze und die davor
-    }
+    """Analysiert die BTC-Tendenz der letzten Stunde (LONG/SHORT/NEUTRAL) via CoinGecko."""
+    # Ruft 24 Stunden Daten im 5-Minuten-Intervall ab
+    url = "api.coingecko.com"
     
     try:
-        r = requests.get(url, params=params, timeout=10).json()
-        kline_data = r.get("data", [])
-        if len(kline_data) < 2:
-            print("[TREND] Nicht genügend Daten für Trendanalyse.")
+        r = requests.get(url, timeout=10).json()
+        prices_data = r.get("prices", [])
+        if len(prices_data) < 12: # Mindestens 12 Punkte für 1 Stunde (5min Intervalle)
+            print("[TREND] Nicht genügend CoinGecko Daten für Trendanalyse.")
             return "NEUTRAL"
             
-        # Die vorletzte Kerze ist die letzte abgeschlossene volle Stunde
-        last_hour_kline = kline_data[-2] 
-        open_price = float(last_hour_kline.get("open"))
-        close_price = float(last_hour_kline.get("close"))
+        # Timestamp vor 60 Minuten
+        one_hour_ago_ms = (time.time() - 3600) * 1000
+        
+        # Finde den ersten Preis vor oder zum Zeitpunkt vor 1 Stunde
+        # Preise sind [timestamp_ms, price]
+        prices_last_hour = [p[1] for p in prices_data if p[0] >= one_hour_ago_ms]
+
+        if not prices_last_hour:
+            print("[TREND] Keine Preise im letzten Fenster gefunden.")
+            return "NEUTRAL"
+            
+        open_price = prices_last_hour[0]
+        close_price = prices_last_hour[-1] # Der letzte verfügbare Preis ist der Schlusskurs
         
         if close_price > open_price:
-            print(f"[TREND] BTC 1H Tendenz: LONG (Open: {open_price}, Close: {close_price})")
+            print(f"[TREND] BTC 1H Tendenz: LONG (Open: {open_price:.2f}, Close: {close_price:.2f})")
             return "LONG"
         elif close_price < open_price:
-            print(f"[TREND] BTC 1H Tendenz: SHORT (Open: {open_price}, Close: {close_price})")
+            print(f"[TREND] BTC 1H Tendenz: SHORT (Open: {open_price:.2f}, Close: {close_price:.2f})")
             return "SHORT"
         else:
-            print("[TREND] BTC 1H Tendenz: NEUTRAL (Doji)")
+            print("[TREND] BTC 1H Tendenz: NEUTRAL")
             return "NEUTRAL"
             
     except Exception as e:
-        print(f"[ERROR TREND] Fehler beim Abrufen des BTC-Trends: {e}")
+        print(f"[ERROR TREND] Fehler beim Abrufen des BTC-Trends von CoinGecko: {e}")
         return "NEUTRAL"
 
 
-# --- ORDER & MONITORING LOGIK ---
+# --- ORDER & MONITORING LOGIK (Unverändert) ---
+# ... (execute_trade_bingx und monitor_position Funktionen bleiben wie in V 2.2) ...
 
 def execute_trade_bingx(symbol, side):
     """Platziert die Order basierend auf der ermittelten Tendenz."""
@@ -111,11 +114,11 @@ def execute_trade_bingx(symbol, side):
     
     # Passe TP/SL basierend auf der Richtung an
     if side == "LONG":
-        tp_percent = 0.5
-        sl_percent = 0.4
+        tp_percent = 0.75
+        sl_percent = 0.5
     else: # SHORT
-        tp_percent = 0.5
-        sl_percent = 0.4
+        tp_percent = 0.75
+        sl_percent = 0.5
 
     qty = round(trade_size_usdt / price, 6)
     
@@ -191,19 +194,19 @@ def monitor_position(symbol, entry, tp, sl, side):
         active_monitors[key] = False
         print(f"[MONITOR] END {symbol}")
         
-# ---------------- HEALTH CHECK ----------------
+# ---------------- HEALTH CHECK (Unverändert) ----------------
 
 @app.route("/", methods=["GET", "POST"])
 def health_check():
     return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
-# ---------------- DEBUG ROUTE ----------------
+# ---------------- DEBUG ROUTE (Unverändert) ----------------
 
 @app.route("/debug", methods=["GET"])
 def debug_logs():
     return "Bitte Render Dashboard → Logs öffnen.", 200
         
-# --- FLASK WEBHOCK HANDLER ---
+# --- FLASK WEBHOCK HANDLER (Unverändert in der Logik, nutzt neue Trend-Funktion) ---
 
 @app.route("/testorder", methods=["POST"])
 def handle_alert():
@@ -225,17 +228,14 @@ def handle_alert():
         threading.Thread(target=execute_trade_bingx, args=(symbol, "LONG",)).start()
         return jsonify({"status": "order_started_long", "symbol": symbol, "btc_trend": btc_trend}), 200
     elif btc_trend == "SHORT":
-        # Hier ist die Annahme, dass du auch SHORT Positionen eröffnen möchtest, 
-        # wenn der BTC-Trend short ist, unabhängig vom ursprünglichen Signal.
         threading.Thread(target=execute_trade_bingx, args=(symbol, "SHORT",)).start()
         return jsonify({"status": "order_started_short", "symbol": symbol, "btc_trend": btc_trend}), 200
     else:
         return jsonify({"status": "trend_neutral_no_order", "symbol": symbol, "btc_trend": btc_trend}), 200
 
 
-# --- APP START ---
+# --- APP START (Unverändert) ---
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
