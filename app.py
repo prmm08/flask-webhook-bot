@@ -19,6 +19,12 @@ app = Flask(__name__)
 # Globaler Status für aktive Überwachungen
 active_monitors = {}
 
+btc_cache = {
+    "trend": "NEUTRAL",
+    "timestamp": 0
+}
+
+
 # --- HILFSFUNKTIONEN ---
 
 def sign_bingx(params):
@@ -59,8 +65,14 @@ def close_bingx(symbol):
 # --- NEUE FUNKTION: BTC TREND ERKENNUNG VIA BINANCE ---
 
 def get_btc_hourly_trend():
-    """Analysiert die BTC-Tendenz der letzten Stunde (LONG/SHORT/NEUTRAL) via Binance."""
-    url = "https://api.binance.com/api/v3/klines"  # KORREKTE ENDPOINT
+    """Holt BTC Trend, aber cached ihn 60 Sekunden, um Binance nicht zu überlasten."""
+    now = time.time()
+
+    # Cache gültig?
+    if now - btc_cache["timestamp"] < 60:
+        return btc_cache["trend"]
+
+    url = "https://api.binance.com/api/v3/klines"
     params = {
         "symbol": "BTCUSDT",
         "interval": "1h",
@@ -70,36 +82,35 @@ def get_btc_hourly_trend():
     try:
         r = requests.get(url, params=params, timeout=10)
 
-        # Falls Binance eine Fehlermeldung sendet
         if r.status_code != 200:
             print(f"[ERROR TREND] Binance Status {r.status_code}: {r.text}")
-            return "NEUTRAL"
+            return btc_cache["trend"]  # Fallback: letzter Trend
 
         data = r.json()
-
         if not isinstance(data, list) or len(data) < 2:
-            print("[TREND] Nicht genügend Binance Daten für Trendanalyse.")
-            return "NEUTRAL"
+            return btc_cache["trend"]
 
-        # Letzte abgeschlossene Kerze ist Index 0
         last_hour = data[0]
-
         open_price = float(last_hour[1])
         close_price = float(last_hour[4])
 
         if close_price > open_price:
-            print(f"[TREND] BTC 1H Tendenz: LONG (Open: {open_price}, Close: {close_price})")
-            return "LONG"
+            trend = "LONG"
         elif close_price < open_price:
-            print(f"[TREND] BTC 1H Tendenz: SHORT (Open: {open_price}, Close: {close_price})")
-            return "SHORT"
+            trend = "SHORT"
         else:
-            print("[TREND] BTC 1H Tendenz: NEUTRAL")
-            return "NEUTRAL"
+            trend = "NEUTRAL"
+
+        btc_cache["trend"] = trend
+        btc_cache["timestamp"] = now
+
+        print(f"[TREND] BTC 1H: {trend}")
+        return trend
 
     except Exception as e:
-        print(f"[ERROR TREND] Fehler beim Abrufen des BTC-Trends von Binance: {e}")
-        return "NEUTRAL"
+        print(f"[ERROR TREND] Binance Fehler: {e}")
+        return btc_cache["trend"]
+
 
 
 
