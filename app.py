@@ -1,4 +1,4 @@
-# -------- V 2.1: BINGX FUTURES ONLY - FINAL & VERIFIED CODE --------
+# -------- V 2.2: BINGX FUTURES ONLY - Auto Trade/TP/SL/BE/Health Check/Long - Short depends on BTC Trend --------
 
 import time
 import hmac
@@ -55,27 +55,75 @@ def close_bingx(symbol):
     params["signature"] = sign_bingx(params)
     requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions", data=params, headers={"X-BX-APIKEY": API_KEY})
 
+
+# --- NEUE FUNKTION: BTC TREND ERKENNUNG ---
+
+def get_btc_hourly_trend():
+    """Analysiert die BTC-Tendenz der letzten Stunde (LONG/SHORT/NEUTRAL)."""
+    symbol = "BTC-USDT"
+    # Ruft die letzten 2 Kerzen (5-Minuten-Intervalle) ab, um die letzte volle Stunde zu bewerten
+    # Da die API 1h Intervalle unterstützt, nutzen wir diese für Einfachheit
+    url = f"{BINGX_BASE}/openApi/swap/v2/market/kline"
+    params = {
+        "symbol": symbol,
+        "interval": "1H",
+        "limit": 2 # Wir brauchen nur die letzte abgeschlossene Kerze und die davor
+    }
+    
+    try:
+        r = requests.get(url, params=params, timeout=10).json()
+        kline_data = r.get("data", [])
+        if len(kline_data) < 2:
+            print("[TREND] Nicht genügend Daten für Trendanalyse.")
+            return "NEUTRAL"
+            
+        # Die vorletzte Kerze ist die letzte abgeschlossene volle Stunde
+        last_hour_kline = kline_data[-2] 
+        open_price = float(last_hour_kline.get("open"))
+        close_price = float(last_hour_kline.get("close"))
+        
+        if close_price > open_price:
+            print(f"[TREND] BTC 1H Tendenz: LONG (Open: {open_price}, Close: {close_price})")
+            return "LONG"
+        elif close_price < open_price:
+            print(f"[TREND] BTC 1H Tendenz: SHORT (Open: {open_price}, Close: {close_price})")
+            return "SHORT"
+        else:
+            print("[TREND] BTC 1H Tendenz: NEUTRAL (Doji)")
+            return "NEUTRAL"
+            
+    except Exception as e:
+        print(f"[ERROR TREND] Fehler beim Abrufen des BTC-Trends: {e}")
+        return "NEUTRAL"
+
+
 # --- ORDER & MONITORING LOGIK ---
 
-def execute_long_bingx(symbol):
-    """Platziert die Long Order."""
-    print(f"[BINGX] Starte Long Order für {symbol}")
+def execute_trade_bingx(symbol, side):
+    """Platziert die Order basierend auf der ermittelten Tendenz."""
+    print(f"[BINGX] Starte {side} Order für {symbol}")
     price = get_price_bingx(symbol)
     if not price: return
 
     # Risk Management Settings
     trade_size_usdt = 20 # Positionsgröße in USDT
     leverage = 20
-    tp_percent = 0.75
-    sl_percent = 0.5
     
+    # Passe TP/SL basierend auf der Richtung an
+    if side == "LONG":
+        tp_percent = 0.5
+        sl_percent = 0.4
+    else: # SHORT
+        tp_percent = 0.5
+        sl_percent = 0.4
+
     qty = round(trade_size_usdt / price, 6)
     
     params = {
         "leverage": str(leverage),
-        "positionSide": "LONG",
+        "positionSide": side,
         "quantity": str(qty),
-        "side": "BUY",
+        "side": "BUY" if side == "LONG" else "SELL", # Side ist BUY/SELL, PositionSide ist LONG/SHORT
         "symbol": symbol,
         "timestamp": str(int(time.time() * 1000)),
         "type": "MARKET"
@@ -86,33 +134,52 @@ def execute_long_bingx(symbol):
 
     # Berechne TP/SL Preise
     entry_price = price
-    tp_price = entry_price * (1 + tp_percent / 100)
-    sl_price = entry_price * (1 - sl_percent / 100)
+    if side == "LONG":
+        tp_price = entry_price * (1 + tp_percent / 100)
+        sl_price = entry_price * (1 - sl_percent / 100)
+    else: # SHORT
+        tp_price = entry_price * (1 - tp_percent / 100)
+        sl_price = entry_price * (1 + sl_percent / 100)
     
     # Starte den Monitoring Thread
-    threading.Thread(target=monitor_position, args=(symbol, entry_price, tp_price, sl_price)).start()
+    threading.Thread(target=monitor_position, args=(symbol, entry_price, tp_price, sl_price, side)).start()
 
-def monitor_position(symbol, entry, tp, sl):
+def monitor_position(symbol, entry, tp, sl, side):
     """Überwacht die Position im 1-Sekunden-Takt."""
     key = f"BINGX_{symbol}"
     active_monitors[key] = True
-    print(f"[MONITOR] START {symbol} | Entry: {entry:.4f} | TP: {tp:.4f} | SL: {sl:.4f}")
+    print(f"[MONITOR] START {symbol} ({side}) | Entry: {entry:.4f} | TP: {tp:.4f} | SL: {sl:.4f}")
     
     try:
+        # Die Break-Even Logik ist bei Short-Positionen invers
+        be_trigger_long = entry * 1.02
+        be_trigger_short = entry * 0.98
         be_set = False
+
         while True:
             curr = get_price_bingx(symbol)
             if not curr: time.sleep(1); continue
 
             # Break-Even Logik (+2% Gewinn Trigger)
-            if not be_set and curr >= entry * 1.02:
-                sl = entry
-                be_set = True
-                print(f"[BE] {symbol} aktiviert! SL auf Entry gesetzt.")
+            if not be_set:
+                if side == "LONG" and curr >= be_trigger_long:
+                    sl = entry
+                    be_set = True
+                    print(f"[BE] {symbol} aktiviert! SL auf Entry gesetzt.")
+                elif side == "SHORT" and curr <= be_trigger_short:
+                    sl = entry
+                    be_set = True
+                    print(f"[BE] {symbol} aktiviert! SL auf Entry gesetzt.")
 
             # EXIT TRIGGER (TP oder SL/BE erreicht)
-            if curr >= tp or curr <= sl:
-                reason = "TP" if curr >= tp else "SL/BE"
+            if (side == "LONG" and (curr >= tp or curr <= sl)) or \
+               (side == "SHORT" and (curr <= tp or curr >= sl)):
+                
+                if (side == "LONG" and curr >= tp) or (side == "SHORT" and curr <= tp):
+                    reason = "TP"
+                else:
+                    reason = "SL/BE"
+                    
                 print(f"[EXIT] {symbol} Triggered durch {reason} bei Preis: {curr:.4f}")
                 close_bingx(symbol)
                 break
@@ -136,11 +203,11 @@ def health_check():
 def debug_logs():
     return "Bitte Render Dashboard → Logs öffnen.", 200
         
-# --- FLASK WEBHOOK HANDLER ---
+# --- FLASK WEBHOCK HANDLER ---
 
 @app.route("/testorder", methods=["POST"])
 def handle_alert():
-    """Endpunkt für Handelssignale (z.B. von Cryptocurrencyalerting)."""
+    """Endpunkt für Handelssignale. Fragt BTC-Trend ab und platziert LONG/SHORT."""
     data = request.get_json(force=True, silent=True) or {}
     currency = str(data.get("currency", "")).upper()
     if not currency: return jsonify({"error": "no currency"}), 400
@@ -148,12 +215,22 @@ def handle_alert():
     symbol = f"{currency}-USDT"
     print(f"\n--- SIGNAL EMPFANGEN: {symbol} ---")
 
-    if not is_pos_open_bingx(symbol) and not active_monitors.get(f"BINGX_{symbol}"):
-        threading.Thread(target=execute_long_bingx, args=(symbol,)).start()
-        return jsonify({"status": "order_started", "symbol": symbol}), 200
-    else:
+    if is_pos_open_bingx(symbol) or active_monitors.get(f"BINGX_{symbol}"):
         return jsonify({"status": "already_active", "symbol": symbol}), 200
-
+    
+    # NEUE LOGIK HIER: BTC Tendenz abfragen
+    btc_trend = get_btc_hourly_trend()
+    
+    if btc_trend == "LONG":
+        threading.Thread(target=execute_trade_bingx, args=(symbol, "LONG",)).start()
+        return jsonify({"status": "order_started_long", "symbol": symbol, "btc_trend": btc_trend}), 200
+    elif btc_trend == "SHORT":
+        # Hier ist die Annahme, dass du auch SHORT Positionen eröffnen möchtest, 
+        # wenn der BTC-Trend short ist, unabhängig vom ursprünglichen Signal.
+        threading.Thread(target=execute_trade_bingx, args=(symbol, "SHORT",)).start()
+        return jsonify({"status": "order_started_short", "symbol": symbol, "btc_trend": btc_trend}), 200
+    else:
+        return jsonify({"status": "trend_neutral_no_order", "symbol": symbol, "btc_trend": btc_trend}), 200
 
 
 # --- APP START ---
@@ -161,3 +238,4 @@ def handle_alert():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
