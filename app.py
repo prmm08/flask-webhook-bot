@@ -144,13 +144,11 @@ def handle_alert():
 
 # ---------------- HEALTH CHECK / VERIFIZIERUNG ----------------
 
+@app.route("/", methods=["GET", "POST"])
 @app.route("/myweb", methods=["GET", "POST"])
-def health_check():
-    """
-    Dieser Endpunkt antwortet auf GET/POST Anfragen von
-    Diensten wie cryptocurrencyalerting.com zur Verifizierung.
-    """
-    return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
+def health_check_simple():
+    """Ein einfacher Health-Check, der nur OK zurückgibt."""
+    return "OK", 200
 
 # --- APP START ---
 
