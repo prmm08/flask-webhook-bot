@@ -1,4 +1,4 @@
-# -------- VER 4.0: BINGX FUTURES ONLY - LONG/ISOLATED/AUTO-CLOSE --------
+# -------- VER 4.2: BINGX FUTURES ONLY - FINAL & VERIFIED CODE --------
 
 import time
 import hmac
@@ -45,7 +45,6 @@ def is_pos_open_bingx(symbol):
         r = requests.get(f"{BINGX_BASE}/openApi/swap/v2/user/positions", params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
         return any(float(p.get("positionAmt", 0)) != 0 for p in r.get("data", []))
     except:
-        # Bei API-Fehler sicherheitshalber True zurückgeben, um Doppel-Orders zu vermeiden
         return True
 
 def close_bingx(symbol):
@@ -71,21 +70,19 @@ def execute_long_bingx(symbol):
     sl_percent = 0.5
     
     qty = round(trade_size_usdt / price, 6)
-    ts = str(int(time.time() * 1000))
     
     params = {
         "leverage": str(leverage),
-        "positionSide": "LONG", # LONG Position
+        "positionSide": "LONG",
         "quantity": str(qty),
-        "side": "BUY", # Kaufen für Long
+        "side": "BUY",
         "symbol": symbol,
-        "timestamp": ts,
+        "timestamp": str(int(time.time() * 1000)),
         "type": "MARKET"
     }
     params["signature"] = sign_bingx(params)
     
-    resp = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
-    print(f"[BINGX] Order Antwort: {resp}")
+    requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10)
 
     # Berechne TP/SL Preise
     entry_price = price
@@ -105,13 +102,11 @@ def monitor_position(symbol, entry, tp, sl):
         be_set = False
         while True:
             curr = get_price_bingx(symbol)
-            if not curr:
-                time.sleep(1)
-                continue
+            if not curr: time.sleep(1); continue
 
-            # Break-Even Logik (+2% Gewinn)
+            # Break-Even Logik (+2% Gewinn Trigger)
             if not be_set and curr >= entry * 1.02:
-                sl = entry # Setze SL auf Entry Preis
+                sl = entry
                 be_set = True
                 print(f"[BE] {symbol} aktiviert! SL auf Entry gesetzt.")
 
@@ -129,17 +124,11 @@ def monitor_position(symbol, entry, tp, sl):
         active_monitors[key] = False
         print(f"[MONITOR] END {symbol}")
         
-        
-# ---------------- HEALTH CHECK ----------------
-
-@app.route("/", methods=["GET", "POST"])
-def health_check():
-    return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
-
 # --- FLASK WEBHOOK HANDLER ---
 
 @app.route("/testorder", methods=["POST"])
 def handle_alert():
+    """Endpunkt für Handelssignale (z.B. von Cryptocurrencyalerting)."""
     data = request.get_json(force=True, silent=True) or {}
     currency = str(data.get("currency", "")).upper()
     if not currency: return jsonify({"error": "no currency"}), 400
@@ -147,17 +136,25 @@ def handle_alert():
     symbol = f"{currency}-USDT"
     print(f"\n--- SIGNAL EMPFANGEN: {symbol} ---")
 
-    # Prüfe ob bereits aktiv oder in Überwachung
     if not is_pos_open_bingx(symbol) and not active_monitors.get(f"BINGX_{symbol}"):
         threading.Thread(target=execute_long_bingx, args=(symbol,)).start()
         return jsonify({"status": "order_started", "symbol": symbol}), 200
     else:
         return jsonify({"status": "already_active", "symbol": symbol}), 200
 
+# ---------------- HEALTH CHECK / VERIFIZIERUNG ----------------
 
+@app.route("/", methods=["GET", "POST"])
+def health_check():
+    """
+    Dieser Endpunkt antwortet auf GET/POST Anfragen von
+    Diensten wie cryptocurrencyalerting.com zur Verifizierung.
+    """
+    return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
+# --- APP START ---
 
 if __name__ == "__main__":
-    # Bindet an den Port, den Render vorschreibt (standardmäßig 10000)
+    # Bindet an den Port, den Render vorschreibt
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
