@@ -1,4 +1,4 @@
-# -------- V 2.8: BINGX FUTURES ONLY - FINAL ROBUST BINANCE BTC TREND FILTER ADDED --------
+# -------- V 2.9: BINGX FUTURES ONLY - FINAL ROBUST BINANCE BTC TREND FILTER ADDED --------
 
 import time
 import hmac
@@ -75,9 +75,9 @@ def get_btc_hourly_trend():
             return "NEUTRAL"
             
         # Die Daten bei Index 0 sind die der letzten abgeschlossenen Stunde
-        last_hour_kline = r # <-- KORRIGIERTER ZUGRIFF
-        open_price = float(last_hour_kline) # <-- KORRIGIERTER ZUGRIFF (Index 1 ist Open)
-        close_price = float(last_hour_kline) # <-- KORRIGIERTER ZUGRIFF (Index 4 ist Close)
+        last_hour_kline = r[0] # <-- KORRIGIERTER ZUGRIFF AUF DIE LISTE
+        open_price = float(last_hour_kline[1]) # <-- KORRIGIERTER ZUGRIFF (Index 1 ist Open)
+        close_price = float(last_hour_kline[4]) # <-- KORRIGIERTER ZUGRIFF (Index 4 ist Close)
         
         if close_price > open_price:
             print(f"[TREND] BTC 1H Tendenz: LONG (Open: {open_price:.2f}, Close: {close_price:.2f})")
