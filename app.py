@@ -1,4 +1,4 @@
-# -------- V 2.4: BINGX FUTURES ONLY - ROBUST BINANCE BTC TREND FILTER ADDED --------
+# -------- V 2.5: BINGX FUTURES ONLY - FINAL ROBUST BINANCE BTC TREND FILTER ADDED --------
 
 import time
 import hmac
@@ -61,11 +61,11 @@ def close_bingx(symbol):
 def get_btc_hourly_trend():
     """Analysiert die BTC-Tendenz der letzten Stunde (LONG/SHORT/NEUTRAL) via Binance."""
     # Ruft die letzten 2 Kerzen (1-Stunden-Intervalle) von Binance ab
-    url = "api.binance.com"
+    url = "api.binance.com" # Korrekte URL mit https://
     params = {
         "symbol": "BTCUSDT", # Binance verwendet BTCUSDT ohne Bindestrich
         "interval": "1h",
-        "limit": 2 # Wir brauchen nur die letzte abgeschlossene Kerze (Index 0)
+        "limit": 2 # Index 0 ist die letzte abgeschlossene Kerze
     }
     
     try:
@@ -78,8 +78,8 @@ def get_btc_hourly_trend():
             
         # Die Daten bei Index 0 sind die der letzten abgeschlossenen Stunde
         last_hour_kline = r[0] 
-        open_price = float(last_hour_kline[1])
-        close_price = float(last_hour_kline[4])
+        open_price = float(last_hour_kline[1]) # Index 1 ist der Open Preis
+        close_price = float(last_hour_kline[4]) # Index 4 ist der Close Preis
         
         if close_price > open_price:
             print(f"[TREND] BTC 1H Tendenz: LONG (Open: {open_price:.2f}, Close: {close_price:.2f})")
