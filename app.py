@@ -1,4 +1,4 @@
-# -------- V 4.0: BINGX FUTURES (api/v3) - ALWAYS SHORT ON SIGNAL --------
+# -------- VER 1.8: Auto SHORT Orders / TP / SL / BE / Monitoring / Cooldown --------
 
 import time
 import hmac
@@ -9,302 +9,192 @@ import urllib.parse
 import threading
 from flask import Flask, request, jsonify
 
-# --- API Konfiguration BingX (NEU: api.bingx.com / api/v3) ---
+# -------- API Keys --------
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
-BINGX_BASE = "https://api.bingx.com"  # NEU
+BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
 
-# Globaler Status für aktive Überwachungen
-active_monitors = {}
-
-
-# --- SIGNATUR & REQUEST HILFSFUNKTIONEN ---
-
-def sign_bingx(params: dict) -> str:
-    """
-    Erzeugt BingX-Signatur für /api/v3 Endpoints.
-    Signiert wird die URL-encodete Query-String.
-    """
+def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
+def get_price(symbol):
+    """Preis für das übergebene Symbol holen"""
+    url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
+    r = requests.get(url, params={"symbol": symbol}, timeout=10)
+    return float(r.json()["data"]["price"])
 
-def signed_get(path: str, params: dict) -> dict:
-    """
-    Authentifizierter GET-Request gegen BingX /api/v3.
-    Fügt timestamp + signature hinzu.
-    """
-    ts = str(int(time.time() * 1000))
-    params = dict(params) if params else {}
-    params["timestamp"] = ts
-    params["recvWindow"] = "5000"
-
-    signature = sign_bingx(params)
-    params["signature"] = signature
-
-    url = f"{BINGX_BASE}{path}"
+def get_positions():
+    """Fragt aktive Positionen ab"""
+    url = f"{BINGX_BASE}/openApi/swap/v2/user/positions"
     headers = {"X-BX-APIKEY": API_KEY}
+    params = {"timestamp": str(int(time.time() * 1000))}
+    params["signature"] = sign_params(params)
+    resp = requests.get(url, params=params, headers=headers, timeout=10)
+    return resp.json()
 
-    r = requests.get(url, params=params, headers=headers, timeout=10)
-    try:
-        return r.json()
-    except Exception:
-        return {"error": "invalid_json", "raw": r.text, "status": r.status_code}
+def close_all_positions(symbol):
+    """Schließt alle offenen Positionen für ein Symbol"""
+    url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions"
+    headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+    params = {"symbol": symbol, "timestamp": str(int(time.time() * 1000))}
+    params["signature"] = sign_params(params)
+    resp = requests.post(url, data=params, headers=headers, timeout=10)
+    print("CloseAll response:", resp.json())
+    return resp.json()
 
+# -------- Dynamische Rundung --------
+def dynamic_round(price, value):
+    if price > 1000:
+        decimals = 2
+    elif price > 1:
+        decimals = 4
+    else:
+        decimals = 6
+    return round(value, decimals)
 
-def signed_post(path: str, params: dict) -> dict:
+# -------- Monitor --------
+active_monitors = {}
+
+def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
     """
-    Authentifizierter POST-Request gegen BingX /api/v3.
-    Signiert Query-String (BingX: application/x-www-form-urlencoded).
+    Überwacht SHORT Positionen.
+    BE, TP, SL werden exakt geprüft.
     """
-    ts = str(int(time.time() * 1000))
-    params = dict(params) if params else {}
-    params["timestamp"] = ts
-    params["recvWindow"] = "5000"
+    print(f"[MONITOR] {symbol} SHORT gestartet | Entry={entry_price}, TP={tp_price}, SL={sl_price}")
+    active_monitors[symbol] = True
 
-    signature = sign_bingx(params)
-    params["signature"] = signature
-
-    url = f"{BINGX_BASE}{path}"
-    headers = {
-        "X-BX-APIKEY": API_KEY,
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-
-    r = requests.post(url, data=urllib.parse.urlencode(params), headers=headers, timeout=10)
-    try:
-        return r.json()
-    except Exception:
-        return {"error": "invalid_json", "raw": r.text, "status": r.status_code}
-
-
-# --- PREIS, POSITIONEN, CLOSE ---
-
-def get_price_bingx(symbol: str):
-    """
-    Holt den stabilen Mark-Preis von BingX Futures.
-    NEU: /api/v3/market/markPrice, Symbol z.B. BTC-USDT.
-    """
-    try:
-        path = "/api/v3/market/markPrice"
-        # Laut Deiner letzten Tests ist dieser Endpoint auth-pflichtig → signed_get
-        r = signed_get(path, {"symbol": symbol})
-
-        if "data" not in r or "markPrice" not in r["data"]:
-            print(f"[ERROR PREIS] Ungültige Antwort für {symbol}: {r}")
-            return None
-
-        return float(r["data"]["markPrice"])
-
-    except Exception as e:
-        print(f"[ERROR PREIS] {symbol}: {e}")
-        return None
-
-
-def is_pos_open_bingx(symbol: str) -> bool:
-    """
-    Prüft, ob eine Futures-Position offen ist.
-    NEU: /api/v3/position
-    """
-    try:
-        path = "/api/v3/position"
-        r = signed_get(path, {"symbol": symbol})
-
-        if "data" not in r:
-            print(f"[ERROR POS_OPEN] Unerwartete Antwort für {symbol}: {r}")
-            return True
-
-        data = r["data"]
-        # Struktur variiert je nach API; wir gehen von Liste aus
-        if isinstance(data, list):
-            for p in data:
-                amt = float(p.get("positionAmt", 0) or p.get("quantity", 0) or 0)
-                if amt != 0:
-                    return True
-            return False
-        else:
-            # Falls Einzelobjekt
-            amt = float(data.get("positionAmt", 0) or data.get("quantity", 0) or 0)
-            return amt != 0
-
-    except Exception as e:
-        print(f"[ERROR POS_OPEN] {symbol}: {e}")
-        # Im Zweifel lieber annehmen, dass was offen ist
-        return True
-
-
-def close_bingx(symbol: str):
-    """
-    Schließt alle Positionen für das Symbol (Market-Order in Gegenrichtung).
-    Da BingX v3 kein direktes closeAll für Futures mehr bietet,
-    wird hier eine Market-Order in Gegenrichtung ausgelöst (simplified).
-    """
-    print(f"[BINGX] Versuche Position für {symbol} zu schließen (Market).")
-    try:
-        # Position holen, um Richtung/Menge zu kennen
-        path_pos = "/api/v3/position"
-        r_pos = signed_get(path_pos, {"symbol": symbol})
-
-        if "data" not in r_pos:
-            print(f"[ERROR CLOSE] Keine Positionsdaten für {symbol}: {r_pos}")
-            return
-
-        positions = r_pos["data"]
-        if isinstance(positions, dict):
-            positions = [positions]
-
-        for p in positions:
-            amt = float(p.get("positionAmt", 0) or p.get("quantity", 0) or 0)
-            if amt == 0:
-                continue
-
-            side = "BUY" if amt < 0 else "SELL"  # Short schließen → BUY
-            qty = abs(amt)
-
-            params = {
-                "symbol": symbol,
-                "side": side,
-                "type": "MARKET",
-                "quantity": str(qty)
-            }
-            path_order = "/api/v3/order"
-            r_close = signed_post(path_order, params)
-            print(f"[CLOSE ORDER] {symbol} → {r_close}")
-
-    except Exception as e:
-        print(f"[ERROR CLOSE] {symbol}: {e}")
-
-
-# --- ORDER & MONITORING LOGIK ---
-
-def execute_trade_bingx(symbol: str, side: str):
-    """
-    Platziert eine SHORT-Order basierend auf dem Signal.
-    NEU: /api/v3/order, Symbol wie BTC-USDT.
-    """
-    print(f"[BINGX] Starte {side} Order für {symbol}")
-    price = get_price_bingx(symbol)
-    if not price:
-        print(f"[BINGX] Abbruch, kein Preis für {symbol}.")
-        return
-
-    trade_size_usdt = 20
-    leverage = 20
-
-    tp_percent = 0.75
-    sl_percent = 0.5
-
-    qty = round(trade_size_usdt / price, 6)
-
-    # Viele v3-APIs brauchen Leverage separat, hier vereinfachen wir:
-    params = {
-        "symbol": symbol,
-        "side": "SELL",          # immer SELL für SHORT
-        "type": "MARKET",
-        "quantity": str(qty)
-    }
-    path_order = "/api/v3/order"
-    res = signed_post(path_order, params)
-
-    if "data" not in res:
-        print(f"[ERROR ORDER] Unerwartete Antwort für {symbol}: {res}")
-        return
-
-    data = res["data"]
+    # Break-Even Setup
+    spread = entry_price * 0.0005  # 0.05% Puffer
+    be_trigger = entry_price * 0.98 - spread
+    be_set = False
 
     try:
-        entry_price = float(data.get("avgPrice") or data.get("price") or price)
-    except Exception:
-        entry_price = price
-
-    tp_price = entry_price * (1 - tp_percent / 100)
-    sl_price = entry_price * (1 + sl_percent / 100)
-
-    threading.Thread(
-        target=monitor_position,
-        args=(symbol, entry_price, tp_price, sl_price, side),
-        daemon=True
-    ).start()
-
-
-def monitor_position(symbol: str, entry: float, tp: float, sl: float, side: str):
-    key = f"BINGX_{symbol}"
-    active_monitors[key] = True
-    print(f"[MONITOR] START {symbol} ({side}) | Entry: {entry:.4f} | TP: {tp:.4f} | SL: {sl:.4f}")
-
-    try:
-        spread = entry * 0.0005
-        be_trigger_short = entry * 0.98 - spread
-        be_set = False
-
         while True:
-            curr = get_price_bingx(symbol)
-            if not curr:
-                time.sleep(1)
-                continue
+            current = get_price(symbol)
+            print(f"[PRICE] {symbol}: {current}")
 
-            # Break-Even Logik für SHORT
-            if not be_set and curr <= be_trigger_short:
-                sl = entry
+            # --- Break-Even ---
+            if not be_set and current <= be_trigger:
+                sl_price = entry_price
                 be_set = True
-                print(f"[BE] {symbol} aktiviert! SL auf Entry gesetzt.")
+                print(f"[BE] {symbol} aktiviert → SL auf Entry gesetzt ({sl_price})")
 
-            # EXIT TRIGGER
-            if curr <= tp or curr >= sl:
-                reason = "TP" if curr <= tp else "SL/BE"
-                print(f"[EXIT] {symbol} Triggered durch {reason} bei Preis: {curr:.4f}")
-                close_bingx(symbol)
+            # --- Exit ---
+            if current <= tp_price:
+                print(f"[EXIT] {symbol} → TP erreicht @ {current}")
+                close_all_positions(symbol)
                 break
 
-            time.sleep(1)
+            if current >= sl_price:
+                print(f"[EXIT] {symbol} → SL/BE erreicht @ {current}")
+                close_all_positions(symbol)
+                break
 
-    except Exception as e:
-        print(f"[ERROR MONITOR] {symbol}: {e}")
+            time.sleep(interval)
 
     finally:
-        active_monitors[key] = False
-        print(f"[MONITOR] END {symbol}")
+        active_monitors[symbol] = False
+        print(f"[MONITOR] {symbol} beendet")
 
+# -------- Cooldown --------
+cooldowns = {}
+COOLDOWN_SECONDS = 2 * 60 * 60  # 2 Stunden
 
-# ---------------- HEALTH CHECK ----------------
-
+# -------- Health Check --------
 @app.route("/", methods=["GET", "POST"])
 def health_check():
-    return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
+    return jsonify({"status": "ok"}), 200
 
-
-@app.route("/debug", methods=["GET"])
-def debug_logs():
-    return "Bitte Render Dashboard → Logs öffnen.", 200
-
-
-# --- FLASK WEBHOOK HANDLER ---
-
+# -------- Webhook --------
 @app.route("/testorder", methods=["POST"])
 def handle_alert():
-    """
-    Endpunkt für Handelssignale. TRIGGERT IMMER NUR SHORT.
-    Erwartet z.B.: {"currency": "ZEC"}
-    daraus wird: ZEC-USDT (Futures-Symbol)
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    currency = str(data.get("currency", "")).upper()
-    if not currency:
-        return jsonify({"error": "no currency"}), 400
+    try:
+        data = request.get_json(force=True, silent=True) or {}
 
-    symbol = f"{currency}-USDT"  # NEU: Bindestrich, passt zur v3-API
-    print(f"\n--- SIGNAL EMPFANGEN: {currency} → BingX Symbol: {symbol} ---")
+        if not data.get("currency"):
+            return jsonify({"status": "ok"}), 200
 
-    if is_pos_open_bingx(symbol) or active_monitors.get(f"BINGX_{symbol}"):
-        return jsonify({"status": "already_active", "symbol": symbol}), 200
+        currency = str(data.get("currency", "")).upper()
+        symbol = f"{currency}-USDT"
 
-    threading.Thread(target=execute_trade_bingx, args=(symbol, "SHORT"), daemon=True).start()
-    return jsonify({"status": "order_started_short", "symbol": symbol}), 200
+        # --- Cooldown ---
+        now = time.time()
+        last_exec = cooldowns.get(symbol, 0)
+        if now - last_exec < COOLDOWN_SECONDS:
+            return jsonify({
+                "status": "cooldown",
+                "remaining_seconds": int(COOLDOWN_SECONDS - (now - last_exec))
+            }), 200
 
+        # --- SHORT Order Setup ---
+        side = "SELL"
+        size = 20
+        leverage = 20
+        tp_percent = 4.0
+        sl_percent = 2.0
 
-# --- APP START ---
+        # Vorab-Preis für Menge
+        pre_price = get_price(symbol)
+        qty = round(size / pre_price, 6)
+
+        headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+        url_order = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
+
+        entry_params = {
+            "leverage": str(leverage),
+            "positionSide": "SHORT",
+            "quantity": str(qty),
+            "side": side,
+            "symbol": symbol,
+            "timestamp": str(int(time.time() * 1000)),
+            "type": "MARKET"
+        }
+        entry_params["signature"] = sign_params(entry_params)
+        entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
+        entry_json = entry_resp.json()
+
+        # --- Exakter Entry ---
+        try:
+            data_block = entry_json.get("data", {}) or {}
+            entry_price = float(
+                data_block.get("avgPrice")
+                or data_block.get("price")
+                or data_block.get("executedPrice")
+                or pre_price
+            )
+        except:
+            entry_price = pre_price
+
+        # --- TP/SL aus exaktem Entry ---
+        tp_price = dynamic_round(entry_price, entry_price * (1 - tp_percent / 100))
+        sl_price = dynamic_round(entry_price, entry_price * (1 + sl_percent / 100))
+
+        print(f"[ORDER] SHORT {symbol} | Entry={entry_price}, TP={tp_price}, SL={sl_price}")
+
+        # --- Monitor starten ---
+        if not active_monitors.get(symbol, False):
+            threading.Thread(
+                target=monitor_position,
+                args=(symbol, entry_price, tp_price, sl_price),
+                daemon=True
+            ).start()
+
+        cooldowns[symbol] = now
+
+        return jsonify({
+            "status": "ok",
+            "symbol": symbol,
+            "entry_price": entry_price,
+            "tp_price": tp_price,
+            "sl_price": sl_price,
+            "entry_response": entry_json
+        }), 200
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
