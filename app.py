@@ -148,10 +148,11 @@ def handle_alert():
         return jsonify({"status": "already_active", "symbol": symbol}), 200
 
 
-@app.route("/")
-def health():
-    # Stellt sicher, dass Render den Service als "Online" erkennt
-    return "Bot Online", 200
+# ---------------- HEALTH CHECK ----------------
+
+@app.route("/", methods=["GET", "POST"])
+def health_check():
+    return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
 if __name__ == "__main__":
     # Bindet an den Port, den Render vorschreibt (standardmäßig 10000)
