@@ -154,17 +154,21 @@ def handle_alert():
     if request.method == "GET":
         return jsonify({"status": "ok", "message": "webhook active"}), 200
 
-    # POST → cryptocurrencyalerting.com sendet oft KEIN JSON beim Test
-    if not request.data or request.data == b"":
+    # POST → cryptocurrencyalerting.com sendet beim Test KEIN JSON
+    data = request.get_json(silent=True)
+
+    # Wenn kein JSON → trotzdem 200 OK zurückgeben
+    if not data:
         print("[INFO] Empty POST received (verification)")
         return jsonify({"status": "ok", "message": "post received"}), 200
 
     # Ab hier NUR echte Signale
-    data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
 
+    # ❗ WICHTIG: KEIN 400 MEHR — currency kann leer sein
     if not currency:
-        return jsonify({"error": "no currency"}), 400
+        print("[WARN] POST ohne currency empfangen")
+        return jsonify({"status": "ignored", "message": "no currency"}), 200
 
     symbol = f"{currency}-USDT"
     print(f"[SIGNAL] {symbol}")
@@ -178,12 +182,13 @@ def handle_alert():
 
 
 
+
 # ---------------- ANTI-SLEEP PING ----------------
 
 def keep_alive():
     while True:
         try:
-            requests.get("https://flask-webhook-bot-1.onrender.com/")
+            requests.get("https://flask-webhook-bot-1.onrender.com/testorder")
         except:
             pass
         time.sleep(60)
