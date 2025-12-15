@@ -138,8 +138,14 @@ def handle_alert():
         }
         entry_params["signature"] = sign_params(entry_params)
         entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
-        entry_json = entry_resp.json()
+        try:
+            entry_json = entry_resp.json()
+        except Exception:
+            print("RAW RESPONSE TEXT:", entry_resp.text)
+            return jsonify({"status": "error", "message": "invalid_json", "raw": entry_resp.text}), 400
+
         print("FULL ORDER RESPONSE:", entry_json)
+
 
 
         # -------- Fix 3: Robuste Entry-Preis-Erkennung --------
