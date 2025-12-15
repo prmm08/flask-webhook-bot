@@ -65,7 +65,7 @@ def close_bingx(symbol):
 # ---------------- SHORT ORDER ----------------
 
 def execute_trade_bingx(symbol):
-    print(f"[ORDER] SHORT {symbol}")
+    print(f"[ORDER] SHORT {symbol} | Entry={price}")
 
     price = get_price_bingx(symbol)
     if not price:
@@ -171,7 +171,10 @@ def handle_alert():
         return jsonify({"status": "ignored", "message": "no currency"}), 200
 
     symbol = f"{currency}-USDT"
-    print(f"[SIGNAL] {symbol}")
+    
+    if currency:
+        print(f"[SIGNAL] {symbol}")
+
 
     if is_pos_open_bingx(symbol) or active_monitors.get(f"BINGX_{symbol}"):
         return jsonify({"status": "already_active"}), 200
