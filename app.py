@@ -1,4 +1,4 @@
-# -------- V 3.1: BINGX FUTURES ONLY - ALWAYS SHORT ON SIGNAL --------
+# -------- V 3.2: BINGX FUTURES ONLY - ALWAYS SHORT ON SIGNAL --------
 
 import time
 import hmac
@@ -22,7 +22,6 @@ active_monitors = {}
 # --- HILFSFUNKTIONEN ---
 
 def sign_bingx(params):
-    """Erzeugt die BingX Signatur."""
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
@@ -31,7 +30,14 @@ def get_price_bingx(symbol):
     try:
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/markPrice"
         r = requests.get(url, params={"symbol": symbol}, timeout=10).json()
+
+        # Robust gegen Fehlerantworten
+        if "data" not in r or "markPrice" not in r["data"]:
+            print(f"[ERROR PREIS] Ungültige Antwort für {symbol}: {r}")
+            return None
+
         return float(r["data"]["markPrice"])
+
     except Exception as e:
         print(f"[ERROR PREIS] {symbol}: {e}")
         return None
@@ -51,7 +57,6 @@ def is_pos_open_bingx(symbol):
         return any(float(p.get("positionAmt", 0)) != 0 for p in r.get("data", []))
     except Exception as e:
         print(f"[ERROR POS_OPEN] {symbol}: {e}")
-        # Im Zweifel lieber nichts Neues aufmachen
         return True
 
 def close_bingx(symbol):
@@ -80,11 +85,9 @@ def execute_trade_bingx(symbol, side):
     if not price:
         return
 
-    # Risk Management Settings
-    trade_size_usdt = 20  # Positionsgröße in USDT
+    trade_size_usdt = 20
     leverage = 20
 
-    # TP/SL Settings (gleich wie vorher, aber nur SHORT genutzt)
     tp_percent = 0.75
     sl_percent = 0.5
 
@@ -92,9 +95,9 @@ def execute_trade_bingx(symbol, side):
 
     params = {
         "leverage": str(leverage),
-        "positionSide": side,                # "SHORT"
+        "positionSide": side,        # SHORT
         "quantity": str(qty),
-        "side": "SELL",                      # immer SELL für SHORT
+        "side": "SELL",              # immer SELL für SHORT
         "symbol": symbol,
         "timestamp": str(int(time.time() * 1000)),
         "type": "MARKET"
@@ -112,11 +115,10 @@ def execute_trade_bingx(symbol, side):
         print(f"[ERROR ORDER] {symbol}: {e}")
         return
 
-    # Exakten Fill-Preis nutzen, fallback auf aktuellen Markpreis
-    entry_price = None
+    # Exakten Fill-Preis nutzen
     try:
         entry_price = float(res.get("data", {}).get("avgPrice", price))
-    except Exception:
+    except:
         entry_price = price
 
     # TP/SL Preise für SHORT
@@ -129,14 +131,12 @@ def execute_trade_bingx(symbol, side):
     ).start()
 
 def monitor_position(symbol, entry, tp, sl, side):
-    """Überwacht die Position im 1-Sekunden-Takt."""
     key = f"BINGX_{symbol}"
     active_monitors[key] = True
     print(f"[MONITOR] START {symbol} ({side}) | Entry: {entry:.4f} | TP: {tp:.4f} | SL: {sl:.4f}")
 
     try:
-        # Spread-Puffer und BE-Trigger (für SHORT)
-        spread = entry * 0.0005  # 0.05% Puffer
+        spread = entry * 0.0005
         be_trigger_short = entry * 0.98 - spread
         be_set = False
 
@@ -152,7 +152,7 @@ def monitor_position(symbol, entry, tp, sl, side):
                 be_set = True
                 print(f"[BE] {symbol} aktiviert! SL auf Entry gesetzt.")
 
-            # EXIT TRIGGER (TP oder SL/BE erreicht) - nur SHORT-Logik nötig
+            # EXIT TRIGGER
             if curr <= tp or curr >= sl:
                 reason = "TP" if curr <= tp else "SL/BE"
                 print(f"[EXIT] {symbol} Triggered durch {reason} bei Preis: {curr:.4f}")
@@ -163,6 +163,7 @@ def monitor_position(symbol, entry, tp, sl, side):
 
     except Exception as e:
         print(f"[ERROR MONITOR] {symbol}: {e}")
+
     finally:
         active_monitors[key] = False
         print(f"[MONITOR] END {symbol}")
@@ -189,14 +190,13 @@ def handle_alert():
     if not currency:
         return jsonify({"error": "no currency"}), 400
 
-    symbol = f"{currency}-USDT"
-    print(f"\n--- SIGNAL EMPFANGEN: {symbol} ---")
+    # ✅ KORREKTES BINGX SYMBOL
+    symbol = f"{currency}USDT"
+    print(f"\n--- SIGNAL EMPFANGEN: {currency} → BingX Symbol: {symbol} ---")
 
-    # Verhindert doppelte Trades bei laufender oder offener Position
     if is_pos_open_bingx(symbol) or active_monitors.get(f"BINGX_{symbol}"):
         return jsonify({"status": "already_active", "symbol": symbol}), 200
 
-    # Immer SHORT ausführen
     threading.Thread(target=execute_trade_bingx, args=(symbol, "SHORT")).start()
     return jsonify({"status": "order_started_short", "symbol": symbol}), 200
 
