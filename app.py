@@ -60,7 +60,7 @@ def close_bingx(symbol):
 
 def get_btc_hourly_trend():
     """Analysiert die BTC-Tendenz der letzten Stunde (LONG/SHORT/NEUTRAL) via Binance."""
-    url = "api.binance.com"
+    url = "https://api.binance.com"
     params = {
         "symbol": "BTCUSDT",
         "interval": "1h",
