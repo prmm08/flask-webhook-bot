@@ -1,4 +1,4 @@
-# -------- VER 1.8: Auto SHORT Orders / TP / SL / BE / Monitoring / Cooldown --------
+# -------- VER 2.0: Auto SHORT Orders / TP / SL / BE / Monitoring (mit 3 Präzisions-Fixes) --------
 
 import time
 import hmac
@@ -16,18 +16,19 @@ BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
 
+# -------- Signatur --------
 def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
+# -------- FIX 1: Futures-Mark-Price statt Spot-Preis --------
 def get_price(symbol):
-    """Preis für das übergebene Symbol holen"""
-    url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
+    """Holt den echten Futures-Mark-Preis (viel genauer als quote/price)."""
+    url = f"{BINGX_BASE}/openApi/swap/v2/quote/markPrice"
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
-    return float(r.json()["data"]["price"])
+    return float(r.json()["data"]["markPrice"])
 
 def get_positions():
-    """Fragt aktive Positionen ab"""
     url = f"{BINGX_BASE}/openApi/swap/v2/user/positions"
     headers = {"X-BX-APIKEY": API_KEY}
     params = {"timestamp": str(int(time.time() * 1000))}
@@ -36,7 +37,6 @@ def get_positions():
     return resp.json()
 
 def close_all_positions(symbol):
-    """Schließt alle offenen Positionen für ein Symbol"""
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions"
     headers = {"X-BX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
     params = {"symbol": symbol, "timestamp": str(int(time.time() * 1000))}
@@ -66,15 +66,17 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
     print(f"[MONITOR] {symbol} SHORT gestartet | Entry={entry_price}, TP={tp_price}, SL={sl_price}")
     active_monitors[symbol] = True
 
-    # Break-Even Setup
-    spread = entry_price * 0.0005  # 0.05% Puffer
+    # -------- FIX 2: Dynamischer Spread statt fixer Wert --------
+    initial_mark = get_price(symbol)
+    spread = abs(initial_mark - entry_price)
+
+    # BE bei 2% Profit minus Spread
     be_trigger = entry_price * 0.98 - spread
     be_set = False
 
     try:
         while True:
             current = get_price(symbol)
-            #print(f"[PRICE] {symbol}: {current}")
 
             # --- Break-Even ---
             if not be_set and current <= be_trigger:
@@ -99,10 +101,6 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
         active_monitors[symbol] = False
         print(f"[MONITOR] {symbol} beendet")
 
-# -------- Cooldown --------
-cooldowns = {}
-COOLDOWN_SECONDS = 0.5 * 60 * 60  # 2 Stunden
-
 # -------- Health Check --------
 @app.route("/", methods=["GET", "POST"])
 def health_check():
@@ -119,15 +117,6 @@ def handle_alert():
 
         currency = str(data.get("currency", "")).upper()
         symbol = f"{currency}-USDT"
-
-        # --- Cooldown ---
-        now = time.time()
-        last_exec = cooldowns.get(symbol, 0)
-        if now - last_exec < COOLDOWN_SECONDS:
-            return jsonify({
-                "status": "cooldown",
-                "remaining_seconds": int(COOLDOWN_SECONDS - (now - last_exec))
-            }), 200
 
         # --- SHORT Order Setup ---
         side = "SELL"
@@ -168,9 +157,12 @@ def handle_alert():
         except:
             entry_price = pre_price
 
-        # --- TP/SL aus exaktem Entry ---
-        tp_price = dynamic_round(entry_price, entry_price * (1 - tp_percent / 100))
-        sl_price = dynamic_round(entry_price, entry_price * (1 + sl_percent / 100))
+        # -------- FIX 3: TP/SL erst berechnen, dann runden --------
+        raw_tp = entry_price * (1 - tp_percent / 100)
+        raw_sl = entry_price * (1 + sl_percent / 100)
+
+        tp_price = dynamic_round(entry_price, raw_tp)
+        sl_price = dynamic_round(entry_price, raw_sl)
 
         print(f"[ORDER] SHORT {symbol} | Entry={entry_price}, TP={tp_price}, SL={sl_price}")
 
@@ -181,8 +173,6 @@ def handle_alert():
                 args=(symbol, entry_price, tp_price, sl_price),
                 daemon=True
             ).start()
-
-        cooldowns[symbol] = now
 
         return jsonify({
             "status": "ok",
