@@ -74,7 +74,7 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
     try:
         while True:
             current = get_price(symbol)
-            print(f"[PRICE] {symbol}: {current}")
+            #print(f"[PRICE] {symbol}: {current}")
 
             # --- Break-Even ---
             if not be_set and current <= be_trigger:
