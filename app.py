@@ -1,4 +1,4 @@
-# -------- VER 2.0: Auto SHORT Orders / TP / SL / BE / Monitoring (mit 3 Präzisions-Fixes) --------
+# -------- VER 2.1: Auto SHORT Orders / TP / SL / BE / Monitoring (mit robustem Entry-Fix) --------
 
 import time
 import hmac
@@ -21,9 +21,9 @@ def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-# -------- FIX 1: Futures-Mark-Price statt Spot-Preis --------
+# -------- Mark-Price (Fix 1) --------
 def get_price(symbol):
-    """Holt den echten Futures-Mark-Preis (viel genauer als quote/price)."""
+    """Holt den echten Futures-Mark-Preis."""
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/markPrice"
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
     return float(r.json()["data"]["markPrice"])
@@ -59,18 +59,13 @@ def dynamic_round(price, value):
 active_monitors = {}
 
 def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
-    """
-    Überwacht SHORT Positionen.
-    BE, TP, SL werden exakt geprüft.
-    """
     print(f"[MONITOR] {symbol} SHORT gestartet | Entry={entry_price}, TP={tp_price}, SL={sl_price}")
     active_monitors[symbol] = True
 
-    # -------- FIX 2: Dynamischer Spread statt fixer Wert --------
+    # -------- Fix 2: Dynamischer Spread --------
     initial_mark = get_price(symbol)
     spread = abs(initial_mark - entry_price)
 
-    # BE bei 2% Profit minus Spread
     be_trigger = entry_price * 0.98 - spread
     be_set = False
 
@@ -145,19 +140,24 @@ def handle_alert():
         entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
         entry_json = entry_resp.json()
 
-        # --- Exakter Entry ---
-        try:
-            data_block = entry_json.get("data", {}) or {}
-            entry_price = float(
-                data_block.get("avgPrice")
-                or data_block.get("price")
-                or data_block.get("executedPrice")
-                or pre_price
-            )
-        except:
+        # -------- Fix 3: Robuste Entry-Preis-Erkennung --------
+        data_block = entry_json.get("data") or entry_json.get("order") or {}
+
+        entry_price = None
+        for key in ["avgPrice", "price", "executedPrice", "fillPrice", "dealAvgPrice"]:
+            if key in data_block:
+                try:
+                    entry_price = float(data_block[key])
+                    break
+                except:
+                    pass
+
+        if entry_price is None:
             entry_price = pre_price
 
-        # -------- FIX 3: TP/SL erst berechnen, dann runden --------
+        print(f"[ENTRY] Preis erkannt: {entry_price}")
+
+        # -------- TP/SL erst berechnen, dann runden --------
         raw_tp = entry_price * (1 - tp_percent / 100)
         raw_sl = entry_price * (1 + sl_percent / 100)
 
