@@ -156,8 +156,11 @@ def debug_logs():
 
 # --- WEBHOOK: IMMER SHORT ---
 
-@app.route("/testorder", methods=["POST"])
+@app.route("/testorder", methods=["GET", "POST"])
 def handle_alert():
+    if request.method == "GET":
+        return jsonify({"status": "ok", "message": "webhook active"}), 200
+
     data = request.get_json(force=True, silent=True) or {}
     currency = str(data.get("currency", "")).upper()
 
@@ -173,6 +176,7 @@ def handle_alert():
     threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
 
     return jsonify({"status": "short_started", "symbol": symbol}), 200
+
 
 # --- APP START ---
 
