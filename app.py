@@ -1,4 +1,4 @@
-# -------- V 2.7: BINGX FUTURES ONLY - FINAL ROBUST COINGECKO BTC TREND FILTER ADDED --------
+# -------- V 2.8: BINGX FUTURES ONLY - FINAL ROBUST BINANCE BTC TREND FILTER ADDED --------
 
 import time
 import hmac
@@ -56,35 +56,28 @@ def close_bingx(symbol):
     requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions", data=params, headers={"X-BX-APIKEY": API_KEY})
 
 
-# --- NEUE FUNKTION: BTC TREND ERKENNUNG VIA COINGECKO ---
+# --- NEUE FUNKTION: BTC TREND ERKENNUNG VIA BINANCE ---
 
 def get_btc_hourly_trend():
-    """Analysiert die BTC-Tendenz der letzten Stunde (LONG/SHORT/NEUTRAL) via CoinGecko."""
-    # Ruft 24 Stunden Daten im 5-Minuten-Intervall ab, um die letzte Stunde zu bewerten
-    url = "https://api.coingecko.com"
+    """Analysiert die BTC-Tendenz der letzten Stunde (LONG/SHORT/NEUTRAL) via Binance."""
+    url = "https://api.binance.com" # Korrekte URL
+    params = {
+        "symbol": "BTCUSDT", # Binance verwendet BTCUSDT ohne Bindestrich
+        "interval": "1h",
+        "limit": 2 # Index 0 ist die letzte abgeschlossene Kerze
+    }
     
     try:
-        r = requests.get(url, timeout=10).json()
-        prices_data = r.get("prices", []) # prices_data ist eine Liste von [timestamp_ms, price]
+        r = requests.get(url, params=params, timeout=10).json()
         
-        if len(prices_data) < 12: # Mindestens 12 Datenpunkte für 1 Stunde (bei 5m Intervallen)
-            print("[TREND] Nicht genügend CoinGecko Daten für Trendanalyse.")
+        if not isinstance(r, list) or len(r) < 2:
+            print("[TREND] Nicht genügend Binance Daten für Trendanalyse.")
             return "NEUTRAL"
             
-        # Timestamp vor 60 Minuten (in Millisekunden)
-        one_hour_ago_ms = (time.time() - 3600) * 1000
-        
-        # Den ersten Datenpunkt finden, der vor oder zum Zeitpunkt vor 1 Stunde liegt
-        prices_last_hour_segment = [p for p in prices_data if p[0] >= one_hour_ago_ms]
-
-        if not prices_last_hour_segment:
-            print("[TREND] Keine Preise im letzten 1-Stunden-Fenster gefunden.")
-            return "NEUTRAL"
-            
-        # Der erste Preis im Segment ist der "Open" Preis für diese Stunde
-        open_price = prices_last_hour_segment[0]
-        # Der letzte Preis im Segment ist der aktuelle "Close" Preis
-        close_price = prices_last_hour_segment[-1]
+        # Die Daten bei Index 0 sind die der letzten abgeschlossenen Stunde
+        last_hour_kline = r # <-- KORRIGIERTER ZUGRIFF
+        open_price = float(last_hour_kline) # <-- KORRIGIERTER ZUGRIFF (Index 1 ist Open)
+        close_price = float(last_hour_kline) # <-- KORRIGIERTER ZUGRIFF (Index 4 ist Close)
         
         if close_price > open_price:
             print(f"[TREND] BTC 1H Tendenz: LONG (Open: {open_price:.2f}, Close: {close_price:.2f})")
@@ -97,7 +90,7 @@ def get_btc_hourly_trend():
             return "NEUTRAL"
             
     except Exception as e:
-        print(f"[ERROR TREND] Fehler beim Abrufen des BTC-Trends von CoinGecko: {e}")
+        print(f"[ERROR TREND] Fehler beim Abrufen des BTC-Trends von Binance: {e}")
         return "NEUTRAL"
 
 
