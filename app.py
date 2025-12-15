@@ -144,6 +144,11 @@ def handle_alert():
 
 # ---------------- HEALTH CHECK / VERIFIZIERUNG ----------------
 
+@app.route("/testorder", methods=["GET", "POST"])
+def health_check_testorder():
+    """Dupliziert den Health Check für den Testorder Endpunkt."""
+    return jsonify({"status": "ok", "message": "Webhook erreichbar auf testorder"}), 200
+
 @app.route("/", methods=["GET", "POST"])
 def health_check():
     """
