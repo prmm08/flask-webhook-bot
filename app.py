@@ -122,10 +122,10 @@ def execute_trade_bingx(symbol, side):
     leverage = 20
 
     if side == "LONG":
-        tp_percent = 0.75
+        tp_percent = 0.5
         sl_percent = 0.5
     else:
-        tp_percent = 0.75
+        tp_percent = 0.5
         sl_percent = 0.5
 
     qty = round(trade_size_usdt / price, 6)
