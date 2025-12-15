@@ -81,7 +81,7 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
         active_monitors[symbol] = False
 
 cooldowns = {}
-COOLDOWN_SECONDS = 2 * 60 * 60
+COOLDOWN_SECONDS = 0.5 * 60 * 60
 
 @app.route("/", methods=["GET", "POST"])
 def health_check():
@@ -109,8 +109,8 @@ def handle_alert():
         side = "SELL"
         size = 20
         leverage = 20
-        tp_percent = 3
-        sl_percent = 1
+        tp_percent = 0.25
+        sl_percent = 0.25
 
         price = get_price(symbol)
         qty = round(size / price, 6)
