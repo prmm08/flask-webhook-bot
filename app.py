@@ -126,7 +126,7 @@ def monitor_position(symbol, entry, tp, sl):
         
 # --- FLASK WEBHOOK HANDLER ---
 
-@app.route("/testorder", methods=["POST"])
+@app.route("/myweb", methods=["POST"])
 def handle_alert():
     """Endpunkt für Handelssignale (z.B. von Cryptocurrencyalerting)."""
     data = request.get_json(force=True, silent=True) or {}
@@ -144,12 +144,7 @@ def handle_alert():
 
 # ---------------- HEALTH CHECK / VERIFIZIERUNG ----------------
 
-@app.route("/testorder", methods=["GET", "POST"])
-def health_check_testorder():
-    """Dupliziert den Health Check für den Testorder Endpunkt."""
-    return jsonify({"status": "ok", "message": "Webhook erreichbar auf testorder"}), 200
-
-@app.route("/", methods=["GET", "POST"])
+@app.route("/myweb", methods=["GET", "POST"])
 def health_check():
     """
     Dieser Endpunkt antwortet auf GET/POST Anfragen von
