@@ -60,38 +60,47 @@ def close_bingx(symbol):
 
 def get_btc_hourly_trend():
     """Analysiert die BTC-Tendenz der letzten Stunde (LONG/SHORT/NEUTRAL) via Binance."""
-    url = "https://api.binance.com" # Korrekte URL
+    url = "https://api.binance.com/api/v3/klines"  # KORREKTE ENDPOINT
     params = {
-        "symbol": "BTCUSDT", # Binance verwendet BTCUSDT ohne Bindestrich
+        "symbol": "BTCUSDT",
         "interval": "1h",
-        "limit": 2 # Index 0 ist die letzte abgeschlossene Kerze
+        "limit": 2
     }
-    
+
     try:
-        r = requests.get(url, params=params, timeout=10).json()
-        
-        if not isinstance(r, list) or len(r) < 2:
+        r = requests.get(url, params=params, timeout=10)
+
+        # Falls Binance eine Fehlermeldung sendet
+        if r.status_code != 200:
+            print(f"[ERROR TREND] Binance Status {r.status_code}: {r.text}")
+            return "NEUTRAL"
+
+        data = r.json()
+
+        if not isinstance(data, list) or len(data) < 2:
             print("[TREND] Nicht genügend Binance Daten für Trendanalyse.")
             return "NEUTRAL"
-            
-        # Die Daten bei Index 0 sind die der letzten abgeschlossenen Stunde
-        last_hour_kline = r[0] # <-- KORRIGIERTER ZUGRIFF AUF DIE LISTE
-        open_price = float(last_hour_kline[1]) # <-- KORRIGIERTER ZUGRIFF (Index 1 ist Open)
-        close_price = float(last_hour_kline[4]) # <-- KORRIGIERTER ZUGRIFF (Index 4 ist Close)
-        
+
+        # Letzte abgeschlossene Kerze ist Index 0
+        last_hour = data[0]
+
+        open_price = float(last_hour[1])
+        close_price = float(last_hour[4])
+
         if close_price > open_price:
-            print(f"[TREND] BTC 1H Tendenz: LONG (Open: {open_price:.2f}, Close: {close_price:.2f})")
+            print(f"[TREND] BTC 1H Tendenz: LONG (Open: {open_price}, Close: {close_price})")
             return "LONG"
         elif close_price < open_price:
-            print(f"[TREND] BTC 1H Tendenz: SHORT (Open: {open_price:.2f}, Close: {close_price:.2f})")
+            print(f"[TREND] BTC 1H Tendenz: SHORT (Open: {open_price}, Close: {close_price})")
             return "SHORT"
         else:
             print("[TREND] BTC 1H Tendenz: NEUTRAL")
             return "NEUTRAL"
-            
+
     except Exception as e:
         print(f"[ERROR TREND] Fehler beim Abrufen des BTC-Trends von Binance: {e}")
         return "NEUTRAL"
+
 
 
 # --- ORDER & MONITORING LOGIK (Unverändert) ---
