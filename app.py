@@ -139,6 +139,8 @@ def handle_alert():
         entry_params["signature"] = sign_params(entry_params)
         entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
         entry_json = entry_resp.json()
+        print("FULL ORDER RESPONSE:", entry_json)
+
 
         # -------- Fix 3: Robuste Entry-Preis-Erkennung --------
         data_block = entry_json.get("data") or entry_json.get("order") or {}
