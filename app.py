@@ -65,12 +65,15 @@ def close_bingx(symbol):
 # ---------------- SHORT ORDER ----------------
 
 def execute_trade_bingx(symbol):
-    print(f"[ORDER] SHORT {symbol} | Entry={price}")
 
     price = get_price_bingx(symbol)
-    if not price:
-        print("[ERROR] Preis konnte nicht geladen werden")
+
+    # Wenn Symbol ungültig → still abbrechen
+    if price is None:
         return
+
+    print(f"[ORDER] SHORT {symbol} | Entry={price}")
+
 
     trade_size_usdt = 20
     leverage = 20
