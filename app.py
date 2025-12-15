@@ -1,10 +1,4 @@
-#/ -------- VER 1.8: Pump-Trigger + 45-Minuten-Watcher + Compact Logs --------
-#✅ 45‑Minuten‑Watcher (statt 30) 
-#✅ jede Minute erneute Prüfung 
-#✅ Pump wird NICHT erneut geprüft 
-#✅ Pump ist nur der Trigger 
-#✅ Watcher prüft NUR die anderen Bedingungen: Volumen, RSI, Wick, Momentum
-#✅ kompakte Logs 
+# -------- VER 2.0: Minimal SHORT Bot (No Filters) --------
 
 import time
 import hmac
@@ -13,19 +7,9 @@ import requests
 import os
 import urllib.parse
 import threading
-import logging
 from flask import Flask, request, jsonify
 
-# ---------------- FLASK + LOGGING SETUP ----------------
-
 app = Flask(__name__)
-
-app.logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setLevel(logging.INFO)
-app.logger.addHandler(handler)
-
-# ---------------- API KEYS ----------------
 
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
@@ -37,20 +21,14 @@ def sign_params(params):
     query = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-# ---------------- PRICE + POSITIONS ----------------
+# ---------------- PRICE ----------------
 
 def get_price(symbol):
     url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
     return float(r.json()["data"]["price"])
 
-def get_positions():
-    url = f"{BINGX_BASE}/openApi/swap/v2/user/positions"
-    headers = {"X-BX-APIKEY": API_KEY}
-    params = {"timestamp": str(int(time.time() * 1000))}
-    params["signature"] = sign_params(params)
-    resp = requests.get(url, params=params, headers=headers, timeout=10)
-    return resp.json()
+# ---------------- CLOSE ALL ----------------
 
 def close_all_positions(symbol):
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions"
@@ -58,7 +36,7 @@ def close_all_positions(symbol):
     params = {"symbol": symbol, "timestamp": str(int(time.time() * 1000))}
     params["signature"] = sign_params(params)
     resp = requests.post(url, data=params, headers=headers, timeout=10)
-    app.logger.info(f"[CLOSE] {resp.json()}")
+    print("[CLOSE]", resp.json())
     return resp.json()
 
 # ---------------- DYNAMIC ROUND ----------------
@@ -72,103 +50,9 @@ def dynamic_round(price, value):
         decimals = 6
     return round(value, decimals)
 
-# ---------------- OHLCV + RSI ----------------
-
-def get_ohlcv(symbol, interval="1m", limit=10):
-    url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=10)
-    return r.json().get("data", [])
-
-def calc_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50
-
-    gains = []
-    losses = []
-
-    for i in range(1, period + 1):
-        diff = closes[-i] - closes[-i - 1]
-        if diff > 0:
-            gains.append(diff)
-        else:
-            losses.append(abs(diff))
-
-    avg_gain = sum(gains) / period if gains else 0.00001
-    avg_loss = sum(losses) / period if losses else 0.00001
-
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-
-    return rsi
-
-
-# ---------------- FILTER OHNE PUMP (für Watcher) ----------------
-
-def check_reversal_conditions(symbol, logger):
-    ohlcv = get_ohlcv(symbol, "1m", 50)
-    if len(ohlcv) < 6:
-        return False, "NO (Nicht genug OHLCV)"
-
-    closes = [float(c["close"]) for c in ohlcv]
-    volumes = [float(c["volume"]) for c in ohlcv]
-
-    last = ohlcv[-1]
-    open_p = float(last["open"])
-    close_p = float(last["close"])
-    high_p = float(last["high"])
-    wick = high_p - max(open_p, close_p)
-    body = abs(close_p - open_p)
-
-    avg_vol = sum(volumes[-6:-1]) / 5
-    vol_spike = volumes[-1] > avg_vol * 2
-    wick_reversal = wick > body * 1.3
-
-    p1 = get_price(symbol)
-    time.sleep(0.4)
-    p2 = get_price(symbol)
-    time.sleep(0.4)
-    p3 = get_price(symbol)
-    momentum_falling = p3 < p2 < p1
-
-    rsi = calc_rsi(closes)
-
-    logger.info(
-        f"[CHECK] {symbol} | Vol={vol_spike} | Wick={wick_reversal} | Mom={momentum_falling} | RSI={rsi:.1f}"
-    )
-
-    if not vol_spike:
-        return False, "NO (Volumen fehlt)"
-    if not wick_reversal:
-        return False, "NO (Wick fehlt)"
-    if not momentum_falling:
-        return False, "NO (Momentum nicht gedreht)"
-    if rsi <= 80:
-        return False, f"NO (RSI {rsi:.1f} nicht überkauft)"
-
-    return True, "YES"
-
-# ---------------- 45-MINUTEN WATCHER ----------------
-
-def pump_watcher(symbol, pump_percent):
-    app.logger.info(f"[WATCHER] gestartet für {symbol} (45 Minuten)")
-
-    start = time.time()
-    max_duration = 45 * 60  # 45 Minuten
-
-    while time.time() - start < max_duration:
-        ok, reason = check_reversal_conditions(symbol, app.logger)
-
-        if ok:
-            app.logger.info(f"[WATCHER RESULT] Bedingungen erfüllt → SHORT")
-            trigger_short(symbol)
-            return
-
-        time.sleep(60)
-
-    app.logger.info(f"[WATCHER END] Keine Bedingungen erfüllt nach 45 Minuten")
-
 # ---------------- SHORT AUSLÖSEN ----------------
+
+active_monitors = {}
 
 def trigger_short(symbol):
     side = "SELL"
@@ -195,8 +79,10 @@ def trigger_short(symbol):
     entry_params["signature"] = sign_params(entry_params)
     entry_resp = requests.post(url_order, data=entry_params, headers=headers, timeout=10)
 
-    tp_price = dynamic_round(price, price * (1 - tp_percent / 100))
-    sl_price = dynamic_round(price, price * (1 + sl_percent / 100))
+    print("[SHORT OPEN]", entry_resp.json())
+
+    tp_price = dynamic_round(price, price * 0.95)
+    sl_price = dynamic_round(price, price * 1.02)
 
     if not active_monitors.get(symbol, False):
         threading.Thread(
@@ -204,16 +90,10 @@ def trigger_short(symbol):
             args=(symbol, price, tp_price, sl_price)
         ).start()
 
-    cooldowns[symbol] = time.time()
-
-    app.logger.info(f"[SHORT] {symbol} eröffnet bei {price}")
-
 # ---------------- POSITION MONITOR ----------------
 
-active_monitors = {}
-
 def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
-    app.logger.info(f"[MONITOR] {symbol} gestartet")
+    print(f"[MONITOR] {symbol} gestartet")
     active_monitors[symbol] = True
     try:
         trailing_percent = 0.025
@@ -221,15 +101,17 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
 
         while True:
             current = get_price(symbol)
-            app.logger.info(f"[PRICE] {symbol} = {current}")
+            print(f"[PRICE] {symbol} = {current}")
 
+            # Break-Even
             if not be_set and current <= entry_price * (1 - trailing_percent):
                 sl_price = entry_price
                 be_set = True
-                app.logger.info(f"[BE] Break-Even aktiviert für {symbol}")
+                print(f"[BE] Break-Even aktiviert für {symbol}")
 
+            # TP oder SL
             if current <= tp_price or current >= sl_price:
-                app.logger.info(f"[EXIT] {symbol} TP/SL erreicht")
+                print(f"[EXIT] {symbol} TP/SL erreicht")
                 close_all_positions(symbol)
                 break
 
@@ -237,67 +119,28 @@ def monitor_position(symbol, entry_price, tp_price, sl_price, interval=1):
     finally:
         active_monitors[symbol] = False
 
-# ---------------- COOLDOWN ----------------
+# ---------------- WEBHOOK ----------------
 
-cooldowns = {}
-COOLDOWN_SECONDS = 2 * 60 * 60
-
-# ---------------- HEALTH CHECK ----------------
-
-@app.route("/", methods=["GET", "POST"])
-def health_check():
-    return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
-
-# ---------------- DEBUG ROUTE ----------------
-
-@app.route("/debug", methods=["GET"])
-def debug_logs():
-    return "Bitte Render Dashboard → Logs öffnen.", 200
-
-# ---------------- MAIN WEBHOOK ----------------
-
-@app.route("/testorder", methods=["POST"])
-def handle_alert():
+@app.route("/signal", methods=["POST"])
+def handle_signal():
     try:
-        raw = request.data
-        app.logger.info(f"[RAW] {raw}")
+        data = request.get_json(force=True)
+        print("[JSON]", data)
 
-        try:
-            data = request.get_json(force=True)
-            app.logger.info(f"[JSON] {data}")
-        except Exception as e:
-            app.logger.error(f"[JSON ERROR] {e}")
-            return jsonify({"status": "error", "message": "JSON Fehler"}), 400
-
-        if not data or "currency" not in data or "percent" not in data:
-            app.logger.warning("[IGNORED] Ungültiges JSON")
+        if not data or "currency" not in data:
             return jsonify({"status": "ignored", "reason": "Ungültiges JSON"}), 200
 
         currency = str(data["currency"]).upper()
         symbol = f"{currency}-USDT"
-        pump_percent = float(data["percent"])
 
-        app.logger.info(f"[RECEIVED] {symbol} Pump={pump_percent}%")
+        print(f"[RECEIVED] SHORT SIGNAL für {symbol}")
 
-        if pump_percent < 2.5:
-            return jsonify({"status": "ignored", "reason": "Pump < 2.5%"}), 200
+        trigger_short(symbol)
 
-
-        # Sofortige Prüfung
-        ok, reason = check_reversal_conditions(symbol, app.logger)
-        app.logger.info(f"[RESULT] {reason}")
-
-        if ok:
-            trigger_short(symbol)
-            return jsonify({"status": "ok", "reason": "Sofort ausgelöst"}), 200
-
-        # Watcher starten
-        threading.Thread(target=pump_watcher, args=(symbol, pump_percent)).start()
-
-        return jsonify({"status": "watching", "reason": "Watcher gestartet (45 Minuten)"}), 200
+        return jsonify({"status": "ok", "message": "SHORT ausgeführt"}), 200
 
     except Exception as e:
-        app.logger.error(f"[ERROR] {e}")
+        print("[ERROR]", e)
         return jsonify({"status": "error", "message": str(e)}), 400
 
 # ---------------- RUN ----------------
