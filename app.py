@@ -128,6 +128,13 @@ def monitor_position(symbol, entry, tp, sl):
     finally:
         active_monitors[key] = False
         print(f"[MONITOR] END {symbol}")
+        
+        
+# ---------------- HEALTH CHECK ----------------
+
+@app.route("/", methods=["GET", "POST"])
+def health_check():
+    return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
 # --- FLASK WEBHOOK HANDLER ---
 
@@ -148,11 +155,7 @@ def handle_alert():
         return jsonify({"status": "already_active", "symbol": symbol}), 200
 
 
-# ---------------- HEALTH CHECK ----------------
 
-@app.route("/", methods=["GET", "POST"])
-def health_check():
-    return jsonify({"status": "ok", "message": "Webhook erreichbar"}), 200
 
 if __name__ == "__main__":
     # Bindet an den Port, den Render vorschreibt (standardmäßig 10000)
