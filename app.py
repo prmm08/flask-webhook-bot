@@ -77,7 +77,7 @@ def execute_trade_bingx(symbol):
     leverage = 20
 
     tp_percent = 1
-    sl_percent =
+    sl_percent = 100
 
     qty = round(trade_size_usdt / price, 6)
 
