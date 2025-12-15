@@ -150,14 +150,20 @@ def health_check():
 @app.route("/testorder", methods=["GET", "POST"])
 def handle_alert():
 
-    # GET → cryptocurrencyalerting.com verification
+    # GET → Verifizierung
     if request.method == "GET":
         return jsonify({"status": "ok", "message": "webhook active"}), 200
 
-    # POST → actual trading signal
-    data = request.get_json(silent=True) or {}
-    currency = str(data.get("currency", "")).upper()
+    # POST → cryptocurrencyalerting.com sendet oft KEIN JSON beim Test
+    data = request.get_json(silent=True)
 
+    # Wenn kein JSON → trotzdem 200 zurückgeben
+    if not data:
+        print("[INFO] Empty POST received (verification)")
+        return jsonify({"status": "ok", "message": "post received"}), 200
+
+    # Ab hier nur echte Signale
+    currency = str(data.get("currency", "")).upper()
     if not currency:
         return jsonify({"error": "no currency"}), 400
 
@@ -170,6 +176,7 @@ def handle_alert():
     threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
 
     return jsonify({"status": "short_started", "symbol": symbol}), 200
+
 
 # ---------------- ANTI-SLEEP PING ----------------
 
