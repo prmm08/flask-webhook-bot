@@ -119,7 +119,10 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
 
 # ---------------- MAIN LOGIC (KORRIGIERT) ----------------
 
+# ---------------- MAIN LOGIC (KORRIGIERT FÜR ENTRY SIGNATUR) ----------------
+
 def execute_trade_bingx(symbol):
+    # ... (RSI Check und Preis laden bleibt gleich) ...
     ohlcv = get_ohlcv(symbol, RSI_TIMEFRAME)
     if not ohlcv: return
     rsi = calc_rsi([float(c["close"]) for c in ohlcv])
@@ -133,17 +136,28 @@ def execute_trade_bingx(symbol):
 
     trade_size_usdt, leverage = 10, 10
     qty = round(trade_size_usdt / price, 6)
+    
+    print(f"[ORDER] SHORT {symbol} | Entry={price} | RSI={rsi:.1f} ({RSI_TIMEFRAME})")
 
     # 1. Entry Order (Market)
     ts_entry = str(int(time.time() * 1000))
     entry_params = {
-        "symbol": symbol, "side": "SELL", "positionSide": "SHORT",
-        "type": "MARKET", "quantity": str(qty), "leverage": str(leverage),
+        "symbol": symbol, 
+        "side": "SELL", 
+        "positionSide": "SHORT",
+        "type": "MARKET", 
+        "quantity": str(qty), 
+        "leverage": str(leverage),
         "timestamp": ts_entry
     }
-    # Für die Entry-Order nutzen wir die alte Signatur-Methode (Body/Data)
-    entry_params["signature"] = sign_bingx(entry_params)
-    r_entry = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=entry_params, headers={"X-BX-APIKEY": API_KEY}).json()
+    
+    # Signatur berechnen und in die URL integrieren (WICHTIGER FIX!)
+    query_string = urllib.parse.urlencode(sorted(entry_params.items()))
+    signature = hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    full_url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{query_string}&signature={signature}"
+
+    headers = {"X-BX-APIKEY": API_KEY}
+    r_entry = requests.post(full_url, headers=headers).json()
     
     if r_entry.get("code") != 0:
         print(f"[ERROR] Entry failed for {symbol}: {r_entry.get('msg')}")
@@ -156,10 +170,10 @@ def execute_trade_bingx(symbol):
     sl = price * (1 + SL_PERCENT / 100)
     be_trigger = price * (1 - BE_PERCENT / 100)
 
-    # set_tp_sl kümmert sich nun selbst um das Timing
     set_tp_sl(symbol, qty, tp, sl)
     
     threading.Thread(target=monitor_be, args=(symbol, qty, price, tp, be_trigger)).start()
+
 
 
 # ---------------- BE MONITOR ----------------
