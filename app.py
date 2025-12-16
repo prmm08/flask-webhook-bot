@@ -1,4 +1,4 @@
-# -------- V 3.1: BINGX FUTURES - KORRIGIERTE SIGNATUR & PREISE --------
+# -------- V 3.2: BINGX FUTURES - KORRIGIERTE SIGNATUR & TIMING --------
 
 import time
 import hmac
@@ -27,7 +27,6 @@ TP_PERCENT, SL_PERCENT, BE_PERCENT = 0.9, 0.8, 0.4
 # ---------------- SIGNING (FIXED) ----------------
 
 def sign_bingx(params):
-    # Sortierung der Parameter ist für die BingX-Signatur essentiell
     query_string = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -71,7 +70,7 @@ def is_pos_open_bingx(symbol):
     except:
         return True
 
-# ---------------- PRECISE TP/SL SETTING ----------------
+# ---------------- PRECISE TP/SL SETTING (KORRIGIERT) ----------------
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
     # Preise auf 6 Nachkommastellen runden
@@ -92,37 +91,26 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
             "timestamp": ts
         }
         
-        # 1. Parameter sortieren und Query-String erstellen
         query_string = urllib.parse.urlencode(sorted(params.items()))
-        
-        # 2. Signatur generieren
-        signature = hmac.new(
-            API_SECRET.encode("utf-8"), 
-            query_string.encode("utf-8"), 
-            hashlib.sha256
-        ).hexdigest()
-        
-        # 3. URL mit Parametern UND Signatur bauen
+        signature = hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
         full_url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{query_string}&signature={signature}"
         
-        # 4. Request senden (Daten sind in der URL, daher data={} oder None)
         headers = {"X-BX-APIKEY": API_KEY}
         return requests.post(full_url, headers=headers)
 
     # TP und SL nacheinander senden
     r_tp = place_order(tp_p, "TAKE_PROFIT_MARKET")
-    r_sl = place_order(sl_p, "STOP_LOSS_MARKET")
+    # STOP_LOSS_MARKET durch STOP_MARKET ersetzt!
+    r_sl = place_order(sl_p, "STOP_MARKET") 
 
     print(f"[API] TP: {r_tp.json().get('msg')} | SL: {r_sl.json().get('msg')}")
 
-
-# ---------------- MAIN LOGIC ----------------
+# ---------------- MAIN LOGIC (KORRIGIERTES TIMING) ----------------
 
 def execute_trade_bingx(symbol):
     ohlcv = get_ohlcv(symbol, RSI_TIMEFRAME)
     if not ohlcv: return
     rsi = calc_rsi([float(c["close"]) for c in ohlcv])
-
     if rsi < 80:
         print(f"[RSI BLOCK] {symbol} RSI={rsi:.1f} < 80")
         return
@@ -133,7 +121,7 @@ def execute_trade_bingx(symbol):
     trade_size_usdt, leverage = 10, 10
     qty = round(trade_size_usdt / price, 6)
 
-    # Entry Order
+    # Entry Order senden
     entry_params = {
         "symbol": symbol, "side": "SELL", "positionSide": "SHORT",
         "type": "MARKET", "quantity": str(qty), "leverage": str(leverage),
@@ -142,6 +130,9 @@ def execute_trade_bingx(symbol):
     entry_params["signature"] = sign_bingx(entry_params)
     requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=entry_params, headers={"X-BX-APIKEY": API_KEY})
 
+    # Warten, bis die Position im BingX System registriert ist
+    time.sleep(2) 
+    
     # TP/SL Berechnung
     tp = price * (1 - TP_PERCENT / 100)
     sl = price * (1 + SL_PERCENT / 100)
@@ -150,11 +141,12 @@ def execute_trade_bingx(symbol):
     set_tp_sl(symbol, qty, tp, sl)
     threading.Thread(target=monitor_be, args=(symbol, qty, price, tp, be_trigger)).start()
 
+# ---------------- BE MONITOR ----------------
+
 def monitor_be(symbol, qty, entry, tp, trigger):
     while is_pos_open_bingx(symbol):
         curr = get_price_bingx(symbol)
         if curr and curr <= trigger:
-            # Cancel und Reset für BE
             ts = str(int(time.time() * 1000))
             c_params = {"symbol": symbol, "timestamp": ts}
             c_params["signature"] = sign_bingx(c_params)
@@ -165,6 +157,8 @@ def monitor_be(symbol, qty, entry, tp, trigger):
             print(f"[BE] SL auf Entry für {symbol} verschoben.")
             break
         time.sleep(3)
+
+# ---------------- WEBHOOK & START (Rest bleibt gleich) ----------------
 
 @app.route("/testorder", methods=["POST", "GET"])
 def handle_alert():
