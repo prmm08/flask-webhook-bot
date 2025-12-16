@@ -1,4 +1,4 @@
-# -------- V 3.0: BINGX FUTURES ONLY - SHORT ONLY + RSI FILTER + PRECISE TP/SL GOOGLE --------
+# -------- V 3.0: BINGX FUTURES ONLY - SHORT ONLY + RSI FILTER + PRECISE TP/SL/BE --------
 
 import time
 import hmac
@@ -25,6 +25,11 @@ app = Flask(__name__)
 
 # --- RSI TIMEFRAME (wählbar: "1m", "5m", "15m") ---
 RSI_TIMEFRAME = "1m"
+
+# --- Globale Trade Einstellungen für BE Monitor ---
+TP_PERCENT = 0.9  
+SL_PERCENT = 0.8  
+BE_PERCENT = 0.4  
 
 # ---------------- SIGNING ----------------
 
@@ -54,7 +59,6 @@ def get_ohlcv(symbol, interval="1m", limit=100):
         return []
 
 def calc_rsi(closes, period=14):
-    # ... (RSI Logik bleibt gleich) ...
     if len(closes) < period + 1:
         return 50
 
@@ -77,7 +81,6 @@ def calc_rsi(closes, period=14):
 # ---------------- POSITION CHECK ----------------
 
 def is_pos_open_bingx(symbol):
-    # ... (Position Check Logik bleibt gleich) ...
     try:
         ts = str(int(time.time() * 1000))
         params = {"symbol": symbol, "timestamp": ts}
@@ -92,7 +95,7 @@ def is_pos_open_bingx(symbol):
     except:
         return True
 
-# ---------------- CLOSE (nicht mehr benötigt für TP/SL) ----------------
+# ---------------- CLOSE ----------------
 
 def close_bingx(symbol):
     ts = str(int(time.time() * 1000))
@@ -104,42 +107,67 @@ def close_bingx(symbol):
         headers={"X-BX-APIKEY": API_KEY}
     )
 
-# ---------------- PRECISE TP/SL SETTING (NEU) ----------------
+# ---------------- PRECISE TP/SL SETTING ----------------
 
-def set_tp_sl(symbol, tp_price, sl_price, position_side="SHORT"):
+def set_tp_sl(symbol, qty, tp_price, sl_price, position_side="SHORT"):
+    """
+    Sendet TP und SL Orders an BingX. 
+    qty: Die Menge aus der Hauptorder (muss identisch sein)
+    """
+    # 1. TAKE PROFIT
     ts = str(int(time.time() * 1000))
-    # Nutzt eine Trailing Stop Order-Funktion, die auch feste TP/SL Preise annimmt
-    params = {
+    tp_params = {
         "symbol": symbol,
-        "type": "TAKE_PROFIT_MARKET", # Bei Trigger wird Marktorder ausgeführt
+        "side": "BUY",  # Bei SHORT Exit ist die Order ein BUY
         "positionSide": position_side,
-        "stopPrice": str(tp_price),
+        "type": "TAKE_PROFIT_MARKET",
+        "quantity": str(qty),
+        "stopPrice": str(round(tp_price, 6)),
+        "workingType": "MARK_PRICE", 
+        "closePosition": "true",     
         "timestamp": ts
     }
-    params["signature"] = sign_bingx(params)
-    # Senden der TP Order
-    requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=params, headers={"X-BX-APIKEY": API_KEY})
-
+    tp_params["signature"] = sign_bingx(tp_params)
+    r_tp = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=tp_params, headers={"X-BX-APIKEY": API_KEY})
+    
+    # 2. STOP LOSS
     ts = str(int(time.time() * 1000))
-    params = {
+    sl_params = {
         "symbol": symbol,
-        "type": "STOP_LOSS_MARKET", # Bei Trigger wird Marktorder ausgeführt
+        "side": "BUY", 
         "positionSide": position_side,
-        "stopPrice": str(sl_price),
+        "type": "STOP_LOSS_MARKET",
+        "quantity": str(qty),
+        "stopPrice": str(round(sl_price, 6)),
+        "workingType": "MARK_PRICE",
+        "closePosition": "true",
         "timestamp": ts
     }
-    params["signature"] = sign_bingx(params)
-    # Senden der SL Order
-    requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=params, headers={"X-BX-APIKEY": API_KEY})
+    sl_params["signature"] = sign_bingx(sl_params)
+    r_sl = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=sl_params, headers={"X-BX-APIKEY": API_KEY})
+
+    print(f"[API RESPONSE] TP: {r_tp.json().get('msg')} | SL: {r_sl.json().get('msg')}")
     print(f"[ORDERS GESETZT] TP @ {tp_price:.5f} | SL @ {sl_price:.5f} direkt bei BingX.")
 
+
+# ---------------- ORDER CANCELLATION ----------------
+
+def cancel_all_orders(symbol):
+    ts = str(int(time.time() * 1000))
+    params = {"symbol": symbol, "timestamp": ts}
+    params["signature"] = sign_bingx(params)
+    requests.post(
+        f"{BINGX_BASE}/openApi/swap/v2/trade/cancelAllOrders",
+        data=params,
+        headers={"X-BX-APIKEY": API_KEY}
+    )
+    print(f"[ORDERS GELÖSCHT] Alle offenen Orders für {symbol} storniert.")
 
 # ---------------- SHORT ORDER ----------------
 
 def execute_trade_bingx(symbol):
 
     # --- RSI CHECK ---
-    # ... (RSI Logik bleibt gleich) ...
     ohlcv = get_ohlcv(symbol, RSI_TIMEFRAME, 100)
     if not ohlcv:
         return
@@ -162,10 +190,6 @@ def execute_trade_bingx(symbol):
     trade_size_usdt = 10
     leverage = 10
 
-    tp_percent = 0.9  
-    sl_percent = 0.8  
-    be_percent = 0.4  
-
     qty = round(trade_size_usdt / price, 6)
 
     # --- Entry Order Senden ---
@@ -179,33 +203,24 @@ def execute_trade_bingx(symbol):
         "type": "MARKET"
     }
     params["signature"] = sign_bingx(params)
+    requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=params, headers={"X-BX-APIKEY": API_KEY})
 
-    requests.post(
-        f"{BINGX_BASE}/openApi/swap/v2/trade/order",
-        data=params,
-        headers={"X-BX-APIKEY": API_KEY},
-        timeout=10
-    )
-
-    # --- TP/SL Preise berechnen (SHORT!) ---
+    # --- TP/SL Berechnung ---
     entry = price
-    tp = entry * (1 - tp_percent / 100)
-    sl = entry * (1 + sl_percent / 100)
-    be_trigger_price = entry * (1 - be_percent / 100) 
+    tp = entry * (1 - TP_PERCENT / 100)
+    sl = entry * (1 + SL_PERCENT / 100)
+    be_trigger_price = entry * (1 - BE_PERCENT / 100) 
 
     # --- TP/SL an BingX senden (Präzise Ausführung) ---
-    set_tp_sl(symbol, tp, sl, position_side="SHORT")
+    set_tp_sl(symbol, qty, tp, sl, position_side="SHORT")
 
     # --- BE Monitoring lokal starten ---
-    threading.Thread(target=monitor_position_be, args=(symbol, entry, be_trigger_price)).start()
+    threading.Thread(target=monitor_position_be, args=(symbol, qty, entry, tp, be_trigger_price)).start()
 
 
 # ---------------- BREAK-EVEN MONITOR (Lokal) ----------------
 
-# Dieser Monitor wartet nur darauf, dass der BE getriggert wird
-# und ersetzt dann den SL bei BingX.
-
-def monitor_position_be(symbol, entry, be_trigger_price):
+def monitor_position_be(symbol, qty, entry, tp_price, be_trigger_price):
     
     # BE-Level: Entry minus 0.05% (um Trading-Gebühren zu decken)
     be_level = entry * (1 - 0.05 / 100) 
@@ -216,43 +231,31 @@ def monitor_position_be(symbol, entry, be_trigger_price):
         while True:
             curr = get_price_bingx(symbol)
             if curr is None:
-                time.sleep(2) # Weniger Polling
+                time.sleep(2) 
                 continue
 
             # Break-Even Logik (bei Short: Kurs <= Trigger)
             if curr <= be_trigger_price:
-                # Hier müssen wir den SL bei BingX löschen und den neuen setzen
                 cancel_all_orders(symbol)
-                # Neuen SL setzen (BE Preis). TP bleibt aktiv.
-                set_tp_sl(symbol, tp_price=entry * (1 - tp_percent / 100), sl_price=be_level, position_side="SHORT")
-                print(f"[BE-AKTIVIERT] {symbol}: SL auf Entry (incl. Fees) verschoben: {be_level:.5f}")
-                break # Monitor kann beendet werden, BingX verwaltet nun TP/SL/BE
-
-            time.sleep(2) # Weniger Polling
+                time.sleep(1) # Kurze Pause für API Sync
+                # Neuen SL auf Break-Even setzen, TP bleibt gleich
+                set_tp_sl(symbol, qty, tp_price, be_level, position_side="SHORT")
+                print(f"[BE-AKTIVIERT] {symbol}: SL auf Entry (incl. Fees) verschoben.")
+                break 
+            
+            # Sicherheitscheck: Falls Position manuell geschlossen wurde
+            if not is_pos_open_bingx(symbol):
+                break
+                
+            time.sleep(2)
 
     finally:
-        # Hier wird active_monitors nicht mehr benötigt
         print(f"[BE-MONITOR ENDE] {symbol}")
-
-# ---------------- ORDER CANCELLATION (NEU) ----------------
-
-def cancel_all_orders(symbol):
-    ts = str(int(time.time() * 1000))
-    params = {"symbol": symbol, "timestamp": ts}
-    params["signature"] = sign_bingx(params)
-    requests.post(
-        f"{BINGX_BASE}/openApi/swap/v2/trade/cancelAllOrders",
-        data=params,
-        headers={"X-BX-APIKEY": API_KEY}
-    )
-    print(f"[ORDERS GELÖSCHT] Alle offenen Orders für {symbol} storniert.")
-
 
 # ---------------- WEBHOOK ----------------
 
 @app.route("/testorder", methods=["GET", "POST"])
 def handle_alert():
-    # ... (Webhook Logik bleibt gleich, active_monitors Check entfernt) ...
 
     if request.method == "GET":
         return jsonify({"status": "ok"}), 200
@@ -270,7 +273,6 @@ def handle_alert():
     symbol = f"{currency}-USDT"
     print(f"[SIGNAL] {symbol}")
 
-    # Prüfen, ob Position bereits offen ist (active_monitors wird nicht mehr benötigt)
     if is_pos_open_bingx(symbol):
         return jsonify({"status": "already_active"}), 200
 
@@ -283,8 +285,7 @@ def handle_alert():
 def keep_alive():
     while True:
         try:
-            # Polling Intervall erhöht, um Server zu entlasten
-            requests.get("https://flask-webhook-bot-1.onrender.com/testorder")
+            requests.get("flask-webhook-bot-1.onrender.com")
         except:
             pass
         time.sleep(300)
