@@ -19,7 +19,7 @@ app = Flask(__name__)
 active_monitors = {}
 
 # --- RSI TIMEFRAME (wählbar: "1m", "5m", "15m") ---
-RSI_TIMEFRAME = "5m"
+RSI_TIMEFRAME = "1m"
 
 # ---------------- SIGNING ----------------
 
