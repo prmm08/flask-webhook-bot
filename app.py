@@ -1,4 +1,4 @@
-# -------- V 3.2: BINGX FUTURES - KORRIGIERTE SIGNATUR & TIMING --------
+# -------- V 3.2: BINGX FUTURES - KORRIGIERTE SIGNATUR & TIMING Google Working->16.12.25 20.39--------
 
 import time
 import hmac
@@ -127,8 +127,8 @@ def execute_trade_bingx(symbol):
     if not ohlcv: return
     rsi = calc_rsi([float(c["close"]) for c in ohlcv])
     
-    if rsi < 70:
-        print(f"[RSI BLOCK] {symbol} RSI={rsi:.1f} < 70")
+    if rsi < 80:
+        print(f"[RSI BLOCK] {symbol} RSI={rsi:.1f} < 80")
         return
 
     price = get_price_bingx(symbol)
@@ -182,16 +182,28 @@ def monitor_be(symbol, qty, entry, tp, trigger):
     while is_pos_open_bingx(symbol):
         curr = get_price_bingx(symbol)
         if curr and curr <= trigger:
+            # 1. Zuerst ALLE alten Orders (TP und SL) bei BingX löschen
             ts = str(int(time.time() * 1000))
             c_params = {"symbol": symbol, "timestamp": ts}
-            c_params["signature"] = sign_bingx(c_params)
-            requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/cancelAllOrders", data=c_params, headers={"X-BX-APIKEY": API_KEY})
+            query_string = urllib.parse.urlencode(sorted(c_params.items()))
+            signature = hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+            cancel_url = f"{BINGX_BASE}/openApi/swap/v2/trade/cancelAllOrders?{query_string}&signature={signature}"
             
-            time.sleep(1)
+            requests.post(cancel_url, headers={"X-BX-APIKEY": API_KEY})
+            
+            # 2. Kurze Pause, damit die API die Stornierung verarbeitet
+            time.sleep(1.0)
+            
+            # 3. Neuen SL auf Entry und den ursprünglichen TP wieder setzen
+            # Entry * 0.9995 sorgt für einen minimalen Profit (Gebührendeckung)
             set_tp_sl(symbol, qty, tp, entry * 0.9995)
-            print(f"[BE] SL auf Entry für {symbol} verschoben.")
+            
+            print(f"[BE SUCCESS] SL für {symbol} auf Entry verschoben. Monitor beendet.")
             break
+        
+        # Sicherheits-Exit falls Position manuell geschlossen wurde
         time.sleep(3)
+
 
 # ---------------- WEBHOOK & START (Rest bleibt gleich) ----------------
 
