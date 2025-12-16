@@ -1,4 +1,4 @@
-# -------- V 2.8: BINGX FUTURES ONLY - SHORT ONLY + RSI FILTER + CLEAN LOGS + VERIFIED WEBHOOK --------
+# -------- V 3.0: BINGX FUTURES ONLY - SHORT ONLY + ADX FILTER --------
 
 import time
 import hmac
@@ -8,14 +8,14 @@ import os
 import urllib.parse
 import threading
 from flask import Flask, request, jsonify
+import logging
 
 # --- API Konfiguration BingX ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
-# --- Flask ohne Access Logs starten ---
-import logging
+# --- Flask Access Logs deaktivieren ---
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
@@ -23,8 +23,8 @@ app = Flask(__name__)
 
 active_monitors = {}
 
-# --- RSI TIMEFRAME (wählbar: "1m", "5m", "15m") ---
-RSI_TIMEFRAME = "1m"
+# --- ADX Timeframe ---
+ADX_TIMEFRAME = "5m"
 
 # ---------------- SIGNING ----------------
 
@@ -42,7 +42,7 @@ def get_price_bingx(symbol):
     except:
         return None
 
-# ---------------- OHLCV + RSI ----------------
+# ---------------- OHLCV ----------------
 
 def get_ohlcv(symbol, interval="1m", limit=100):
     try:
@@ -53,25 +53,42 @@ def get_ohlcv(symbol, interval="1m", limit=100):
     except:
         return []
 
-def calc_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50
+# ---------------- ADX ----------------
 
-    gains = []
-    losses = []
+def calc_adx(ohlcv, period=14):
+    if len(ohlcv) < period + 2:
+        return 20, 0, 0  # fallback
 
-    for i in range(1, period + 1):
-        diff = closes[-i] - closes[-i - 1]
-        if diff > 0:
-            gains.append(diff)
-        else:
-            losses.append(abs(diff))
+    highs = [float(c["high"]) for c in ohlcv]
+    lows = [float(c["low"]) for c in ohlcv]
+    closes = [float(c["close"]) for c in ohlcv]
 
-    avg_gain = sum(gains) / period if gains else 0.00001
-    avg_loss = sum(losses) / period if losses else 0.00001
+    tr_list, plus_dm_list, minus_dm_list = [], [], []
 
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    for i in range(1, len(ohlcv)):
+        high, low = highs[i], lows[i]
+        prev_close = closes[i - 1]
+
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        tr_list.append(tr)
+
+        up_move = highs[i] - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
+
+        plus_dm_list.append(up_move if up_move > down_move and up_move > 0 else 0)
+        minus_dm_list.append(down_move if down_move > up_move and down_move > 0 else 0)
+
+    tr14 = sum(tr_list[-period:])
+    plus_dm14 = sum(plus_dm_list[-period:])
+    minus_dm14 = sum(minus_dm_list[-period:])
+
+    plus_di = 100 * (plus_dm14 / tr14) if tr14 != 0 else 0
+    minus_di = 100 * (minus_dm14 / tr14) if tr14 != 0 else 0
+
+    dx = abs(plus_di - minus_di) / (plus_di + minus_di + 0.00001) * 100
+    adx = dx  # simplified ADX
+
+    return adx, plus_di, minus_di
 
 # ---------------- POSITION CHECK ----------------
 
@@ -106,27 +123,26 @@ def close_bingx(symbol):
 
 def execute_trade_bingx(symbol):
 
-    # --- RSI CHECK ---
-    ohlcv = get_ohlcv(symbol, RSI_TIMEFRAME, 100)
-    if not ohlcv:
+    # --- ADX ---
+    ohlcv_adx = get_ohlcv(symbol, ADX_TIMEFRAME, 100)
+    if not ohlcv_adx:
         return
 
-    closes = [float(c["close"]) for c in ohlcv]
-    rsi = calc_rsi(closes)
+    adx, plus_di, minus_di = calc_adx(ohlcv_adx)
 
-    if rsi < 80:
-        print(f"[RSI BLOCK] {symbol} RSI={rsi:.1f} ({RSI_TIMEFRAME}) < 80 → Kein SHORT")
+    if not (adx > 25 and minus_di > plus_di):
+        print(f"[ADX BLOCK] {symbol} ADX={adx:.1f} +DI={plus_di:.1f} -DI={minus_di:.1f}")
         return
 
-    # --- Preis laden ---
+    # --- Preis ---
     price = get_price_bingx(symbol)
     if price is None:
         return
 
-    print(f"[ORDER] SHORT {symbol} | Entry={price} | RSI={rsi:.1f} ({RSI_TIMEFRAME})")
+    print(f"[ORDER] SHORT {symbol} | Entry={price} | ADX={adx:.1f}")
 
-    trade_size_usdt = 20
-    leverage = 20
+    trade_size_usdt = 10
+    leverage = 10
 
     tp_percent = 1
     sl_percent = 1
