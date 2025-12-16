@@ -1,4 +1,4 @@
-# -------- V 2.8: BINGX FUTURES ONLY - SHORT ONLY + RSI FILTER + CLEAN LOGS + VERIFIED WEBHOOK --------
+# -------- V 2.9: BINGX FUTURES ONLY - SHORT ONLY + RSI FILTER + BE IN PERCENT --------
 
 import time
 import hmac
@@ -125,11 +125,13 @@ def execute_trade_bingx(symbol):
 
     print(f"[ORDER] SHORT {symbol} | Entry={price} | RSI={rsi:.1f} ({RSI_TIMEFRAME})")
 
+    # --- Einstellungen ---
     trade_size_usdt = 10
     leverage = 10
 
-    tp_percent = 1
-    sl_percent = 1
+    tp_percent = 1.0  # Ziel: 1% Gewinn
+    sl_percent = 0.8  # Stop-Loss: 1% Verlust
+    be_percent = 0.4  # BE-Aktivierung: Wenn Kurs 0.5% im Profit ist
 
     qty = round(trade_size_usdt / price, 6)
 
@@ -151,21 +153,27 @@ def execute_trade_bingx(symbol):
         timeout=10
     )
 
+    # Berechnungen für Monitor (SHORT!)
     entry = price
     tp = entry * (1 - tp_percent / 100)
     sl = entry * (1 + sl_percent / 100)
+    
+    # Der Preis, bei dem der Stop auf Break-Even gezogen wird (Kurs muss fallen)
+    be_trigger_price = entry * (1 - be_percent / 100) 
 
-    threading.Thread(target=monitor_position, args=(symbol, entry, tp, sl)).start()
+    threading.Thread(target=monitor_position, args=(symbol, entry, tp, sl, be_trigger_price)).start()
 
 # ---------------- MONITOR ----------------
 
-def monitor_position(symbol, entry, tp, sl):
+def monitor_position(symbol, entry, tp, sl, be_trigger_price):
     key = f"BINGX_{symbol}"
     active_monitors[key] = True
 
-    print(f"[MONITOR] {symbol} SHORT | Entry={entry} TP={tp} SL={sl}")
+    # BE-Level: Entry minus 0.05% (um Trading-Gebühren zu decken)
+    be_level = entry * (1 - 0.05 / 100) 
+    
+    print(f"[MONITOR] {symbol} SHORT | Entry={entry} | TP={tp:.5f} | SL={sl:.5f} | BE-Trigger={be_trigger_price:.5f}")
 
-    be_trigger = entry * 1.02
     be_set = False
 
     try:
@@ -175,14 +183,16 @@ def monitor_position(symbol, entry, tp, sl):
                 time.sleep(1)
                 continue
 
-            if not be_set and curr >= be_trigger:
-                sl = entry
+            # Break-Even Logik (bei Short: Kurs <= Trigger)
+            if not be_set and curr <= be_trigger_price:
+                sl = be_level
                 be_set = True
-                print(f"[BE] {symbol} aktiviert")
+                print(f"[BE-AKTIVIERT] {symbol}: SL auf Entry (incl. Fees) verschoben: {sl:.5f}")
 
+            # Exit Bedingungen
             if curr <= tp or curr >= sl:
-                reason = "TP" if curr <= tp else "SL/BE"
-                print(f"[EXIT] {symbol} → {reason}")
+                reason = "TP" if curr <= tp else ("BE" if be_set else "SL")
+                print(f"[EXIT] {symbol} @ {curr} → Grund: {reason}")
                 close_bingx(symbol)
                 break
 
@@ -190,7 +200,7 @@ def monitor_position(symbol, entry, tp, sl):
 
     finally:
         active_monitors[key] = False
-        print(f"[MONITOR END] {symbol}")
+        print(f"[MONITOR ENDE] {symbol}")
 
 # ---------------- WEBHOOK ----------------
 
