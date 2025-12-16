@@ -1,4 +1,4 @@
-# -------- V 3.2: BINGX FUTURES - KORRIGIERTE SIGNATUR & TIMING Google Working->16.12.25 20.39--------
+# -------- V 3.3: BINGX FUTURES - ROBUSTERE BE IMPLEMENTIERUNG --------
 
 import time
 import hmac
@@ -24,7 +24,7 @@ app = Flask(__name__)
 RSI_TIMEFRAME = "1m"
 TP_PERCENT, SL_PERCENT, BE_PERCENT = 0.9, 0.8, 0.4
 
-# ---------------- SIGNING (FIXED) ----------------
+# ---------------- SIGNING ----------------
 
 def sign_bingx(params):
     query_string = urllib.parse.urlencode(sorted(params.items()))
@@ -77,57 +77,42 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
     sl_p = "{:.6f}".format(sl_price)
     
     def place_order(price, order_type):
-        # Bis zu 5 Versuche, falls die Position noch nicht "bereit" ist
         for attempt in range(5):
             ts = str(int(time.time() * 1000))
             params = {
-                "symbol": symbol,
-                "side": "BUY",
-                "positionSide": "SHORT",
-                "type": order_type,
-                "quantity": str(qty),
-                "stopPrice": price,
-                "workingType": "MARK_PRICE",
-                "closePosition": "true",
-                "timestamp": ts
+                "symbol": symbol, "side": "BUY", "positionSide": "SHORT", "type": order_type,
+                "quantity": str(qty), "stopPrice": price, "workingType": "MARK_PRICE",
+                "closePosition": "true", "timestamp": ts
             }
-            
             query_string = urllib.parse.urlencode(sorted(params.items()))
             signature = hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
             full_url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{query_string}&signature={signature}"
             
-            headers = {"X-BX-APIKEY": API_KEY}
-            response = requests.post(full_url, headers=headers).json()
-            
-            msg = response.get("msg", "")
-            code = response.get("code", -1)
+            response = requests.post(full_url, headers={"X-BX-APIKEY": API_KEY}).json()
+            code, msg = response.get("code", -1), response.get("msg", "")
 
-            if code == 0: # Erfolg
-                return response
+            if code == 0: return response
             elif "position not exist" in msg.lower():
-                print(f"[RETRY] Warte auf Position für {symbol} (Versuch {attempt+1}/5)...")
+                print(f"[RETRY] Warte auf Position {symbol} (Versuch {attempt+1}/5)...")
                 time.sleep(1.5)
             else:
-                return response # Anderer Fehler
-        return {"msg": "Max retries reached"}
+                return response
+        return {"msg": "Max retries reached or failed"}
 
-    # TP und SL nacheinander senden
     r_tp = place_order(tp_p, "TAKE_PROFIT_MARKET")
     r_sl = place_order(sl_p, "STOP_MARKET") 
 
     print(f"[API RESULT] {symbol} -> TP: {r_tp.get('msg')} | SL: {r_sl.get('msg')}")
 
-
-# ---------------- MAIN LOGIC (KORRIGIERT FÜR ENTRY SIGNATUR) ----------------
+# ---------------- MAIN LOGIC ----------------
 
 def execute_trade_bingx(symbol):
-    # ... (RSI Check und Preis laden bleibt gleich) ...
     ohlcv = get_ohlcv(symbol, RSI_TIMEFRAME)
     if not ohlcv: return
     rsi = calc_rsi([float(c["close"]) for c in ohlcv])
     
-    if rsi < 70:
-        print(f"[RSI BLOCK] {symbol} RSI={rsi:.1f} < 70")
+    if rsi < 80:
+        print(f"[RSI BLOCK] {symbol} RSI={rsi:.1f} < 80")
         return
 
     price = get_price_bingx(symbol)
@@ -138,25 +123,18 @@ def execute_trade_bingx(symbol):
     
     print(f"[ORDER] SHORT {symbol} | Entry={price} | RSI={rsi:.1f} ({RSI_TIMEFRAME})")
 
-    # 1. Entry Order (Market)
+    # 1. Entry Order (Market) - via URL Params
     ts_entry = str(int(time.time() * 1000))
     entry_params = {
-        "symbol": symbol, 
-        "side": "SELL", 
-        "positionSide": "SHORT",
-        "type": "MARKET", 
-        "quantity": str(qty), 
-        "leverage": str(leverage),
+        "symbol": symbol, "side": "SELL", "positionSide": "SHORT",
+        "type": "MARKET", "quantity": str(qty), "leverage": str(leverage),
         "timestamp": ts_entry
     }
-    
-    # Signatur berechnen und in die URL integrieren (WICHTIGER FIX!)
     query_string = urllib.parse.urlencode(sorted(entry_params.items()))
     signature = hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
     full_url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{query_string}&signature={signature}"
 
-    headers = {"X-BX-APIKEY": API_KEY}
-    r_entry = requests.post(full_url, headers=headers).json()
+    r_entry = requests.post(full_url, headers={"X-BX-APIKEY": API_KEY}).json()
     
     if r_entry.get("code") != 0:
         print(f"[ERROR] Entry failed for {symbol}: {r_entry.get('msg')}")
@@ -164,7 +142,7 @@ def execute_trade_bingx(symbol):
 
     print(f"[ENTRY SUCCESS] {symbol} Short @ {price}")
 
-    # 2. TP/SL mit integrierter Wartezeit/Retry setzen
+    # 2. TP/SL setzen
     tp = price * (1 - TP_PERCENT / 100)
     sl = price * (1 + SL_PERCENT / 100)
     be_trigger = price * (1 - BE_PERCENT / 100)
@@ -173,36 +151,42 @@ def execute_trade_bingx(symbol):
     
     threading.Thread(target=monitor_be, args=(symbol, qty, price, tp, be_trigger)).start()
 
-
-
-# ---------------- BE MONITOR ----------------
+# ---------------- BE MONITOR (KORRIGIERT) ----------------
 
 def monitor_be(symbol, qty, entry, tp, trigger):
+    
+    def cancel_tp_sl_orders(s):
+        ts = str(int(time.time() * 1000))
+        params = {"symbol": s, "timestamp": ts}
+        query_string = urllib.parse.urlencode(sorted(params.items()))
+        signature = hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+        full_url = f"{BINGX_BASE}/openApi/swap/v2/trade/cancelAllOrders?{query_string}&signature={signature}"
+        
+        response = requests.post(full_url, headers={"X-BX-APIKEY": API_KEY}).json()
+        print(f"[BE-CANCEL] {s}: {response.get('msg')}")
+
     while is_pos_open_bingx(symbol):
         curr = get_price_bingx(symbol)
         if curr and curr <= trigger:
-            # 1. Zuerst ALLE alten Orders (TP und SL) bei BingX löschen
-            ts = str(int(time.time() * 1000))
-            c_params = {"symbol": symbol, "timestamp": ts}
-            query_string = urllib.parse.urlencode(sorted(c_params.items()))
-            signature = hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
-            cancel_url = f"{BINGX_BASE}/openApi/swap/v2/trade/cancelAllOrders?{query_string}&signature={signature}"
+            print(f"[BE TRIGGERED] {symbol}")
+
+            # 1. Alte Orders stornieren
+            cancel_tp_sl_orders(symbol)
+            time.sleep(1) 
             
-            requests.post(cancel_url, headers={"X-BX-APIKEY": API_KEY})
+            # 2. Neuen SL (BE-Preis) setzen
+            be_level = entry * (1 - 0.05 / 100) # Entry + Fees abgedeckt
             
-            # 2. Kurze Pause, damit die API die Stornierung verarbeitet
-            time.sleep(1.0)
-            
-            # 3. Neuen SL auf Entry und den ursprünglichen TP wieder setzen
-            # Entry * 0.9995 sorgt für einen minimalen Profit (Gebührendeckung)
-            set_tp_sl(symbol, qty, tp, entry * 0.9995)
+            # set_tp_sl wird mit neuem SL aber altem TP aufgerufen
+            set_tp_sl(symbol, qty, tp, be_level)
             
             print(f"[BE SUCCESS] SL für {symbol} auf Entry verschoben. Monitor beendet.")
             break
         
-        # Sicherheits-Exit falls Position manuell geschlossen wurde
+        if not is_pos_open_bingx(symbol):
+            break
+            
         time.sleep(3)
-
 
 # ---------------- WEBHOOK & START (Rest bleibt gleich) ----------------
 
