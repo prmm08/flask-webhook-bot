@@ -117,7 +117,6 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
 
     print(f"[API RESULT] {symbol} -> TP: {r_tp.get('msg')} | SL: {r_sl.get('msg')}")
 
-# ---------------- MAIN LOGIC (KORRIGIERT) ----------------
 
 # ---------------- MAIN LOGIC (KORRIGIERT FÜR ENTRY SIGNATUR) ----------------
 
@@ -127,8 +126,8 @@ def execute_trade_bingx(symbol):
     if not ohlcv: return
     rsi = calc_rsi([float(c["close"]) for c in ohlcv])
     
-    if rsi < 80:
-        print(f"[RSI BLOCK] {symbol} RSI={rsi:.1f} < 80")
+    if rsi < 70:
+        print(f"[RSI BLOCK] {symbol} RSI={rsi:.1f} < 70")
         return
 
     price = get_price_bingx(symbol)
