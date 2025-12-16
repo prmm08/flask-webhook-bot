@@ -1,4 +1,4 @@
-# -------- V 2.9: BINGX FUTURES ONLY - LONG ONLY + RSI FILTER + CLEAN LOGS + VERIFIED WEBHOOK --------
+# -------- V 2.8: BINGX FUTURES ONLY - SHORT ONLY + RSI FILTER + CLEAN LOGS + VERIFIED WEBHOOK --------
 
 import time
 import hmac
@@ -13,6 +13,11 @@ from flask import Flask, request, jsonify
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
+
+# --- Flask ohne Access Logs starten ---
+import logging
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 
 app = Flask(__name__)
 
@@ -97,10 +102,9 @@ def close_bingx(symbol):
         headers={"X-BX-APIKEY": API_KEY}
     )
 
-# ---------------- LONG ORDER ----------------
+# ---------------- SHORT ORDER ----------------
 
 def execute_trade_bingx(symbol):
-    """Platziert einen LONG nur wenn RSI <= 30 ist."""
 
     # --- RSI CHECK ---
     ohlcv = get_ohlcv(symbol, RSI_TIMEFRAME, 100)
@@ -110,8 +114,8 @@ def execute_trade_bingx(symbol):
     closes = [float(c["close"]) for c in ohlcv]
     rsi = calc_rsi(closes)
 
-    if rsi > 30:
-        print(f"[RSI BLOCK] {symbol} RSI={rsi:.1f} ({RSI_TIMEFRAME}) > 30 → Kein LONG")
+    if rsi < 80:
+        print(f"[RSI BLOCK] {symbol} RSI={rsi:.1f} ({RSI_TIMEFRAME}) < 80 → Kein SHORT")
         return
 
     # --- Preis laden ---
@@ -119,10 +123,10 @@ def execute_trade_bingx(symbol):
     if price is None:
         return
 
-    print(f"[ORDER] LONG {symbol} | Entry={price} | RSI={rsi:.1f} ({RSI_TIMEFRAME})")
+    print(f"[ORDER] SHORT {symbol} | Entry={price} | RSI={rsi:.1f} ({RSI_TIMEFRAME})")
 
-    trade_size_usdt = 10
-    leverage = 10
+    trade_size_usdt = 20
+    leverage = 20
 
     tp_percent = 1
     sl_percent = 1
@@ -131,9 +135,9 @@ def execute_trade_bingx(symbol):
 
     params = {
         "leverage": str(leverage),
-        "positionSide": "LONG",
+        "positionSide": "SHORT",
         "quantity": str(qty),
-        "side": "BUY",
+        "side": "SELL",
         "symbol": symbol,
         "timestamp": str(int(time.time() * 1000)),
         "type": "MARKET"
@@ -148,8 +152,8 @@ def execute_trade_bingx(symbol):
     )
 
     entry = price
-    tp = entry * (1 + tp_percent / 100)
-    sl = entry * (1 - sl_percent / 100)
+    tp = entry * (1 - tp_percent / 100)
+    sl = entry * (1 + sl_percent / 100)
 
     threading.Thread(target=monitor_position, args=(symbol, entry, tp, sl)).start()
 
@@ -159,7 +163,7 @@ def monitor_position(symbol, entry, tp, sl):
     key = f"BINGX_{symbol}"
     active_monitors[key] = True
 
-    print(f"[MONITOR] {symbol} LONG | Entry={entry:.4f} | TP={tp:.4f} | SL={sl:.4f}")
+    print(f"[MONITOR] {symbol} SHORT | Entry={entry} TP={tp} SL={sl}")
 
     be_trigger = entry * 1.02
     be_set = False
@@ -174,11 +178,11 @@ def monitor_position(symbol, entry, tp, sl):
             if not be_set and curr >= be_trigger:
                 sl = entry
                 be_set = True
-                print(f"[BE] {symbol} aktiviert! SL auf Entry gesetzt.")
+                print(f"[BE] {symbol} aktiviert")
 
-            if curr >= tp or curr <= sl:
-                reason = "TP" if curr >= tp else "SL/BE"
-                print(f"[EXIT] {symbol} → {reason} bei {curr:.4f}")
+            if curr <= tp or curr >= sl:
+                reason = "TP" if curr <= tp else "SL/BE"
+                print(f"[EXIT] {symbol} → {reason}")
                 close_bingx(symbol)
                 break
 
@@ -188,28 +192,23 @@ def monitor_position(symbol, entry, tp, sl):
         active_monitors[key] = False
         print(f"[MONITOR END] {symbol}")
 
-# ---------------- HEALTH CHECK ----------------
-
-@app.route("/", methods=["GET"])
-def health_check():
-    return jsonify({"status": "ok"}), 200
-
-# ---------------- WEBHOOK (GET + POST) ----------------
+# ---------------- WEBHOOK ----------------
 
 @app.route("/testorder", methods=["GET", "POST"])
 def handle_alert():
 
     if request.method == "GET":
-        return jsonify({"status": "ok", "message": "webhook active"}), 200
+        return jsonify({"status": "ok"}), 200
 
-    if not request.data or request.data == b"":
-        return jsonify({"status": "ok", "message": "post received"}), 200
+    data = request.get_json(silent=True)
 
-    data = request.get_json(silent=True) or {}
+    if not data:
+        return jsonify({"status": "ok"}), 200
+
     currency = str(data.get("currency", "")).upper()
 
     if not currency:
-        return jsonify({"status": "ignored", "message": "no currency"}), 200
+        return jsonify({"status": "ignored"}), 200
 
     symbol = f"{currency}-USDT"
     print(f"[SIGNAL] {symbol}")
@@ -219,14 +218,14 @@ def handle_alert():
 
     threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
 
-    return jsonify({"status": "long_started", "symbol": symbol}), 200
+    return jsonify({"status": "short_started", "symbol": symbol}), 200
 
-# ---------------- ANTI-SLEEP PING ----------------
+# ---------------- ANTI-SLEEP ----------------
 
 def keep_alive():
     while True:
         try:
-            requests.get("https://flask-webhook-bot-1.onrender.com/")
+            requests.get("https://flask-webhook-bot-1.onrender.com/testorder")
         except:
             pass
         time.sleep(60)
