@@ -129,7 +129,7 @@ def execute_trade_bingx(symbol):
     trade_size_usdt = 10
     leverage = 10
 
-    tp_percent = 1.0  # Ziel: 1% Gewinn
+    tp_percent = 0.9  # Ziel: 1% Gewinn
     sl_percent = 0.8  # Stop-Loss: 1% Verlust
     be_percent = 0.4  # BE-Aktivierung: Wenn Kurs 0.5% im Profit ist
 
@@ -238,7 +238,7 @@ def keep_alive():
             requests.get("https://flask-webhook-bot-1.onrender.com/testorder")
         except:
             pass
-        time.sleep(60)
+        time.sleep(300)
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
