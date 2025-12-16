@@ -74,43 +74,47 @@ def is_pos_open_bingx(symbol):
 # ---------------- PRECISE TP/SL SETTING ----------------
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
-    # Preise strikt auf 6 Stellen runden
+    # Preise auf 6 Nachkommastellen runden
     tp_p = "{:.6f}".format(tp_price)
     sl_p = "{:.6f}".format(sl_price)
     
-    # TAKE PROFIT
-    ts_tp = str(int(time.time() * 1000))
-    tp_params = {
-        "symbol": symbol,
-        "side": "BUY", # SHORT Exit
-        "positionSide": "SHORT",
-        "type": "TAKE_PROFIT_MARKET",
-        "quantity": str(qty),
-        "stopPrice": tp_p,
-        "workingType": "MARK_PRICE",
-        "closePosition": "true",
-        "timestamp": ts_tp
-    }
-    tp_params["signature"] = sign_bingx(tp_params)
-    r_tp = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=tp_params, headers={"X-BX-APIKEY": API_KEY})
-    
-    # STOP LOSS
-    ts_sl = str(int(time.time() * 1000))
-    sl_params = {
-        "symbol": symbol,
-        "side": "BUY",
-        "positionSide": "SHORT",
-        "type": "STOP_LOSS_MARKET",
-        "quantity": str(qty),
-        "stopPrice": sl_p,
-        "workingType": "MARK_PRICE",
-        "closePosition": "true",
-        "timestamp": ts_sl
-    }
-    sl_params["signature"] = sign_bingx(sl_params)
-    r_sl = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order", data=sl_params, headers={"X-BX-APIKEY": API_KEY})
+    def place_order(price, order_type):
+        ts = str(int(time.time() * 1000))
+        params = {
+            "symbol": symbol,
+            "side": "BUY",  # Exit für SHORT
+            "positionSide": "SHORT",
+            "type": order_type,
+            "quantity": str(qty),
+            "stopPrice": price,
+            "workingType": "MARK_PRICE",
+            "closePosition": "true",
+            "timestamp": ts
+        }
+        
+        # 1. Parameter sortieren und Query-String erstellen
+        query_string = urllib.parse.urlencode(sorted(params.items()))
+        
+        # 2. Signatur generieren
+        signature = hmac.new(
+            API_SECRET.encode("utf-8"), 
+            query_string.encode("utf-8"), 
+            hashlib.sha256
+        ).hexdigest()
+        
+        # 3. URL mit Parametern UND Signatur bauen
+        full_url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{query_string}&signature={signature}"
+        
+        # 4. Request senden (Daten sind in der URL, daher data={} oder None)
+        headers = {"X-BX-APIKEY": API_KEY}
+        return requests.post(full_url, headers=headers)
+
+    # TP und SL nacheinander senden
+    r_tp = place_order(tp_p, "TAKE_PROFIT_MARKET")
+    r_sl = place_order(sl_p, "STOP_LOSS_MARKET")
 
     print(f"[API] TP: {r_tp.json().get('msg')} | SL: {r_sl.json().get('msg')}")
+
 
 # ---------------- MAIN LOGIC ----------------
 
