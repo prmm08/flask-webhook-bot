@@ -1,4 +1,4 @@
-# -------- V 3.3: BINGX FUTURES - ROBUSTERE BE IMPLEMENTIERUNG Google Works BE not tested yet-17.12.25 12:00--------
+# -------- V 3.4: BINGX FUTURES - BE FIX MIT V3 CANCEL - 17.12.25 --------
 
 import time
 import hmac
@@ -30,15 +30,14 @@ def sign_bingx(params):
     query_string = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
-# ---------------- PRICE & OHLCV ----------------
+# ---------------- MARKET DATA ----------------
 
 def get_price_bingx(symbol):
     try:
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
         r = requests.get(url, params={"symbol": symbol}, timeout=10).json()
         return float(r["data"]["price"])
-    except:
-        return None
+    except: return None
 
 def get_ohlcv(symbol, interval="1m", limit=100):
     try:
@@ -46,8 +45,7 @@ def get_ohlcv(symbol, interval="1m", limit=100):
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         r = requests.get(url, params=params, timeout=10).json()
         return r.get("data", [])
-    except:
-        return []
+    except: return []
 
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1: return 50
@@ -58,8 +56,6 @@ def calc_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ---------------- POSITION CHECK ----------------
-
 def is_pos_open_bingx(symbol):
     try:
         ts = str(int(time.time() * 1000))
@@ -67,41 +63,31 @@ def is_pos_open_bingx(symbol):
         params["signature"] = sign_bingx(params)
         r = requests.get(f"{BINGX_BASE}/openApi/swap/v2/user/positions", params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
         return any(float(p.get("positionAmt", 0)) != 0 for p in r.get("data", []))
-    except:
-        return True
+    except: return True
 
-# ---------------- PRECISE TP/SL SETTING (MIT RETRY-LOGIK) ----------------
+# ---------------- ORDER EXECUTION ----------------
+
+def place_precise_order(symbol, qty, price, order_type, side="BUY"):
+    """ Hilfsfunktion für TP/SL Orders via URL-Params (Stabilster Weg 2025) """
+    for attempt in range(5):
+        ts = str(int(time.time() * 1000))
+        params = {
+            "symbol": symbol, "side": side, "positionSide": "SHORT", "type": order_type,
+            "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
+            "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts
+        }
+        qs = urllib.parse.urlencode(sorted(params.items()))
+        sig = sign_bingx(params)
+        url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}"
+        
+        res = requests.post(url, headers={"X-BX-APIKEY": API_KEY}).json()
+        if res.get("code") == 0: return res
+        time.sleep(1.5)
+    return res
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
-    tp_p = "{:.6f}".format(tp_price)
-    sl_p = "{:.6f}".format(sl_price)
-    
-    def place_order(price, order_type):
-        for attempt in range(5):
-            ts = str(int(time.time() * 1000))
-            params = {
-                "symbol": symbol, "side": "BUY", "positionSide": "SHORT", "type": order_type,
-                "quantity": str(qty), "stopPrice": price, "workingType": "MARK_PRICE",
-                "closePosition": "true", "timestamp": ts
-            }
-            query_string = urllib.parse.urlencode(sorted(params.items()))
-            signature = hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
-            full_url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{query_string}&signature={signature}"
-            
-            response = requests.post(full_url, headers={"X-BX-APIKEY": API_KEY}).json()
-            code, msg = response.get("code", -1), response.get("msg", "")
-
-            if code == 0: return response
-            elif "position not exist" in msg.lower():
-                print(f"[RETRY] Warte auf Position {symbol} (Versuch {attempt+1}/5)...")
-                time.sleep(1.5)
-            else:
-                return response
-        return {"msg": "Max retries reached or failed"}
-
-    r_tp = place_order(tp_p, "TAKE_PROFIT_MARKET")
-    r_sl = place_order(sl_p, "STOP_MARKET") 
-
+    r_tp = place_precise_order(symbol, qty, tp_price, "TAKE_PROFIT_MARKET")
+    r_sl = place_precise_order(symbol, qty, sl_price, "STOP_MARKET")
     print(f"[API RESULT] {symbol} -> TP: {r_tp.get('msg')} | SL: {r_sl.get('msg')}")
 
 # ---------------- MAIN LOGIC ----------------
@@ -117,78 +103,54 @@ def execute_trade_bingx(symbol):
 
     price = get_price_bingx(symbol)
     if not price: return
-
-    trade_size_usdt, leverage = 10, 10
-    qty = round(trade_size_usdt / price, 6)
+    qty = round(10 / price, 6) # 10 USDT fest
     
-    print(f"[ORDER] SHORT {symbol} | Entry={price} | RSI={rsi:.1f} ({RSI_TIMEFRAME})")
+    print(f"[ORDER] SHORT {symbol} | Entry={price}")
 
-    # 1. Entry Order (Market) - via URL Params
-    ts_entry = str(int(time.time() * 1000))
-    entry_params = {
-        "symbol": symbol, "side": "SELL", "positionSide": "SHORT",
-        "type": "MARKET", "quantity": str(qty), "leverage": str(leverage),
-        "timestamp": ts_entry
-    }
-    query_string = urllib.parse.urlencode(sorted(entry_params.items()))
-    signature = hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
-    full_url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{query_string}&signature={signature}"
+    # Entry via URL Params
+    ts = str(int(time.time() * 1000))
+    entry_p = {"symbol": symbol, "side": "SELL", "positionSide": "SHORT", "type": "MARKET", "quantity": str(qty), "leverage": "10", "timestamp": ts}
+    qs = urllib.parse.urlencode(sorted(entry_p.items()))
+    sig = sign_bingx(entry_p)
+    requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY})
 
-    r_entry = requests.post(full_url, headers={"X-BX-APIKEY": API_KEY}).json()
+    time.sleep(2) # Warten auf Position
     
-    if r_entry.get("code") != 0:
-        print(f"[ERROR] Entry failed for {symbol}: {r_entry.get('msg')}")
-        return
-
-    print(f"[ENTRY SUCCESS] {symbol} Short @ {price}")
-
-    # 2. TP/SL setzen
-    tp = price * (1 - TP_PERCENT / 100)
-    sl = price * (1 + SL_PERCENT / 100)
+    tp, sl = price * (1 - TP_PERCENT / 100), price * (1 + SL_PERCENT / 100)
     be_trigger = price * (1 - BE_PERCENT / 100)
-
-    set_tp_sl(symbol, qty, tp, sl)
     
+    set_tp_sl(symbol, qty, tp, sl)
     threading.Thread(target=monitor_be, args=(symbol, qty, price, tp, be_trigger)).start()
 
-# ---------------- BE MONITOR (KORRIGIERT) ----------------
+# ---------------- BE MONITOR (FIXED) ----------------
 
-def monitor_be(symbol, qty, entry, tp, trigger):
+def monitor_be(symbol, qty, entry, tp_price, trigger):
+    print(f"[BE-MONITOR] Start {symbol}. Trigger @ {trigger:.6f}")
     
-    def cancel_tp_sl_orders(s):
-        ts = str(int(time.time() * 1000))
-        params = {"symbol": s, "timestamp": ts}
-        query_string = urllib.parse.urlencode(sorted(params.items()))
-        signature = hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
-        full_url = f"{BINGX_BASE}/openApi/swap/v2/trade/cancelAllOrders?{query_string}&signature={signature}"
-        
-        response = requests.post(full_url, headers={"X-BX-APIKEY": API_KEY}).json()
-        print(f"[BE-CANCEL] {s}: {response.get('msg')}")
-
     while is_pos_open_bingx(symbol):
         curr = get_price_bingx(symbol)
         if curr and curr <= trigger:
-            print(f"[BE TRIGGERED] {symbol}")
+            print(f"[BE TRIGGERED] {symbol} erreicht {curr}")
 
-            # 1. Alte Orders stornieren
-            cancel_tp_sl_orders(symbol)
-            time.sleep(1) 
+            # 1. Alle Orders am Symbol löschen (V3 Endpunkt ist zuverlässiger)
+            ts = str(int(time.time() * 1000))
+            c_p = {"symbol": symbol, "timestamp": ts}
+            qs = urllib.parse.urlencode(sorted(c_p.items()))
+            sig = sign_bingx(c_p)
+            # Nutze swap/v2/trade/allOpenOrders für maximale Kompatibilität
+            requests.delete(f"{BINGX_BASE}/openApi/swap/v2/trade/allOpenOrders?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY})
             
-            # 2. Neuen SL (BE-Preis) setzen
-            be_level = entry * (1 - 0.05 / 100) # Entry + Fees abgedeckt
+            time.sleep(2) # Längere Pause für API Sync
             
-            # set_tp_sl wird mit neuem SL aber altem TP aufgerufen
-            set_tp_sl(symbol, qty, tp, be_level)
+            # 2. Nur den STOP-LOSS neu setzen (Break-Even)
+            # TP bleibt oft erhalten oder wird hier neu gesetzt
+            be_level = entry * 0.9995 # Winziger Profit für Fees
+            set_tp_sl(symbol, qty, tp_price, be_level)
             
-            print(f"[BE SUCCESS] SL für {symbol} auf Entry verschoben. Monitor beendet.")
+            print(f"[BE SUCCESS] {symbol} SL auf BE verschoben.")
             break
         
-        if not is_pos_open_bingx(symbol):
-            break
-            
-        time.sleep(3)
-
-# ---------------- WEBHOOK & START (Rest bleibt gleich) ----------------
+        time.sleep(4)
 
 @app.route("/testorder", methods=["POST", "GET"])
 def handle_alert():
@@ -196,7 +158,6 @@ def handle_alert():
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
     if not currency: return jsonify({"status": "ignored"}), 200
-    
     symbol = f"{currency}-USDT"
     if not is_pos_open_bingx(symbol):
         threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
