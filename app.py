@@ -22,7 +22,7 @@ app = Flask(__name__)
 
 # Globale Settings
 RSI_TIMEFRAME = "1m"
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 1, 1.50, 0.5
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.0, 1.50, 0.5
 
 # ---------------- SIGNING (FIXED) ----------------
 
@@ -133,7 +133,7 @@ def execute_trade_bingx(symbol):
     price = get_price_bingx(symbol)
     if not price: return
 
-    trade_size_usdt, leverage = 10, 10
+    trade_size_usdt, leverage = 70, 20
     qty = round(trade_size_usdt / price, 6)
     
     print(f"[ORDER] SHORT {symbol} | Entry={price} | RSI={rsi:.1f} ({RSI_TIMEFRAME})")
