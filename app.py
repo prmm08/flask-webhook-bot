@@ -1,4 +1,4 @@
-# -------- V 4.1: BINGX LONG & SHORT + ADX & RSI FILTER --------
+# -------- V 4.2: BINGX LONG & SHORT + ADX & RSI FILTER (FIXED) --------
 
 import time
 import hmac
@@ -15,8 +15,10 @@ API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
+# Flask Logs reduzieren
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
+
 app = Flask(__name__)
 
 # Globale Settings
@@ -106,7 +108,7 @@ def set_tp_sl(symbol, qty, tp_price, sl_price, side):
                 "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts
             }
             qs = urllib.parse.urlencode(sorted(params.items()))
-            sig = hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+            sig = sign_bingx(params)
             url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}"
             res = requests.post(url, headers={"X-BX-APIKEY": API_KEY}).json()
             if res.get("code") == 0: return res
@@ -117,19 +119,16 @@ def set_tp_sl(symbol, qty, tp_price, sl_price, side):
     place_order(sl_price, "STOP_MARKET")
 
 def execute_trade(symbol):
-    # --- ADX Check ---
     ohlcv_adx = get_ohlcv(symbol, ADX_TIMEFRAME)
     adx, p_di, m_di = calc_adx(ohlcv_adx)
     
     if adx < 25:
-        print(f"[ADX BLOCK] {symbol} ADX={adx:.1f} (Trend zu schwach)")
+        print(f"[ADX BLOCK] {symbol} ADX={adx:.1f} < 25")
         return
 
-    # --- RSI Check ---
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME)
     rsi = calc_rsi([float(c["close"]) for c in ohlcv_rsi])
 
-    # --- Entscheidung Long oder Short ---
     side = None
     if rsi < 30 and p_di > m_di:
         side = "LONG"
@@ -137,7 +136,7 @@ def execute_trade(symbol):
         side = "SHORT"
     
     if not side:
-        print(f"[FILTER BLOCK] {symbol} RSI/ADX Kriterien nicht erfüllt. RSI={rsi:.1f} ADX={adx:.1f}")
+        print(f"[FILTER BLOCK] {symbol} RSI={rsi:.1f} ADX={adx:.1f}")
         return
 
     order_side = "BUY" if side == "LONG" else "SELL"
@@ -149,17 +148,17 @@ def execute_trade(symbol):
     
     print(f"[SIGNAL] {side} {symbol} | RSI={rsi:.1f} | ADX={adx:.1f}")
 
-    # Entry Order
     ts = str(int(time.time() * 1000))
     params = {
         "symbol": symbol, "side": order_side, "positionSide": side,
         "type": "MARKET", "quantity": str(qty), "leverage": str(leverage), "timestamp": ts
     }
     qs = urllib.parse.urlencode(sorted(params.items()))
-    sig = hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    sig = sign_bingx(params)
     requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY})
 
-    # TP/SL Berechnung (Dynamisch für Long/Short)
+    time.sleep(2) # Warte auf Position-Eröffnung
+    
     tp = price * (1 + TP_PERCENT/100) if side == "LONG" else price * (1 - TP_PERCENT/100)
     sl = price * (1 - SL_PERCENT/100) if side == "LONG" else price * (1 + SL_PERCENT/100)
     be_trig = price * (1 + BE_PERCENT/100) if side == "LONG" else price * (1 - BE_PERCENT/100)
@@ -173,27 +172,28 @@ def monitor_be(symbol, qty, entry, tp, trigger, side):
     def cancel_tp_sl_orders(s):
         ts = str(int(time.time() * 1000))
         p = {"symbol": s, "timestamp": ts}
-        qs = urllib.parse.urllen code(sorted(p.items()))
-        sig = hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+        qs = urllib.parse.urlencode(sorted(p.items()))
+        sig = sign_bingx(p)
         requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/cancelAllOrders?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY})
         
     while True:
         curr = get_price_bingx(symbol)
-        if not curr: time.sleep(3); continue
+        if not curr: 
+            time.sleep(3)
+            continue
         
         is_triggered = (side == "LONG" and curr >= trigger) or (side == "SHORT" and curr <= trigger)
         
         if is_triggered:
             cancel_tp_sl_orders(symbol)
-            time.sleep(1)
-            # Neuer SL (Entry + Fees)
+            time.sleep(1.5)
             be_level = entry * 1.0005 if side == "LONG" else entry * 0.9995
             set_tp_sl(symbol, qty, tp, be_level, side)
-            print(f"[BE SUCCESS] {symbol} {side} SL auf Entry verschoben.")
+            print(f"[BE SUCCESS] {symbol} {side} SL auf BE verschoben.")
             break
         
         if not get_active_position(symbol): break
-        time.sleep(3)
+        time.sleep(5)
 
 # ---------------- WEBHOOK ----------------
 
@@ -211,5 +211,4 @@ def handle_alert():
     return jsonify({"status": "position_exists"}), 200
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
