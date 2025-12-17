@@ -22,7 +22,7 @@ app = Flask(__name__)
 
 # Globale Settings
 RSI_TIMEFRAME = "1m"
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 0.25, 0.5, 0.4
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 0.1, 0.25, 0.4
 
 # ---------------- SIGNING (FIXED) ----------------
 
