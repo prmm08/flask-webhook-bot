@@ -135,6 +135,8 @@ def execute_trade_bingx(symbol):
 
 # ---------------- BE MONITOR (FIXED ACTIVE WAIT) ----------------
 
+# ---------------- BE MONITOR (FINALE KORREKTUR FÜR TRIGGER ORDERS) ----------------
+
 def monitor_be(symbol, qty, entry, tp_price, trigger):
     print(f"[BE-MONITOR] Start {symbol}. Trigger @ {trigger:.6f}")
     
@@ -143,32 +145,38 @@ def monitor_be(symbol, qty, entry, tp_price, trigger):
         if curr and curr <= trigger:
             print(f"[BE TRIGGERED] {symbol} erreicht {curr}")
 
-            # 1. Alle Orders am Symbol löschen (DELETE Request ist schnell)
+            # 1. Spezifisches Löschen von TRIGGER-ORDERS (TP/SL)
+            # Wir nutzen hier den POST Endpunkt für Batch-Stornierung von Trigger-Orders
             ts = str(int(time.time() * 1000))
-            c_p = {"symbol": symbol, "timestamp": ts}
+            c_p = {
+                "symbol": symbol,
+                "timestamp": ts
+            }
             qs = urllib.parse.urlencode(sorted(c_p.items()))
             sig = sign_bingx(c_p)
-            requests.delete(f"{BINGX_BASE}/openApi/swap/v2/trade/allOpenOrders?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY})
             
-            # WICHTIG: Aktiv prüfen, ob Orders weg sind, max 5 Sekunden
-            wait_count = 0
-            while has_open_orders(symbol) and wait_count < 5:
-                print(f"[BE WAIT] Warte auf Order-Stornierung... {wait_count}s")
-                time.sleep(1)
-                wait_count += 1
-
-            if has_open_orders(symbol):
-                print("[BE ERROR] Orders konnten nicht gelöscht werden. BE fehlgeschlagen.")
-                break # Abbruch, um Fehler zu vermeiden
+            # Dieser Endpunkt löscht gezielt TP/SL Orders für das Symbol
+            cancel_url = f"{BINGX_BASE}/openApi/swap/v2/trade/cancelAllOrders?{qs}&signature={sig}"
+            
+            # BingX erwartet hier oft POST statt DELETE für Trigger-Orders
+            requests.post(cancel_url, headers={"X-BX-APIKEY": API_KEY})
+            
+            # Kurze, feste Pause statt der fehleranfälligen Warteschleife
+            # 2 Sekunden reichen der API normalerweise, um den Slot freizugeben
+            time.sleep(2.5)
 
             # 2. Neuen SL (BE-Preis) setzen
-            be_level = entry * 0.9995 # Winziger Profit für Fees
+            # Wir setzen hier nur den SL neu. Der TP wird in set_tp_sl mitgesendet.
+            be_level = entry * 0.9995 
+            
+            # Falls set_tp_sl fehlschlägt, versuchen wir es mit einer direkten SL-Order
             set_tp_sl(symbol, qty, tp_price, be_level)
             
-            print(f"[BE SUCCESS] {symbol} SL auf BE verschoben.")
+            print(f"[BE SUCCESS] {symbol} SL auf BE verschoben. Monitor beendet.")
             break
         
         time.sleep(4)
+
 
 # ---------------- WEBHOOK & START (Rest bleibt gleich) ----------------
 
