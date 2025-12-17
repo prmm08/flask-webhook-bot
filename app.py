@@ -1,4 +1,4 @@
-# -------- V 3.5: BINGX FUTURES - BE FIX MIT ACTIVE WAIT - 17.12.25 --------
+# -------- V 3.6: BINGX FUTURES - BE FIX MIT POSITION SIDE CANCEL - 17.12.25 --------
 
 import time
 import hmac
@@ -22,16 +22,15 @@ app = Flask(__name__)
 
 # Globale Settings
 RSI_TIMEFRAME = "1m"
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.0, 1.5, 0.4
+# HINWEIS: Diese globalen Variablen werden im BE-Monitor benötigt
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.0, 1.5, 0.4 
 
 # ---------------- SIGNING ----------------
-
 def sign_bingx(params):
     query_string = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
 # ---------------- MARKET DATA & POSITION CHECK ----------------
-
 def get_price_bingx(symbol):
     try:
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
@@ -40,7 +39,6 @@ def get_price_bingx(symbol):
     except: return None
 
 def get_ohlcv(symbol, interval="1m", limit=100):
-    # ... (Funktion bleibt gleich) ...
     try:
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -49,7 +47,6 @@ def get_ohlcv(symbol, interval="1m", limit=100):
     except: return []
 
 def calc_rsi(closes, period=14):
-    # ... (Funktion bleibt gleich) ...
     if len(closes) < period + 1: return 50
     gains = [max(0, closes[-i] - closes[-i-1]) for i in range(1, period + 1)]
     losses = [abs(min(0, closes[-i] - closes[-i-1])) for i in range(1, period + 1)]
@@ -59,34 +56,26 @@ def calc_rsi(closes, period=14):
     return 100 - (100 / (1 + rs))
 
 def is_pos_open_bingx(symbol):
-    # ... (Funktion bleibt gleich) ...
     try:
         ts = str(int(time.time() * 1000))
         params = {"symbol": symbol, "timestamp": ts}
         params["signature"] = sign_bingx(params)
         r = requests.get(f"{BINGX_BASE}/openApi/swap/v2/user/positions", params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        # Prüft ob irgendeine Position offen ist
         return any(float(p.get("positionAmt", 0)) != 0 for p in r.get("data", []))
     except: return True
-
-# NEU: Prüfen ob offene Orders existieren
-def has_open_orders(symbol):
-    ts = str(int(time.time() * 1000))
-    params = {"symbol": symbol, "timestamp": ts}
-    qs = urllib.parse.urlencode(sorted(params.items()))
-    sig = sign_bingx(params)
-    url = f"{BINGX_BASE}/openApi/swap/v2/trade/openOrders?{qs}&signature={sig}"
-    response = requests.get(url, headers={"X-BX-APIKEY": API_KEY}).json()
-    return len(response.get('data', [])) > 0
 
 # ---------------- ORDER EXECUTION ----------------
 
 def place_precise_order(symbol, qty, price, order_type, side="BUY"):
-    # ... (Funktion bleibt gleich) ...
+    # Bei BingX Futures ist die PositionSide notwendig
+    positionSide = "SHORT" if side == "BUY" else "LONG" 
+    
     for attempt in range(5):
         ts = str(int(time.time() * 1000))
         params = {
-            "symbol": symbol, "side": side, "positionSide": "SHORT", "type": order_type,
-            "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
+            "symbol": symbol, "side": side, "positionSide": "SHORT", # Feste Short PositionSide
+            "type": order_type, "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
             "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts
         }
         qs = urllib.parse.urlencode(sorted(params.items()))
@@ -98,14 +87,14 @@ def place_precise_order(symbol, qty, price, order_type, side="BUY"):
     return response
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
-    r_tp = place_precise_order(symbol, qty, tp_price, "TAKE_PROFIT_MARKET")
-    r_sl = place_precise_order(symbol, qty, sl_price, "STOP_MARKET")
+    # Short Entry = Exit ist BUY
+    r_tp = place_precise_order(symbol, qty, tp_price, "TAKE_PROFIT_MARKET", side="BUY")
+    r_sl = place_precise_order(symbol, qty, sl_price, "STOP_MARKET", side="BUY")
     print(f"[API RESULT] {symbol} -> TP: {r_tp.get('msg')} | SL: {r_sl.get('msg')}")
 
 # ---------------- MAIN LOGIC ----------------
 
 def execute_trade_bingx(symbol):
-    # ... (Funktion bleibt gleich bis zum Ende) ...
     ohlcv = get_ohlcv(symbol, RSI_TIMEFRAME)
     if not ohlcv: return
     rsi = calc_rsi([float(c["close"]) for c in ohlcv])
@@ -116,8 +105,7 @@ def execute_trade_bingx(symbol):
 
     price = get_price_bingx(symbol)
     if not price: return
-    qty = round(10 / price, 6) # 10 USDT fest
-    
+    qty = round(10 / price, 6)
     print(f"[ORDER] SHORT {symbol} | Entry={price}")
 
     ts = str(int(time.time() * 1000))
@@ -133,9 +121,7 @@ def execute_trade_bingx(symbol):
     set_tp_sl(symbol, qty, tp, sl)
     threading.Thread(target=monitor_be, args=(symbol, qty, price, tp, be_trigger)).start()
 
-# ---------------- BE MONITOR (FIXED ACTIVE WAIT) ----------------
-
-# ---------------- BE MONITOR (FINALE KORREKTUR FÜR TRIGGER ORDERS) ----------------
+# ---------------- BE MONITOR (FIXED POSITION SIDE CANCEL) ----------------
 
 def monitor_be(symbol, qty, entry, tp_price, trigger):
     print(f"[BE-MONITOR] Start {symbol}. Trigger @ {trigger:.6f}")
@@ -145,31 +131,22 @@ def monitor_be(symbol, qty, entry, tp_price, trigger):
         if curr and curr <= trigger:
             print(f"[BE TRIGGERED] {symbol} erreicht {curr}")
 
-            # 1. Spezifisches Löschen von TRIGGER-ORDERS (TP/SL)
-            # Wir nutzen hier den POST Endpunkt für Batch-Stornierung von Trigger-Orders
+            # 1. Storniere Orders spezifisch für die PositionSide 'SHORT'
             ts = str(int(time.time() * 1000))
-            c_p = {
-                "symbol": symbol,
-                "timestamp": ts
-            }
+            # Parameter müssen positionSide enthalten!
+            c_p = {"symbol": symbol, "positionSide": "SHORT", "timestamp": ts} 
             qs = urllib.parse.urlencode(sorted(c_p.items()))
             sig = sign_bingx(c_p)
             
-            # Dieser Endpunkt löscht gezielt TP/SL Orders für das Symbol
-            cancel_url = f"{BINGX_BASE}/openApi/swap/v2/trade/cancelAllOrders?{qs}&signature={sig}"
-            
-            # BingX erwartet hier oft POST statt DELETE für Trigger-Orders
-            requests.post(cancel_url, headers={"X-BX-APIKEY": API_KEY})
-            
-            # Kurze, feste Pause statt der fehleranfälligen Warteschleife
-            # 2 Sekunden reichen der API normalerweise, um den Slot freizugeben
-            time.sleep(2.5)
+            # Verwende DELETE Request für allOpenOrders
+            cancel_url = f"{BINGX_BASE}/openApi/swap/v2/trade/allOpenOrders?{qs}&signature={sig}"
+            response = requests.delete(cancel_url, headers={"X-BX-APIKEY": API_KEY}).json()
+            print(f"[BE-CANCEL] {symbol}: Code {response.get('code')} | Msg: {response.get('msg')}")
 
-            # 2. Neuen SL (BE-Preis) setzen
-            # Wir setzen hier nur den SL neu. Der TP wird in set_tp_sl mitgesendet.
-            be_level = entry * 0.9995 
+            time.sleep(2.5) # Wartezeit für API Sync
             
-            # Falls set_tp_sl fehlschlägt, versuchen wir es mit einer direkten SL-Order
+            # 2. Neuen SL (BE-Preis) setzen
+            be_level = entry * 0.9995 
             set_tp_sl(symbol, qty, tp_price, be_level)
             
             print(f"[BE SUCCESS] {symbol} SL auf BE verschoben. Monitor beendet.")
@@ -177,8 +154,7 @@ def monitor_be(symbol, qty, entry, tp_price, trigger):
         
         time.sleep(4)
 
-
-# ---------------- WEBHOOK & START (Rest bleibt gleich) ----------------
+# ---------------- WEBHOOK & START ----------------
 
 @app.route("/testorder", methods=["POST", "GET"])
 def handle_alert():
