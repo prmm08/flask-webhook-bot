@@ -1,4 +1,4 @@
-# -------- V 3.4: BINGX FUTURES - BE FIX MIT V3 CANCEL - 17.12.25 --------
+# -------- V 3.5: BINGX FUTURES - BE FIX MIT ACTIVE WAIT - 17.12.25 --------
 
 import time
 import hmac
@@ -22,7 +22,7 @@ app = Flask(__name__)
 
 # Globale Settings
 RSI_TIMEFRAME = "1m"
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.0, 1.5, 0.5
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.0, 1.5, 0.4
 
 # ---------------- SIGNING ----------------
 
@@ -30,7 +30,7 @@ def sign_bingx(params):
     query_string = urllib.parse.urlencode(sorted(params.items()))
     return hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
-# ---------------- MARKET DATA ----------------
+# ---------------- MARKET DATA & POSITION CHECK ----------------
 
 def get_price_bingx(symbol):
     try:
@@ -40,6 +40,7 @@ def get_price_bingx(symbol):
     except: return None
 
 def get_ohlcv(symbol, interval="1m", limit=100):
+    # ... (Funktion bleibt gleich) ...
     try:
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -48,6 +49,7 @@ def get_ohlcv(symbol, interval="1m", limit=100):
     except: return []
 
 def calc_rsi(closes, period=14):
+    # ... (Funktion bleibt gleich) ...
     if len(closes) < period + 1: return 50
     gains = [max(0, closes[-i] - closes[-i-1]) for i in range(1, period + 1)]
     losses = [abs(min(0, closes[-i] - closes[-i-1])) for i in range(1, period + 1)]
@@ -57,6 +59,7 @@ def calc_rsi(closes, period=14):
     return 100 - (100 / (1 + rs))
 
 def is_pos_open_bingx(symbol):
+    # ... (Funktion bleibt gleich) ...
     try:
         ts = str(int(time.time() * 1000))
         params = {"symbol": symbol, "timestamp": ts}
@@ -65,10 +68,20 @@ def is_pos_open_bingx(symbol):
         return any(float(p.get("positionAmt", 0)) != 0 for p in r.get("data", []))
     except: return True
 
+# NEU: Prüfen ob offene Orders existieren
+def has_open_orders(symbol):
+    ts = str(int(time.time() * 1000))
+    params = {"symbol": symbol, "timestamp": ts}
+    qs = urllib.parse.urlencode(sorted(params.items()))
+    sig = sign_bingx(params)
+    url = f"{BINGX_BASE}/openApi/swap/v2/trade/openOrders?{qs}&signature={sig}"
+    response = requests.get(url, headers={"X-BX-APIKEY": API_KEY}).json()
+    return len(response.get('data', [])) > 0
+
 # ---------------- ORDER EXECUTION ----------------
 
 def place_precise_order(symbol, qty, price, order_type, side="BUY"):
-    """ Hilfsfunktion für TP/SL Orders via URL-Params (Stabilster Weg 2025) """
+    # ... (Funktion bleibt gleich) ...
     for attempt in range(5):
         ts = str(int(time.time() * 1000))
         params = {
@@ -79,11 +92,10 @@ def place_precise_order(symbol, qty, price, order_type, side="BUY"):
         qs = urllib.parse.urlencode(sorted(params.items()))
         sig = sign_bingx(params)
         url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}"
-        
-        res = requests.post(url, headers={"X-BX-APIKEY": API_KEY}).json()
-        if res.get("code") == 0: return res
+        response = requests.post(url, headers={"X-BX-APIKEY": API_KEY}).json()
+        if response.get("code") == 0: return response
         time.sleep(1.5)
-    return res
+    return response
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
     r_tp = place_precise_order(symbol, qty, tp_price, "TAKE_PROFIT_MARKET")
@@ -93,6 +105,7 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
 # ---------------- MAIN LOGIC ----------------
 
 def execute_trade_bingx(symbol):
+    # ... (Funktion bleibt gleich bis zum Ende) ...
     ohlcv = get_ohlcv(symbol, RSI_TIMEFRAME)
     if not ohlcv: return
     rsi = calc_rsi([float(c["close"]) for c in ohlcv])
@@ -107,22 +120,20 @@ def execute_trade_bingx(symbol):
     
     print(f"[ORDER] SHORT {symbol} | Entry={price}")
 
-    # Entry via URL Params
     ts = str(int(time.time() * 1000))
     entry_p = {"symbol": symbol, "side": "SELL", "positionSide": "SHORT", "type": "MARKET", "quantity": str(qty), "leverage": "10", "timestamp": ts}
     qs = urllib.parse.urlencode(sorted(entry_p.items()))
     sig = sign_bingx(entry_p)
     requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY})
 
-    time.sleep(2) # Warten auf Position
-    
+    time.sleep(2)
     tp, sl = price * (1 - TP_PERCENT / 100), price * (1 + SL_PERCENT / 100)
     be_trigger = price * (1 - BE_PERCENT / 100)
     
     set_tp_sl(symbol, qty, tp, sl)
     threading.Thread(target=monitor_be, args=(symbol, qty, price, tp, be_trigger)).start()
 
-# ---------------- BE MONITOR (FIXED) ----------------
+# ---------------- BE MONITOR (FIXED ACTIVE WAIT) ----------------
 
 def monitor_be(symbol, qty, entry, tp_price, trigger):
     print(f"[BE-MONITOR] Start {symbol}. Trigger @ {trigger:.6f}")
@@ -132,18 +143,25 @@ def monitor_be(symbol, qty, entry, tp_price, trigger):
         if curr and curr <= trigger:
             print(f"[BE TRIGGERED] {symbol} erreicht {curr}")
 
-            # 1. Alle Orders am Symbol löschen (V3 Endpunkt ist zuverlässiger)
+            # 1. Alle Orders am Symbol löschen (DELETE Request ist schnell)
             ts = str(int(time.time() * 1000))
             c_p = {"symbol": symbol, "timestamp": ts}
             qs = urllib.parse.urlencode(sorted(c_p.items()))
             sig = sign_bingx(c_p)
-            # Nutze swap/v2/trade/allOpenOrders für maximale Kompatibilität
             requests.delete(f"{BINGX_BASE}/openApi/swap/v2/trade/allOpenOrders?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY})
             
-            time.sleep(2) # Längere Pause für API Sync
-            
-            # 2. Nur den STOP-LOSS neu setzen (Break-Even)
-            # TP bleibt oft erhalten oder wird hier neu gesetzt
+            # WICHTIG: Aktiv prüfen, ob Orders weg sind, max 5 Sekunden
+            wait_count = 0
+            while has_open_orders(symbol) and wait_count < 5:
+                print(f"[BE WAIT] Warte auf Order-Stornierung... {wait_count}s")
+                time.sleep(1)
+                wait_count += 1
+
+            if has_open_orders(symbol):
+                print("[BE ERROR] Orders konnten nicht gelöscht werden. BE fehlgeschlagen.")
+                break # Abbruch, um Fehler zu vermeiden
+
+            # 2. Neuen SL (BE-Preis) setzen
             be_level = entry * 0.9995 # Winziger Profit für Fees
             set_tp_sl(symbol, qty, tp_price, be_level)
             
@@ -151,6 +169,8 @@ def monitor_be(symbol, qty, entry, tp_price, trigger):
             break
         
         time.sleep(4)
+
+# ---------------- WEBHOOK & START (Rest bleibt gleich) ----------------
 
 @app.route("/testorder", methods=["POST", "GET"])
 def handle_alert():
