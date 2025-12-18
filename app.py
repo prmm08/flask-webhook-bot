@@ -1,4 +1,4 @@
-# -------- V 4.2: BINGX FUTURES - Auto TP, SL, BE Monitor, NUR SHORT MIT RSI < 80 FILTER --------
+# -------- V 4.3: BINGX FUTURES - NUR SHORT WENN RSI >= 80 --------
 
 import time
 import hmac
@@ -21,8 +21,7 @@ app = Flask(__name__)
 
 # Globale Settings
 RSI_TIMEFRAME = "1m"
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.5, 0.5
-# Feste Trade-Richtung für dieses Skript
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.5, 0.4 
 TRADE_SIDE = "SHORT"
 
 # ---------------- SIGNING & HELPERS ----------------
@@ -80,7 +79,6 @@ def close_position_market(symbol):
     print(f"[EXIT] {symbol} Markt-Close ausgeführt.")
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
-    # Exit side for SHORT is BUY
     exit_side = "BUY"
     def place_order(price, o_type):
         ts = str(int(time.time() * 1000))
@@ -104,63 +102,54 @@ def monitor_trade(symbol, entry, tp, sl, be_trigger):
         curr = get_price_bingx(symbol)
         if not curr: time.sleep(2); continue
 
-        # Prüfe, ob BE-Trigger erreicht wurde (Profit bei SHORT: Preis < Trigger)
+        # BE-Trigger bei SHORT: Preis fällt unter Trigger
         if not be_active and curr <= be_trigger:
             be_active = True
-            print(f"[BE STATUS] {symbol} Profit erreicht. BE-Schutz ist jetzt scharf.")
+            print(f"[BE STATUS] {symbol} Profit-Schwelle erreicht. BE-Schutz aktiv.")
 
-        # Wenn BE scharf ist: Schließen sobald Kurs zurück am Entry ist (Preis > Entry)
+        # BE-Exit: Kurs steigt zurück auf Entry (oder höher)
         if be_active and curr >= entry:
-            print(f"[BE EXIT] {symbol} Kurs zurück am Entry. Schließe Position.")
+            print(f"[BE EXIT] {symbol} zurück am Entry. Schließe Position.")
             close_position_market(symbol)
             break
         
-        # Lokaler Sicherheits-Check auf TP oder SL (TP Hit: Preis < TP, SL Hit: Preis > SL)
-        tp_hit = curr <= tp
-        sl_hit = curr >= sl
-
-        if tp_hit or sl_hit:
-            reason = "TP" if tp_hit else "SL"
-            print(f"[LOCAL EXIT] {symbol} {reason} erreicht. Schließe...")
+        # Sicherheits-Checks
+        if curr <= tp or curr >= sl:
+            print(f"[LOCAL EXIT] {symbol} TP/SL erreicht.")
             close_position_market(symbol)
             break
 
         time.sleep(3)
-    print(f"[MONITOR] Ende für {symbol}")
 
-# ---------------- EXECUTION LOGIC (NUR SHORT) ----------------
+# ---------------- EXECUTION LOGIC ----------------
 
 def execute_trade_bingx(symbol):
+    # RSI Check
+    ohlcv = get_ohlcv(symbol, RSI_TIMEFRAME)
+    if not ohlcv: return
+    rsi = calc_rsi([float(c["close"]) for c in ohlcv])
     
-    # RSI Check (Einstiegs-Trigger) im 1m TF
-    ohlcv_asset = get_ohlcv(symbol, RSI_TIMEFRAME)
-    if not ohlcv_asset: return
-    rsi = calc_rsi([float(c["close"]) for c in ohlcv_asset])
-    
-    # Filterbedingung: RSI muss unter 80 sein
-    if rsi >= 80:
-        print(f"[RSI FILTER] Kein Einstiegssignal für {symbol}. RSI={rsi:.1f} >= 80")
+    # NEU: Filterbedingung RSI >= 80
+    if rsi < 80:
+        print(f"[RSI BLOCK] {symbol} RSI={rsi:.1f} (Warte auf >= 80)")
         return
 
-    # Order Ausführung
     price = get_price_bingx(symbol)
     if not price: return
     
     trade_size_usdt, leverage = 10, 10
     qty = round(trade_size_usdt / price, 6)
-    order_side = "SELL"
     
-    print(f"[ENTRY] {TRADE_SIDE} {symbol} @ {price} | RSI: {rsi:.1f}")
+    print(f"[ENTRY] SHORT {symbol} @ {price} | RSI: {rsi:.1f}")
 
     ts = str(int(time.time() * 1000))
-    entry_p = {"symbol": symbol, "side": order_side, "positionSide": TRADE_SIDE, "type": "MARKET", "quantity": str(qty), "leverage": str(leverage), "timestamp": ts}
+    entry_p = {"symbol": symbol, "side": "SELL", "positionSide": TRADE_SIDE, "type": "MARKET", "quantity": str(qty), "leverage": str(leverage), "timestamp": ts}
     qs = urllib.parse.urlencode(sorted(entry_p.items()))
     sig = sign_bingx(entry_p)
     requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY})
 
     time.sleep(2)
     
-    # Kalkulationen TP/SL/BE für SHORT
     tp = price * (1 - TP_PERCENT / 100)
     sl = price * (1 + SL_PERCENT / 100)
     be_trigger = price * (1 - BE_PERCENT / 100)
