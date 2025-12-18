@@ -22,7 +22,7 @@ app = Flask(__name__)
 # Globale Settings
 EMA_TIMEFRAME = "1m"  # Zeitrahmen für den EMA
 EMA_PERIOD = 50
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.0, 0.5
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.0, 1.0, 0.5
 TRADE_SIDE = "LONG"
 
 # ---------------- SIGNING & HELPERS ----------------
