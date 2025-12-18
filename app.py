@@ -165,7 +165,7 @@ def execute_trade_bingx(symbol):
     # Trade nur, wenn Asset RSI im extremen Bereich der BTC-Tendenz ist
     if trend_side == "LONG" and rsi < 35: # Nur "Buy the Dip" im Bullenmarkt
         trade_side = "LONG"
-    elif trend_side == "SHORT" and rsi > 65: # Nur "Sell the Rally" im Bärenmarkt
+    elif trend_side == "SHORT" and rsi > 75: # Nur "Sell the Rally" im Bärenmarkt
         trade_side = "SHORT"
     
     if not trade_side:
