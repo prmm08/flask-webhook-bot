@@ -1,4 +1,4 @@
-# -------- V 4.3: BINGX FUTURES - NUR SHORT WENN RSI >= 80 --------
+# -------- V 5.0: BINGX FUTURES - NUR LONG WENN PREIS > EMA 50 --------
 
 import time
 import hmac
@@ -20,9 +20,10 @@ log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
 # Globale Settings
-RSI_TIMEFRAME = "1m"
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.5, 0.4 
-TRADE_SIDE = "SHORT"
+EMA_TIMEFRAME = "1m"  # Zeitrahmen für den EMA
+EMA_PERIOD = 50
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.0, 0.5
+TRADE_SIDE = "LONG"
 
 # ---------------- SIGNING & HELPERS ----------------
 
@@ -37,7 +38,7 @@ def get_price_bingx(symbol):
         return float(r["data"]["price"])
     except: return None
 
-def get_ohlcv(symbol, interval="1m", limit=100):
+def get_ohlcv(symbol, interval, limit=100):
     try:
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -47,14 +48,13 @@ def get_ohlcv(symbol, interval="1m", limit=100):
 
 # ---------------- INDICATORS ----------------
 
-def calc_rsi(closes, period=14):
-    if len(closes) < period + 1: return 50
-    gains = [max(0, closes[-i] - closes[-i-1]) for i in range(1, period + 1)]
-    losses = [abs(min(0, closes[-i] - closes[-i-1])) for i in range(1, period + 1)]
-    avg_gain = sum(gains) / period or 0.0001
-    avg_loss = sum(losses) / period or 0.0001
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+def calc_ema(prices, period):
+    if len(prices) < period: return prices[-1]
+    k = 2 / (period + 1)
+    ema = sum(prices[:period]) / period  # Start mit SMA
+    for price in prices[period:]:
+        ema = (price * k) + (ema * (1 - k))
+    return ema
 
 # ---------------- POSITION ACTIONS ----------------
 
@@ -79,7 +79,7 @@ def close_position_market(symbol):
     print(f"[EXIT] {symbol} Markt-Close ausgeführt.")
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
-    exit_side = "BUY"
+    exit_side = "SELL" # Exit für Long ist Sell
     def place_order(price, o_type):
         ts = str(int(time.time() * 1000))
         params = {
@@ -102,19 +102,19 @@ def monitor_trade(symbol, entry, tp, sl, be_trigger):
         curr = get_price_bingx(symbol)
         if not curr: time.sleep(2); continue
 
-        # BE-Trigger bei SHORT: Preis fällt unter Trigger
-        if not be_active and curr <= be_trigger:
+        # BE-Trigger bei LONG: Preis steigt über Trigger
+        if not be_active and curr >= be_trigger:
             be_active = True
             print(f"[BE STATUS] {symbol} Profit-Schwelle erreicht. BE-Schutz aktiv.")
 
-        # BE-Exit: Kurs steigt zurück auf Entry (oder höher)
-        if be_active and curr >= entry:
+        # BE-Exit: Kurs fällt zurück auf Entry (oder tiefer)
+        if be_active and curr <= entry:
             print(f"[BE EXIT] {symbol} zurück am Entry. Schließe Position.")
             close_position_market(symbol)
             break
         
-        # Sicherheits-Checks
-        if curr <= tp or curr >= sl:
+        # Lokale Sicherheits-Checks
+        if curr >= tp or curr <= sl:
             print(f"[LOCAL EXIT] {symbol} TP/SL erreicht.")
             close_position_market(symbol)
             break
@@ -124,38 +124,37 @@ def monitor_trade(symbol, entry, tp, sl, be_trigger):
 # ---------------- EXECUTION LOGIC ----------------
 
 def execute_trade_bingx(symbol):
-    # RSI Check
-    ohlcv = get_ohlcv(symbol, RSI_TIMEFRAME)
+    # EMA Berechnung
+    ohlcv = get_ohlcv(symbol, EMA_TIMEFRAME, limit=100)
     if not ohlcv: return
-    rsi = calc_rsi([float(c["close"]) for c in ohlcv])
+    closes = [float(c["close"]) for c in ohlcv]
+    ema_value = calc_ema(closes, EMA_PERIOD)
+    current_price = closes[-1]
     
-    # NEU: Filterbedingung RSI >= 80
-    if rsi < 80:
-        print(f"[RSI BLOCK] {symbol} RSI={rsi:.1f} (Warte auf >= 80)")
+    # NEU: Filterbedingung Preis > EMA 50
+    if current_price <= ema_value:
+        print(f"[EMA BLOCK] {symbol} Preis ({current_price}) <= EMA {EMA_PERIOD} ({ema_value:.6f})")
         return
 
-    price = get_price_bingx(symbol)
-    if not price: return
-    
     trade_size_usdt, leverage = 10, 10
-    qty = round(trade_size_usdt / price, 6)
+    qty = round(trade_size_usdt / current_price, 6)
     
-    print(f"[ENTRY] SHORT {symbol} @ {price} | RSI: {rsi:.1f}")
+    print(f"[ENTRY] LONG {symbol} @ {current_price} | EMA50: {ema_value:.6f}")
 
     ts = str(int(time.time() * 1000))
-    entry_p = {"symbol": symbol, "side": "SELL", "positionSide": TRADE_SIDE, "type": "MARKET", "quantity": str(qty), "leverage": str(leverage), "timestamp": ts}
+    entry_p = {"symbol": symbol, "side": "BUY", "positionSide": TRADE_SIDE, "type": "MARKET", "quantity": str(qty), "leverage": str(leverage), "timestamp": ts}
     qs = urllib.parse.urlencode(sorted(entry_p.items()))
     sig = sign_bingx(entry_p)
     requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY})
 
     time.sleep(2)
     
-    tp = price * (1 - TP_PERCENT / 100)
-    sl = price * (1 + SL_PERCENT / 100)
-    be_trigger = price * (1 - BE_PERCENT / 100)
+    tp = current_price * (1 + TP_PERCENT / 100)
+    sl = current_price * (1 - SL_PERCENT / 100)
+    be_trigger = current_price * (1 + BE_PERCENT / 100)
     
     set_tp_sl(symbol, qty, tp, sl)
-    threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger)).start()
+    threading.Thread(target=monitor_trade, args=(symbol, current_price, tp, sl, be_trigger)).start()
 
 # ---------------- WEBHOOK ----------------
 
