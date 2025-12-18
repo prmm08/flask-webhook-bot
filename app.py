@@ -23,7 +23,7 @@ app = Flask(__name__)
 # Globale Settings
 RSI_TIMEFRAME = "1m"
 # HINWEIS: Diese globalen Variablen werden im BE-Monitor benötigt
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.0, 1.5, 0.4 
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.5, 0.5
 
 # ---------------- SIGNING ----------------
 def sign_bingx(params):
