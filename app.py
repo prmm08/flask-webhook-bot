@@ -21,9 +21,9 @@ app = Flask(__name__)
 
 # Globale Settings
 RSI_TIMEFRAME = "1m" # Wird nur noch zur Info geladen
-BTC_TREND_TIMEFRAME = "1h"
-MA_PERIOD = 50
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.5, 1.5, 0.5
+BTC_TREND_TIMEFRAME = "15m"
+MA_PERIOD = 15
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.5, 1.5, 1.5
 
 # ---------------- SIGNING & HELPERS ----------------
 
