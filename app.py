@@ -1,4 +1,4 @@
-# -------- V 4.2: BINGX FUTURES - Auto TP, SL, BE Monitor, NUR SHORT MIT RSI < 80 FILTER --------
+# -------- V 2.9: BINGX LONG & SHORT + NUR BTC TREND FILTER (OHNE RSI FILTER) --------
 
 import time
 import hmac
@@ -20,10 +20,10 @@ log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
 # Globale Settings
-RSI_TIMEFRAME = "1m"
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.5, 0.5
-# Feste Trade-Richtung für dieses Skript
-TRADE_SIDE = "SHORT"
+RSI_TIMEFRAME = "1m" # Wird nur noch zur Info geladen
+BTC_TREND_TIMEFRAME = "1h"
+MA_PERIOD = 50
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.5, 1.5, 0.5
 
 # ---------------- SIGNING & HELPERS ----------------
 
@@ -48,6 +48,10 @@ def get_ohlcv(symbol, interval="1m", limit=100):
 
 # ---------------- INDICATORS ----------------
 
+def calc_ma(closes, period):
+    if len(closes) < period: return closes[-1]
+    return sum(closes[-period:]) / period
+
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1: return 50
     gains = [max(0, closes[-i] - closes[-i-1]) for i in range(1, period + 1)]
@@ -71,21 +75,22 @@ def get_active_position(symbol):
     except: return None
 
 def close_position_market(symbol):
+    pos = get_active_position(symbol)
+    if not pos: return
     ts = str(int(time.time() * 1000))
     params = {"symbol": symbol, "timestamp": ts}
     qs = urllib.parse.urlencode(sorted(params.items()))
     sig = sign_bingx(params)
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions?{qs}&signature={sig}"
     requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-    print(f"[EXIT] {symbol} Markt-Close ausgeführt.")
+    print(f"[EXIT] {symbol} Markt-Close ausgeführt ({pos.get('positionSide')}).")
 
-def set_tp_sl(symbol, qty, tp_price, sl_price):
-    # Exit side for SHORT is BUY
-    exit_side = "BUY"
+def set_tp_sl(symbol, qty, tp_price, sl_price, side):
+    exit_side = "SELL" if side == "LONG" else "BUY"
     def place_order(price, o_type):
         ts = str(int(time.time() * 1000))
         params = {
-            "symbol": symbol, "side": exit_side, "positionSide": TRADE_SIDE,
+            "symbol": symbol, "side": exit_side, "positionSide": side,
             "type": o_type, "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
             "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts
         }
@@ -98,26 +103,26 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
 
 # ---------------- MONITORING ----------------
 
-def monitor_trade(symbol, entry, tp, sl, be_trigger):
+def monitor_trade(symbol, entry, tp, sl, be_trigger, side):
     be_active = False
     while get_active_position(symbol):
         curr = get_price_bingx(symbol)
         if not curr: time.sleep(2); continue
 
-        # Prüfe, ob BE-Trigger erreicht wurde (Profit bei SHORT: Preis < Trigger)
-        if not be_active and curr <= be_trigger:
+        profit_reached = (side == "LONG" and curr >= be_trigger) or (side == "SHORT" and curr <= be_trigger)
+
+        if not be_active and profit_reached:
             be_active = True
             print(f"[BE STATUS] {symbol} Profit erreicht. BE-Schutz ist jetzt scharf.")
 
-        # Wenn BE scharf ist: Schließen sobald Kurs zurück am Entry ist (Preis > Entry)
-        if be_active and curr >= entry:
+        back_to_entry = (side == "LONG" and curr <= entry) or (side == "SHORT" and curr >= entry)
+        if be_active and back_to_entry:
             print(f"[BE EXIT] {symbol} Kurs zurück am Entry. Schließe Position.")
             close_position_market(symbol)
             break
         
-        # Lokaler Sicherheits-Check auf TP oder SL (TP Hit: Preis < TP, SL Hit: Preis > SL)
-        tp_hit = curr <= tp
-        sl_hit = curr >= sl
+        tp_hit = (side == "LONG" and curr >= tp) or (side == "SHORT" and curr <= tp)
+        sl_hit = (side == "LONG" and curr <= sl) or (side == "SHORT" and curr >= sl)
 
         if tp_hit or sl_hit:
             reason = "TP" if tp_hit else "SL"
@@ -128,45 +133,55 @@ def monitor_trade(symbol, entry, tp, sl, be_trigger):
         time.sleep(3)
     print(f"[MONITOR] Ende für {symbol}")
 
-# ---------------- EXECUTION LOGIC (NUR SHORT) ----------------
+# ---------------- EXECUTION LOGIC (OHNE RSI FILTER) ----------------
 
 def execute_trade_bingx(symbol):
+    # 1. BTC Trend Check (Master Filter)
+    ohlcv_btc = get_ohlcv("BTC-USDT", BTC_TREND_TIMEFRAME, limit=MA_PERIOD + 1)
+    if not ohlcv_btc: return
+    closes_btc = [float(c["close"]) for c in ohlcv_btc]
+    ma_btc = calc_ma(closes_btc, MA_PERIOD)
+    current_btc_price = closes_btc[-1]
+
+    trade_side = None
+    if current_btc_price > ma_btc:
+        trade_side = "LONG"
+    elif current_btc_price < ma_btc:
+        trade_side = "SHORT"
     
-    # RSI Check (Einstiegs-Trigger) im 1m TF
-    ohlcv_asset = get_ohlcv(symbol, RSI_TIMEFRAME)
-    if not ohlcv_asset: return
-    rsi = calc_rsi([float(c["close"]) for c in ohlcv_asset])
-    
-    # Filterbedingung: RSI muss unter 80 sein
-    if rsi >= 80:
-        print(f"[RSI FILTER] Kein Einstiegssignal für {symbol}. RSI={rsi:.1f} >= 80")
+    if not trade_side:
+        print("[TREND FILTER] BTC Trend unklar (Seitwärts), kein Trade.")
         return
 
-    # Order Ausführung
+    # Info: RSI wird nur noch geladen, um es im Log anzuzeigen
+    ohlcv_asset = get_ohlcv(symbol, RSI_TIMEFRAME)
+    rsi = calc_rsi([float(c["close"]) for c in ohlcv_asset]) if ohlcv_asset else 50
+    
+    # 2. Order Ausführung, da Filter passiert
     price = get_price_bingx(symbol)
     if not price: return
     
     trade_size_usdt, leverage = 10, 10
     qty = round(trade_size_usdt / price, 6)
-    order_side = "SELL"
+    order_side = "BUY" if trade_side == "LONG" else "SELL"
     
-    print(f"[ENTRY] {TRADE_SIDE} {symbol} @ {price} | RSI: {rsi:.1f}")
+    print(f"[ENTRY] {trade_side} {symbol} @ {price} | BTC-Trend: {trade_side} | RSI: {rsi:.1f}")
 
     ts = str(int(time.time() * 1000))
-    entry_p = {"symbol": symbol, "side": order_side, "positionSide": TRADE_SIDE, "type": "MARKET", "quantity": str(qty), "leverage": str(leverage), "timestamp": ts}
+    entry_p = {"symbol": symbol, "side": order_side, "positionSide": trade_side, "type": "MARKET", "quantity": str(qty), "leverage": str(leverage), "timestamp": ts}
     qs = urllib.parse.urlencode(sorted(entry_p.items()))
     sig = sign_bingx(entry_p)
     requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY})
 
     time.sleep(2)
     
-    # Kalkulationen TP/SL/BE für SHORT
-    tp = price * (1 - TP_PERCENT / 100)
-    sl = price * (1 + SL_PERCENT / 100)
-    be_trigger = price * (1 - BE_PERCENT / 100)
+    # Kalkulationen TP/SL/BE dynamisch für Long/Short
+    tp = price * (1 + TP_PERCENT / 100) if trade_side == "LONG" else price * (1 - TP_PERCENT / 100)
+    sl = price * (1 - SL_PERCENT / 100) if trade_side == "LONG" else price * (1 + SL_PERCENT / 100)
+    be_trigger = price * (1 + BE_PERCENT / 100) if trade_side == "LONG" else price * (1 - BE_PERCENT / 100)
     
-    set_tp_sl(symbol, qty, tp, sl)
-    threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger)).start()
+    set_tp_sl(symbol, qty, tp, sl, trade_side)
+    threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger, trade_side)).start()
 
 # ---------------- WEBHOOK ----------------
 
