@@ -22,7 +22,7 @@ app = Flask(__name__)
 # Globale Standard-Settings
 DEFAULT_BTC_TF = "15m"
 MA_PERIOD = 50
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1,0, 0.5
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.0, 0.5
 
 # ---------------- SIGNING & HELPERS ----------------
 
