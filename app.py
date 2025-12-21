@@ -20,8 +20,8 @@ log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
 # Globale Settings für Reversal-Shorts
-TP_PERCENT = 1.5   # Take Profit
-SL_PERCENT = 1.0   # Stop Loss
+TP_PERCENT = 3.0   # Take Profit
+SL_PERCENT = 1.5   # Stop Loss
 LEVERAGE = 10      # Hebel
 TRADE_SIZE = 10    # USDT Einsatz
 
