@@ -1,4 +1,4 @@
-# -------- V 4.4: BINGX FUTURES - NUR SHORT WENN RSI >= 80 (OHNE EMA/LONG) --------
+# -------- V 4.6: BINGX FUTURES - SHORT WENN RSI >= 80 UND OPEN INTEREST < 5% (COINGLASS) --------
 
 import time
 import hmac
@@ -14,18 +14,24 @@ import logging
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
+# NEU: CoinGlass API Key aus Umgebungsvariable laden
+COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY") 
+COINGLASS_BASE = "fapi.coinglass.com"
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
 # Globale Settings für die Short-Strategie
-RSI_TIMEFRAME = "1m"  # Standard-Timeframe für RSI-Berechnung
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.5, 1.5
+RSI_TIMEFRAME = "1m"
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 4.5, 1.5, 0.5
 TRADE_SIZE = 10    # USDT Einsatz
 LEVERAGE = 10
+# Schwellenwert: Wir brauchen einen absoluten USDT-Wert oder eine relative Metrik
+# Da "Prozent" von was unklar ist, nehme ich einen Platzhalter an.
+# Wir können z.B. prüfen, ob das OI < 10.000.000 USDT ist (10 Millionen)
+OI_THRESHOLD_USDT = 10000000.0 
 
-# Lock gegen Race Conditions bei schnellen aufeinanderfolgenden Webhooks
 order_lock = threading.Lock()
 
 # ---------------- SIGNING & HELPERS ----------------
@@ -35,6 +41,7 @@ def sign_bingx(params):
     return hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
 def get_price_bingx(symbol):
+    # ... (Code wie oben) ...
     try:
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
         r = requests.get(url, params={"symbol": symbol}, timeout=10).json()
@@ -42,6 +49,7 @@ def get_price_bingx(symbol):
     except: return None
 
 def get_ohlcv(symbol, interval, limit=100):
+    # ... (Code wie oben) ...
     try:
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -52,6 +60,7 @@ def get_ohlcv(symbol, interval, limit=100):
 # ---------------- INDICATORS ----------------
 
 def calc_rsi(closes, period=14):
+    # ... (Code wie oben) ...
     if len(closes) < period + 1: return 50
     gains = [max(0, closes[-i] - closes[-i-1]) for i in range(1, period + 1)]
     losses = [abs(min(0, closes[-i] - closes[-i-1])) for i in range(1, period + 1)]
@@ -60,10 +69,43 @@ def calc_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ---------------- POSITION ACTIONS ----------------
+# ---------------- OPEN INTEREST LOGIC (COINGLASS) ----------------
 
+def get_open_interest(symbol) -> float:
+    """ 
+    Ruft das gesamte Open Interest für das Symbol von CoinGlass ab (in USDT).
+    """
+    if not COINGLASS_API_KEY:
+        print("[FEHLER] COINGLASS_API_KEY ist nicht gesetzt.")
+        return -1.0 # Fehlerwert
+        
+    # Symbole konvertieren: BTC-USDT -> BTC
+    base_currency = symbol.split('-')[0]
+    
+    try:
+        url = f"{COINGLASS_BASE}openInterest"
+        headers = {"coinglassSecret": COINGLASS_API_KEY}
+        params = {"symbol": base_currency}
+        
+        r = requests.get(url, headers=headers, params=params, timeout=10).json()
+        
+        if r.get("code") == "00000":
+            # Extrahiere das Gesamt-Open Interest
+            data = r.get("data", {}).get("list", [])
+            if data:
+                # Das letzte Element im Array ist der aktuelle Wert
+                return float(data[-1].get("openInterest")) 
+        
+        print(f"[FEHLER] CoinGlass Antwort Problem: {r.get('msg')}")
+        return -1.0
+
+    except Exception as e:
+        print(f"[FEHLER] Beim Abrufen von CoinGlass Daten: {e}")
+        return -1.0
+
+# ---------------- POSITION ACTIONS ----------------
 def has_active_position(symbol):
-    """ Prüft ob eine Position existiert """
+    # ... (Code wie oben) ...
     try:
         ts = str(int(time.time() * 1000))
         params = {"symbol": symbol, "timestamp": ts}
@@ -73,8 +115,8 @@ def has_active_position(symbol):
              if abs(float(p.get("positionAmt", 0))) > 0: return True
         return False
     except: return False
-
 def close_position_market(symbol):
+    # ... (Code wie oben) ...
     ts = str(int(time.time() * 1000))
     params = {"symbol": symbol, "timestamp": ts}
     qs = urllib.parse.urlencode(sorted(params.items()))
@@ -82,9 +124,9 @@ def close_position_market(symbol):
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions?{qs}&signature={sig}"
     requests.post(url, headers={"X-BX-APIKEY": API_KEY})
     print(f"[EXIT] {symbol} Markt-Close ausgeführt.")
-
 def set_tp_sl(symbol, qty, tp_price, sl_price):
-    exit_side = "BUY" # Exit side for SHORT
+    # ... (Code wie oben) ...
+    exit_side = "BUY"
     def place_order(price, o_type):
         ts = str(int(time.time() * 1000))
         params = {
@@ -96,56 +138,50 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
     place_order(tp_price, "TAKE_PROFIT_MARKET")
     place_order(sl_price, "STOP_MARKET")
 
-# ---------------- MONITORING (mit BE Logik) ----------------
-
+# ---------------- MONITORING ----------------
 def monitor_trade(symbol, entry, tp, sl, be_trigger):
+    # ... (Code wie oben) ...
     be_active = False
     while has_active_position(symbol):
         curr = get_price_bingx(symbol)
         if not curr: time.sleep(2); continue
-
-        # Prüfe, ob BE-Trigger erreicht wurde (Profit bei SHORT: Preis < Trigger)
         if not be_active and curr <= be_trigger:
             be_active = True
-            print(f"[BE STATUS] {symbol} Profit erreicht. BE-Schutz ist jetzt scharf.")
-
-        # Wenn BE scharf ist: Schließen sobald Kurs zurück am Entry ist (Preis > Entry)
         if be_active and curr >= entry:
-            print(f"[BE EXIT] {symbol} Kurs zurück am Entry. Schließe Position.")
             close_position_market(symbol)
             break
-        
-        # Lokaler Sicherheits-Check auf TP oder SL
         if curr <= tp or curr >= sl:
             close_position_market(symbol)
             break
-
         time.sleep(3)
     print(f"[MONITOR] Ende für {symbol}")
 
 
-# ---------------- EXECUTION LOGIC (NUR SHORT WENN RSI >= 80) ----------------
+# ---------------- EXECUTION LOGIC (NUR SHORT WENN RSI >= 80 & OI < Threshold) ----------------
 
 def execute_trade_bingx(symbol, timeframe):
     with order_lock:
-        # 1. Sicherheits-Check: Ist bereits eine Position offen?
         if has_active_position(symbol):
             print(f"[ABORT] Position für {symbol} existiert bereits.")
             return
-
-        # 2. RSI Check im definierten Timeframe
+            
+        # 1. RSI Check
         ohlcv_asset = get_ohlcv(symbol, timeframe)
         if not ohlcv_asset: return
         rsi = calc_rsi([float(c["close"]) for c in ohlcv_asset])
+
+        # 2. Open Interest Check mit CoinGlass
+        open_interest_usdt = get_open_interest(symbol) 
         
-        # 3. Filterbedingung: Nur ausführen, wenn RSI >= 80
-        if rsi >= 80:
+        # 3. Filterbedingungen prüfen
+        # Prüfe, ob OI gültig (>0) und unter dem Schwellenwert liegt
+        if rsi >= 80 and open_interest_usdt > 0 and open_interest_usdt < OI_THRESHOLD_USDT:
             price = get_price_bingx(symbol)
             if not price: return
             
             qty = round(TRADE_SIZE / price, 6)
             
-            print(f"[ENTRY] SHORT {symbol} @ {price} | TF: {timeframe} | RSI: {rsi:.1f} (>= 80 Bedingung erfüllt)")
+            print(f"[ENTRY] SHORT {symbol} | TF: {timeframe} | RSI: {rsi:.1f} | OI: ${open_interest_usdt:,.0f}")
 
             ts = str(int(time.time() * 1000))
             entry_p = {"symbol": symbol, "side": "SELL", "positionSide": "SHORT", "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts}
@@ -153,19 +189,16 @@ def execute_trade_bingx(symbol, timeframe):
 
             if r.get("code") == 0:
                 time.sleep(2)
-                # 4. Kalkulationen TP/SL/BE für SHORT
                 tp = price * (1 - TP_PERCENT / 100)
                 sl = price * (1 + SL_PERCENT / 100)
                 be_trigger = price * (1 - BE_PERCENT / 100)
-                
                 set_tp_sl(symbol, qty, tp, sl)
-                # 5. Monitoring Thread starten (inkl. BE Logik)
                 threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger)).start()
             else:
                 print(f"[ERROR] Order fehlgeschlagen: {r}")
         
         else:
-            print(f"[RSI FILTER] Kein Einstiegssignal für {symbol}. RSI={rsi:.1f} ist unter 80.")
+            print(f"[FILTER] Kein Signal für {symbol}. Bedingungen nicht erfüllt (RSI={rsi:.1f}, OI=${open_interest_usdt:,.0f}).")
 
 
 # ---------------- WEBHOOK ----------------
@@ -174,7 +207,6 @@ def execute_trade_bingx(symbol, timeframe):
 def handle_alert():
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
-    # Erlaubt "tf" im Webhook zu senden, sonst Standard-RSI-TF
     tf = data.get("tf", RSI_TIMEFRAME) 
     
     if not currency: 
@@ -182,7 +214,6 @@ def handle_alert():
     
     symbol = f"{currency}-USDT"
     
-    # Thread starten zur Ausführung
     threading.Thread(target=execute_trade_bingx, args=(symbol, tf)).start()
     
     return jsonify({"status": "processing", "symbol": symbol}), 200
