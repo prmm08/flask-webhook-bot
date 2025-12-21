@@ -1,4 +1,4 @@
-# -------- V 4.6: BINGX FUTURES - SHORT WENN RSI >= 80 UND OPEN INTEREST < 5% (COINGLASS) --------
+# -------- V 4.7: BINGX FUTURES - SHORT WENN RSI >= 80 UND OPEN INTEREST < Threshold (COINGLASS FIX) --------
 
 import time
 import hmac
@@ -14,9 +14,9 @@ import logging
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
-# NEU: CoinGlass API Key aus Umgebungsvariable laden
 COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY") 
-COINGLASS_BASE = "fapi.coinglass.com"
+# Basis URL ohne Endpunkt
+COINGLASS_BASE_URL = "https://fapi.coinglass.com" 
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -24,12 +24,10 @@ app = Flask(__name__)
 
 # Globale Settings für die Short-Strategie
 RSI_TIMEFRAME = "1m"
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 4.5, 1.5, 0.5
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.5, 3.0
 TRADE_SIZE = 10    # USDT Einsatz
 LEVERAGE = 10
-# Schwellenwert: Wir brauchen einen absoluten USDT-Wert oder eine relative Metrik
-# Da "Prozent" von was unklar ist, nehme ich einen Platzhalter an.
-# Wir können z.B. prüfen, ob das OI < 10.000.000 USDT ist (10 Millionen)
+# Schwellenwert in USD, z.B. 10 Millionen
 OI_THRESHOLD_USDT = 10000000.0 
 
 order_lock = threading.Lock()
@@ -41,7 +39,6 @@ def sign_bingx(params):
     return hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
 def get_price_bingx(symbol):
-    # ... (Code wie oben) ...
     try:
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
         r = requests.get(url, params={"symbol": symbol}, timeout=10).json()
@@ -49,7 +46,6 @@ def get_price_bingx(symbol):
     except: return None
 
 def get_ohlcv(symbol, interval, limit=100):
-    # ... (Code wie oben) ...
     try:
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -60,7 +56,6 @@ def get_ohlcv(symbol, interval, limit=100):
 # ---------------- INDICATORS ----------------
 
 def calc_rsi(closes, period=14):
-    # ... (Code wie oben) ...
     if len(closes) < period + 1: return 50
     gains = [max(0, closes[-i] - closes[-i-1]) for i in range(1, period + 1)]
     losses = [abs(min(0, closes[-i] - closes[-i-1])) for i in range(1, period + 1)]
@@ -69,25 +64,20 @@ def calc_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ---------------- OPEN INTEREST LOGIC (COINGLASS) ----------------
-
-# In der Sektion 'OPEN INTEREST LOGIC'
+# ---------------- OPEN INTEREST LOGIC (COINGLASS FIX) ----------------
 
 def get_open_interest(symbol) -> float:
-    """ 
-    Ruft das gesamte Open Interest für das Symbol von CoinGlass ab (in USDT).
-    """
     if not COINGLASS_API_KEY:
         print("[FEHLER] COINGLASS_API_KEY ist nicht gesetzt. OI=-1.")
         return -1.0 
         
-    # Symbole konvertieren: BTC-USDT -> BTC
+    # Symbole konvertieren: FET-USDT -> FET
     base_currency = symbol.replace('-USDT', '')
     
     try:
-        url = f"{COINGLASS_BASE}openInterest"
+        # URL korrekt zusammensetzen
+        url = f"{COINGLASS_BASE_URL}/api/v1/futures/openInterest"
         headers = {"coinglassSecret": COINGLASS_API_KEY}
-        # Wir übergeben nur die Basis-Währung, nicht das volle Symbol-Paar
         params = {"symbol": base_currency} 
         
         r = requests.get(url, headers=headers, params=params, timeout=10).json()
@@ -95,27 +85,26 @@ def get_open_interest(symbol) -> float:
         if r.get("code") == "00000":
             data = r.get("data", {}).get("list", [])
             if data:
-                # Das letzte Element im Array ist der aktuellste Wert
                 oi_value = float(data[-1].get("openInterest"))
                 return oi_value
             else:
-                print(f"[FEHLER] CoinGlass API: Keine Daten im 'list' Array für {symbol}. OI=-1.")
+                print(f"[FEHLER] CoinGlass API: Keine Daten im 'list' Array für {symbol}. Code: {r.get('code')}. OI=-1.")
                 return -1.0
         else:
             print(f"[FEHLER] CoinGlass API Code: {r.get('code')}, Message: {r.get('msg')}. OI=-1.")
             return -1.0
 
     except requests.exceptions.RequestException as e:
+        # Hier sollte der "No scheme supplied" Fehler behoben sein
         print(f"[FEHLER] Netzwerk- oder Request-Problem beim Abrufen von CoinGlass: {e}. OI=-1.")
         return -1.0
     except Exception as e:
         print(f"[FEHLER] Unerwarteter Fehler beim Parsen der CoinGlass Daten: {e}. OI=-1.")
         return -1.0
 
-
 # ---------------- POSITION ACTIONS ----------------
+
 def has_active_position(symbol):
-    # ... (Code wie oben) ...
     try:
         ts = str(int(time.time() * 1000))
         params = {"symbol": symbol, "timestamp": ts}
@@ -125,8 +114,8 @@ def has_active_position(symbol):
              if abs(float(p.get("positionAmt", 0))) > 0: return True
         return False
     except: return False
+
 def close_position_market(symbol):
-    # ... (Code wie oben) ...
     ts = str(int(time.time() * 1000))
     params = {"symbol": symbol, "timestamp": ts}
     qs = urllib.parse.urlencode(sorted(params.items()))
@@ -134,8 +123,8 @@ def close_position_market(symbol):
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions?{qs}&signature={sig}"
     requests.post(url, headers={"X-BX-APIKEY": API_KEY})
     print(f"[EXIT] {symbol} Markt-Close ausgeführt.")
+
 def set_tp_sl(symbol, qty, tp_price, sl_price):
-    # ... (Code wie oben) ...
     exit_side = "BUY"
     def place_order(price, o_type):
         ts = str(int(time.time() * 1000))
@@ -150,24 +139,18 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
 
 # ---------------- MONITORING ----------------
 def monitor_trade(symbol, entry, tp, sl, be_trigger):
-    # ... (Code wie oben) ...
     be_active = False
     while has_active_position(symbol):
         curr = get_price_bingx(symbol)
         if not curr: time.sleep(2); continue
-        if not be_active and curr <= be_trigger:
-            be_active = True
-        if be_active and curr >= entry:
-            close_position_market(symbol)
-            break
-        if curr <= tp or curr >= sl:
-            close_position_market(symbol)
-            break
+        if not be_active and curr <= be_trigger: be_active = True
+        if be_active and curr >= entry: close_position_market(symbol); break
+        if curr <= tp or curr >= sl: close_position_market(symbol); break
         time.sleep(3)
     print(f"[MONITOR] Ende für {symbol}")
 
 
-# ---------------- EXECUTION LOGIC (NUR SHORT WENN RSI >= 80 & OI < Threshold) ----------------
+# ---------------- EXECUTION LOGIC ----------------
 
 def execute_trade_bingx(symbol, timeframe):
     with order_lock:
@@ -180,11 +163,11 @@ def execute_trade_bingx(symbol, timeframe):
         if not ohlcv_asset: return
         rsi = calc_rsi([float(c["close"]) for c in ohlcv_asset])
 
-        # 2. Open Interest Check mit CoinGlass
+        # 2. Open Interest Check
         open_interest_usdt = get_open_interest(symbol) 
         
         # 3. Filterbedingungen prüfen
-        # Prüfe, ob OI gültig (>0) und unter dem Schwellenwert liegt
+        # Prüfe: RSI >= 80 UND OI gültig (>0) UND OI < Schwellenwert
         if rsi >= 80 and open_interest_usdt > 0 and open_interest_usdt < OI_THRESHOLD_USDT:
             price = get_price_bingx(symbol)
             if not price: return
