@@ -71,37 +71,47 @@ def calc_rsi(closes, period=14):
 
 # ---------------- OPEN INTEREST LOGIC (COINGLASS) ----------------
 
+# In der Sektion 'OPEN INTEREST LOGIC'
+
 def get_open_interest(symbol) -> float:
     """ 
     Ruft das gesamte Open Interest für das Symbol von CoinGlass ab (in USDT).
     """
     if not COINGLASS_API_KEY:
-        print("[FEHLER] COINGLASS_API_KEY ist nicht gesetzt.")
-        return -1.0 # Fehlerwert
+        print("[FEHLER] COINGLASS_API_KEY ist nicht gesetzt. OI=-1.")
+        return -1.0 
         
     # Symbole konvertieren: BTC-USDT -> BTC
-    base_currency = symbol.split('-')[0]
+    base_currency = symbol.replace('-USDT', '')
     
     try:
         url = f"{COINGLASS_BASE}openInterest"
         headers = {"coinglassSecret": COINGLASS_API_KEY}
-        params = {"symbol": base_currency}
+        # Wir übergeben nur die Basis-Währung, nicht das volle Symbol-Paar
+        params = {"symbol": base_currency} 
         
         r = requests.get(url, headers=headers, params=params, timeout=10).json()
         
         if r.get("code") == "00000":
-            # Extrahiere das Gesamt-Open Interest
             data = r.get("data", {}).get("list", [])
             if data:
-                # Das letzte Element im Array ist der aktuelle Wert
-                return float(data[-1].get("openInterest")) 
-        
-        print(f"[FEHLER] CoinGlass Antwort Problem: {r.get('msg')}")
+                # Das letzte Element im Array ist der aktuellste Wert
+                oi_value = float(data[-1].get("openInterest"))
+                return oi_value
+            else:
+                print(f"[FEHLER] CoinGlass API: Keine Daten im 'list' Array für {symbol}. OI=-1.")
+                return -1.0
+        else:
+            print(f"[FEHLER] CoinGlass API Code: {r.get('code')}, Message: {r.get('msg')}. OI=-1.")
+            return -1.0
+
+    except requests.exceptions.RequestException as e:
+        print(f"[FEHLER] Netzwerk- oder Request-Problem beim Abrufen von CoinGlass: {e}. OI=-1.")
+        return -1.0
+    except Exception as e:
+        print(f"[FEHLER] Unerwarteter Fehler beim Parsen der CoinGlass Daten: {e}. OI=-1.")
         return -1.0
 
-    except Exception as e:
-        print(f"[FEHLER] Beim Abrufen von CoinGlass Daten: {e}")
-        return -1.0
 
 # ---------------- POSITION ACTIONS ----------------
 def has_active_position(symbol):
