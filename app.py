@@ -1,4 +1,4 @@
-# -------- V 2.6: BINGX FUTURES - NUR SHORT WENN RSI >= 80 --------
+# -------- V 4.4: BINGX FUTURES - NUR SHORT WENN RSI >= 80 (OHNE EMA/LONG) --------
 
 import time
 import hmac
@@ -19,10 +19,10 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
-# Globale Settings
-RSI_TIMEFRAME = "1m"
+# Globale Settings für die Short-Strategie
+RSI_TIMEFRAME = "1m"  # Standard-Timeframe für RSI-Berechnung
 TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.5, 1.5
-TRADE_SIZE = 10  # USDT
+TRADE_SIZE = 10    # USDT Einsatz
 LEVERAGE = 10
 
 # Lock gegen Race Conditions bei schnellen aufeinanderfolgenden Webhooks
@@ -41,7 +41,7 @@ def get_price_bingx(symbol):
         return float(r["data"]["price"])
     except: return None
 
-def get_ohlcv(symbol, interval="1m", limit=100):
+def get_ohlcv(symbol, interval, limit=100):
     try:
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -96,7 +96,7 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
     place_order(tp_price, "TAKE_PROFIT_MARKET")
     place_order(sl_price, "STOP_MARKET")
 
-# ---------------- MONITORING ----------------
+# ---------------- MONITORING (mit BE Logik) ----------------
 
 def monitor_trade(symbol, entry, tp, sl, be_trigger):
     be_active = False
@@ -123,40 +123,46 @@ def monitor_trade(symbol, entry, tp, sl, be_trigger):
         time.sleep(3)
     print(f"[MONITOR] Ende für {symbol}")
 
+
 # ---------------- EXECUTION LOGIC (NUR SHORT WENN RSI >= 80) ----------------
 
-def execute_trade_bingx(symbol):
+def execute_trade_bingx(symbol, timeframe):
     with order_lock:
+        # 1. Sicherheits-Check: Ist bereits eine Position offen?
         if has_active_position(symbol):
-            print(f"[SKIP] Position für {symbol} existiert bereits.")
+            print(f"[ABORT] Position für {symbol} existiert bereits.")
             return
-            
-        ohlcv_asset = get_ohlcv(symbol, RSI_TIMEFRAME)
+
+        # 2. RSI Check im definierten Timeframe
+        ohlcv_asset = get_ohlcv(symbol, timeframe)
         if not ohlcv_asset: return
         rsi = calc_rsi([float(c["close"]) for c in ohlcv_asset])
         
-        # NEUE FILTERBEDINGUNG: Nur ausführen, wenn RSI >= 80
+        # 3. Filterbedingung: Nur ausführen, wenn RSI >= 80
         if rsi >= 80:
             price = get_price_bingx(symbol)
             if not price: return
             
             qty = round(TRADE_SIZE / price, 6)
             
-            print(f"[ENTRY] SHORT {symbol} @ {price} | RSI: {rsi:.1f} (>= 80 Bedingung erfüllt)")
+            print(f"[ENTRY] SHORT {symbol} @ {price} | TF: {timeframe} | RSI: {rsi:.1f} (>= 80 Bedingung erfüllt)")
 
             ts = str(int(time.time() * 1000))
             entry_p = {"symbol": symbol, "side": "SELL", "positionSide": "SHORT", "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts}
-            requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_p.items()))}&signature={sign_bingx(entry_p)}", headers={"X-BX-APIKEY": API_KEY})
+            r = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_p.items()))}&signature={sign_bingx(entry_p)}", headers={"X-BX-APIKEY": API_KEY}).json()
 
-            time.sleep(2)
-            
-            # Kalkulationen TP/SL/BE für SHORT
-            tp = price * (1 - TP_PERCENT / 100)
-            sl = price * (1 + SL_PERCENT / 100)
-            be_trigger = price * (1 - BE_PERCENT / 100)
-            
-            set_tp_sl(symbol, qty, tp, sl)
-            threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger)).start()
+            if r.get("code") == 0:
+                time.sleep(2)
+                # 4. Kalkulationen TP/SL/BE für SHORT
+                tp = price * (1 - TP_PERCENT / 100)
+                sl = price * (1 + SL_PERCENT / 100)
+                be_trigger = price * (1 - BE_PERCENT / 100)
+                
+                set_tp_sl(symbol, qty, tp, sl)
+                # 5. Monitoring Thread starten (inkl. BE Logik)
+                threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger)).start()
+            else:
+                print(f"[ERROR] Order fehlgeschlagen: {r}")
         
         else:
             print(f"[RSI FILTER] Kein Einstiegssignal für {symbol}. RSI={rsi:.1f} ist unter 80.")
@@ -164,16 +170,21 @@ def execute_trade_bingx(symbol):
 
 # ---------------- WEBHOOK ----------------
 
-@app.route("/testorder", methods=["POST", "GET"])
+@app.route("/testorder", methods=["POST"])
 def handle_alert():
-    if request.method == "GET": return jsonify({"status": "ok"}), 200
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
-    if not currency: return jsonify({"status": "ignored"}), 200
+    # Erlaubt "tf" im Webhook zu senden, sonst Standard-RSI-TF
+    tf = data.get("tf", RSI_TIMEFRAME) 
+    
+    if not currency: 
+        return jsonify({"status": "no_currency"}), 400
+    
     symbol = f"{currency}-USDT"
     
-    # Startet die Logik im Hintergrund (die Logik selbst prüft auf offene Positionen)
-    threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
+    # Thread starten zur Ausführung
+    threading.Thread(target=execute_trade_bingx, args=(symbol, tf)).start()
+    
     return jsonify({"status": "processing", "symbol": symbol}), 200
 
 if __name__ == "__main__":
