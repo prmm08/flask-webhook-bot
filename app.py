@@ -1,4 +1,4 @@
-# -------- V 3.2: BINGX ONLY SHORT REVERSAL (OHNE EMA FILTER) --------
+# -------- V 2.6: BINGX FUTURES - NUR SHORT WENN RSI >= 80 --------
 
 import time
 import hmac
@@ -19,13 +19,13 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
-# Globale Settings für Reversal-Shorts
-TP_PERCENT = 3.0   # Take Profit
-SL_PERCENT = 1.5   # Stop Loss
-LEVERAGE = 10      # Hebel
-TRADE_SIZE = 10    # USDT Einsatz
+# Globale Settings
+RSI_TIMEFRAME = "1m"
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.5, 1.5
+TRADE_SIZE = 10  # USDT
+LEVERAGE = 10
 
-# Lock gegen Race Conditions
+# Lock gegen Race Conditions bei schnellen aufeinanderfolgenden Webhooks
 order_lock = threading.Lock()
 
 # ---------------- SIGNING & HELPERS ----------------
@@ -41,98 +41,140 @@ def get_price_bingx(symbol):
         return float(r["data"]["price"])
     except: return None
 
+def get_ohlcv(symbol, interval="1m", limit=100):
+    try:
+        url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = requests.get(url, params=params, timeout=10).json()
+        return r.get("data", [])
+    except: return []
+
+# ---------------- INDICATORS ----------------
+
+def calc_rsi(closes, period=14):
+    if len(closes) < period + 1: return 50
+    gains = [max(0, closes[-i] - closes[-i-1]) for i in range(1, period + 1)]
+    losses = [abs(min(0, closes[-i] - closes[-i-1])) for i in range(1, period + 1)]
+    avg_gain = sum(gains) / period or 0.0001
+    avg_loss = sum(losses) / period or 0.0001
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
 # ---------------- POSITION ACTIONS ----------------
 
 def has_active_position(symbol):
-    """ Prüft, ob bereits eine Position für diesen Coin offen ist """
+    """ Prüft ob eine Position existiert """
     try:
         ts = str(int(time.time() * 1000))
         params = {"symbol": symbol, "timestamp": ts}
         params["signature"] = sign_bingx(params)
         r = requests.get(f"{BINGX_BASE}/openApi/swap/v2/user/positions", params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
         for p in r.get("data", []):
-             if abs(float(p.get("positionAmt", 0))) > 0: 
-                 return True
+             if abs(float(p.get("positionAmt", 0))) > 0: return True
         return False
-    except: 
-        return False
+    except: return False
+
+def close_position_market(symbol):
+    ts = str(int(time.time() * 1000))
+    params = {"symbol": symbol, "timestamp": ts}
+    qs = urllib.parse.urlencode(sorted(params.items()))
+    sig = sign_bingx(params)
+    url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions?{qs}&signature={sig}"
+    requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+    print(f"[EXIT] {symbol} Markt-Close ausgeführt.")
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
-    """ Setzt Take Profit und Stop Loss für Short (Exit-Seite ist BUY) """
+    exit_side = "BUY" # Exit side for SHORT
     def place_order(price, o_type):
         ts = str(int(time.time() * 1000))
         params = {
-            "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
+            "symbol": symbol, "side": exit_side, "positionSide": "SHORT",
             "type": o_type, "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
             "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts
         }
-        qs = urllib.parse.urlencode(sorted(params.items()))
-        sig = sign_bingx(params)
-        url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}"
-        requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-    
+        requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}", headers={"X-BX-APIKEY": API_KEY})
     place_order(tp_price, "TAKE_PROFIT_MARKET")
     place_order(sl_price, "STOP_MARKET")
 
-# ---------------- EXECUTION LOGIC ----------------
+# ---------------- MONITORING ----------------
 
-def execute_reversal_short(symbol):
-    with order_lock:
-        # 1. Double-Order Check
-        if has_active_position(symbol):
-            print(f"[SKIP] Short für {symbol} bereits aktiv.")
-            return
+def monitor_trade(symbol, entry, tp, sl, be_trigger):
+    be_active = False
+    while has_active_position(symbol):
+        curr = get_price_bingx(symbol)
+        if not curr: time.sleep(2); continue
 
-        # 2. Preis abfragen
-        price = get_price_bingx(symbol)
-        if not price: return
+        # Prüfe, ob BE-Trigger erreicht wurde (Profit bei SHORT: Preis < Trigger)
+        if not be_active and curr <= be_trigger:
+            be_active = True
+            print(f"[BE STATUS] {symbol} Profit erreicht. BE-Schutz ist jetzt scharf.")
 
-        # 3. Mengenberechnung
-        qty = round(TRADE_SIZE / price, 6)
+        # Wenn BE scharf ist: Schließen sobald Kurs zurück am Entry ist (Preis > Entry)
+        if be_active and curr >= entry:
+            print(f"[BE EXIT] {symbol} Kurs zurück am Entry. Schließe Position.")
+            close_position_market(symbol)
+            break
         
-        print(f"[REVERSAL SHORT] Trigger für {symbol} bei Preis {price}")
+        # Lokaler Sicherheits-Check auf TP oder SL
+        if curr <= tp or curr >= sl:
+            close_position_market(symbol)
+            break
 
-        # 4. Market Short Order platzieren
-        ts = str(int(time.time() * 1000))
-        entry_p = {
-            "symbol": symbol, 
-            "side": "SELL", 
-            "positionSide": "SHORT", 
-            "type": "MARKET", 
-            "quantity": str(qty), 
-            "leverage": str(LEVERAGE), 
-            "timestamp": ts
-        }
-        qs = urllib.parse.urlencode(sorted(entry_p.items()))
-        sig = sign_bingx(entry_p)
-        r = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY}).json()
+        time.sleep(3)
+    print(f"[MONITOR] Ende für {symbol}")
 
-        if r.get("code") == 0:
+# ---------------- EXECUTION LOGIC (NUR SHORT WENN RSI >= 80) ----------------
+
+def execute_trade_bingx(symbol):
+    with order_lock:
+        if has_active_position(symbol):
+            print(f"[SKIP] Position für {symbol} existiert bereits.")
+            return
+            
+        ohlcv_asset = get_ohlcv(symbol, RSI_TIMEFRAME)
+        if not ohlcv_asset: return
+        rsi = calc_rsi([float(c["close"]) for c in ohlcv_asset])
+        
+        # NEUE FILTERBEDINGUNG: Nur ausführen, wenn RSI >= 80
+        if rsi >= 80:
+            price = get_price_bingx(symbol)
+            if not price: return
+            
+            qty = round(TRADE_SIZE / price, 6)
+            
+            print(f"[ENTRY] SHORT {symbol} @ {price} | RSI: {rsi:.1f} (>= 80 Bedingung erfüllt)")
+
+            ts = str(int(time.time() * 1000))
+            entry_p = {"symbol": symbol, "side": "SELL", "positionSide": "SHORT", "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts}
+            requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_p.items()))}&signature={sign_bingx(entry_p)}", headers={"X-BX-APIKEY": API_KEY})
+
             time.sleep(2)
-            # 5. TP / SL Kalkulation (Short: TP unten, SL oben)
+            
+            # Kalkulationen TP/SL/BE für SHORT
             tp = price * (1 - TP_PERCENT / 100)
             sl = price * (1 + SL_PERCENT / 100)
+            be_trigger = price * (1 - BE_PERCENT / 100)
+            
             set_tp_sl(symbol, qty, tp, sl)
-            print(f"[SUCCESS] Short {symbol} gesetzt. TP: {tp:.4f}, SL: {sl:.4f}")
+            threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger)).start()
+        
         else:
-            print(f"[ERROR] Order fehlgeschlagen: {r}")
+            print(f"[RSI FILTER] Kein Einstiegssignal für {symbol}. RSI={rsi:.1f} ist unter 80.")
+
 
 # ---------------- WEBHOOK ----------------
 
-@app.route("/testorder", methods=["POST"])
+@app.route("/testorder", methods=["POST", "GET"])
 def handle_alert():
+    if request.method == "GET": return jsonify({"status": "ok"}), 200
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
-    
-    if not currency: 
-        return jsonify({"status": "error", "message": "no_currency"}), 400
-    
+    if not currency: return jsonify({"status": "ignored"}), 200
     symbol = f"{currency}-USDT"
     
-    # Starte Short-Logik in eigenem Thread
-    threading.Thread(target=execute_reversal_short, args=(symbol,)).start()
-    
-    return jsonify({"status": "short_triggered", "symbol": symbol}), 200
+    # Startet die Logik im Hintergrund (die Logik selbst prüft auf offene Positionen)
+    threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
+    return jsonify({"status": "processing", "symbol": symbol}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
