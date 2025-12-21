@@ -1,4 +1,4 @@
-# -------- V 3.1: BINGX DUAL EMA TREND FILTER (BTC & COIN) --------
+# -------- V 3.2: BINGX ONLY SHORT REVERSAL (OHNE EMA FILTER) --------
 
 import time
 import hmac
@@ -19,12 +19,13 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
-# Globale Settings
-DEFAULT_TF = "30m"  # Standard Timeframe für BTC und Coin
-MA_PERIOD = 50
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.5, 1.0, 0.5
+# Globale Settings für Reversal-Shorts
+TP_PERCENT = 1.5   # Take Profit
+SL_PERCENT = 1.0   # Stop Loss
+LEVERAGE = 10      # Hebel
+TRADE_SIZE = 10    # USDT Einsatz
 
-# Lock gegen Race Conditions bei schnellen aufeinanderfolgenden Webhooks
+# Lock gegen Race Conditions
 order_lock = threading.Lock()
 
 # ---------------- SIGNING & HELPERS ----------------
@@ -40,26 +41,10 @@ def get_price_bingx(symbol):
         return float(r["data"]["price"])
     except: return None
 
-def get_ohlcv(symbol, interval, limit=100):
-    try:
-        url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        r = requests.get(url, params=params, timeout=10).json()
-        return r.get("data", [])
-    except: return []
-
-def calc_ema(closes, period):
-    if len(closes) < period: return closes[-1]
-    alpha = 2 / (period + 1)
-    ema = closes[0]
-    for price in closes:
-        ema = (price * alpha) + (ema * (1 - alpha))
-    return ema
-
 # ---------------- POSITION ACTIONS ----------------
 
 def has_active_position(symbol):
-    """ Prüft ob eine Position ODER eine offene Order existiert """
+    """ Prüft, ob bereits eine Position für diesen Coin offen ist """
     try:
         ts = str(int(time.time() * 1000))
         params = {"symbol": symbol, "timestamp": ts}
@@ -70,23 +55,14 @@ def has_active_position(symbol):
                  return True
         return False
     except: 
-        return True # Im Zweifel True zurückgeben, um Doppel-Orders zu vermeiden
+        return False
 
-def close_position_market(symbol):
-    ts = str(int(time.time() * 1000))
-    params = {"symbol": symbol, "timestamp": ts}
-    qs = urllib.parse.urlencode(sorted(params.items()))
-    sig = sign_bingx(params)
-    url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions?{qs}&signature={sig}"
-    requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-    print(f"[EXIT] {symbol} Markt-Close ausgeführt.")
-
-def set_tp_sl(symbol, qty, tp_price, sl_price, side):
-    exit_side = "SELL" if side == "LONG" else "BUY"
+def set_tp_sl(symbol, qty, tp_price, sl_price):
+    """ Setzt Take Profit und Stop Loss für Short (Exit-Seite ist BUY) """
     def place_order(price, o_type):
         ts = str(int(time.time() * 1000))
         params = {
-            "symbol": symbol, "side": exit_side, "positionSide": side,
+            "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
             "type": o_type, "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
             "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts
         }
@@ -100,58 +76,46 @@ def set_tp_sl(symbol, qty, tp_price, sl_price, side):
 
 # ---------------- EXECUTION LOGIC ----------------
 
-def execute_trade_bingx(symbol, timeframe):
+def execute_reversal_short(symbol):
     with order_lock:
-        # 1. Sicherheits-Check: Ist bereits eine Position offen?
+        # 1. Double-Order Check
         if has_active_position(symbol):
-            print(f"[ABORT] Position für {symbol} existiert bereits.")
+            print(f"[SKIP] Short für {symbol} bereits aktiv.")
             return
 
-        # 2. Trend Check BTC
-        ohlcv_btc = get_ohlcv("BTC-USDT", timeframe, limit=MA_PERIOD + 20)
-        if not ohlcv_btc: return
-        closes_btc = [float(c["close"]) for c in ohlcv_btc]
-        ema_btc = calc_ema(closes_btc, MA_PERIOD)
-        price_btc = closes_btc[-1]
+        # 2. Preis abfragen
+        price = get_price_bingx(symbol)
+        if not price: return
 
-        # 3. Trend Check COIN
-        ohlcv_coin = get_ohlcv(symbol, timeframe, limit=MA_PERIOD + 20)
-        if not ohlcv_coin: return
-        closes_coin = [float(c["close"]) for c in ohlcv_coin]
-        ema_coin = calc_ema(closes_coin, MA_PERIOD)
-        price_coin = closes_coin[-1]
-
-        # 4. Dual EMA Bedingung prüfen
-        trade_side = None
-        if price_btc > ema_btc and price_coin > ema_coin:
-            trade_side = "LONG"
-        elif price_btc < ema_btc and price_coin < ema_coin:
-            trade_side = "SHORT"
-
-        if not trade_side:
-            print(f"[FILTER] {symbol} Trends nicht synchron (BTC vs Coin). Kein Trade.")
-            return
-
-        # 5. Order Platzierung
-        trade_size_usdt, leverage = 10, 10
-        qty = round(trade_size_usdt / price_coin, 6)
-        order_side = "BUY" if trade_side == "LONG" else "SELL"
+        # 3. Mengenberechnung
+        qty = round(TRADE_SIZE / price, 6)
         
-        print(f"[ENTRY] {trade_side} {symbol} | BTC > EMA: {price_btc > ema_btc} | {symbol} > EMA: {price_coin > ema_coin}")
+        print(f"[REVERSAL SHORT] Trigger für {symbol} bei Preis {price}")
 
+        # 4. Market Short Order platzieren
         ts = str(int(time.time() * 1000))
-        entry_p = {"symbol": symbol, "side": order_side, "positionSide": trade_side, "type": "MARKET", "quantity": str(qty), "leverage": str(leverage), "timestamp": ts}
+        entry_p = {
+            "symbol": symbol, 
+            "side": "SELL", 
+            "positionSide": "SHORT", 
+            "type": "MARKET", 
+            "quantity": str(qty), 
+            "leverage": str(LEVERAGE), 
+            "timestamp": ts
+        }
         qs = urllib.parse.urlencode(sorted(entry_p.items()))
         sig = sign_bingx(entry_p)
-        requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY})
+        r = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{qs}&signature={sig}", headers={"X-BX-APIKEY": API_KEY}).json()
 
-        # Kurze Pause für API-Sync
-        time.sleep(2)
-        
-        # TP/SL/BE Kalkulation
-        tp = price_coin * (1 + TP_PERCENT/100) if trade_side == "LONG" else price_coin * (1 - TP_PERCENT/100)
-        sl = price_coin * (1 - SL_PERCENT/100) if trade_side == "LONG" else price_coin * (1 + SL_PERCENT/100)
-        set_tp_sl(symbol, qty, tp, sl, trade_side)
+        if r.get("code") == 0:
+            time.sleep(2)
+            # 5. TP / SL Kalkulation (Short: TP unten, SL oben)
+            tp = price * (1 - TP_PERCENT / 100)
+            sl = price * (1 + SL_PERCENT / 100)
+            set_tp_sl(symbol, qty, tp, sl)
+            print(f"[SUCCESS] Short {symbol} gesetzt. TP: {tp:.4f}, SL: {sl:.4f}")
+        else:
+            print(f"[ERROR] Order fehlgeschlagen: {r}")
 
 # ---------------- WEBHOOK ----------------
 
@@ -159,18 +123,16 @@ def execute_trade_bingx(symbol, timeframe):
 def handle_alert():
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
-    tf = data.get("tf", DEFAULT_TF) # Erlaubt "tf" im Webhook zu senden
     
     if not currency: 
-        return jsonify({"status": "no_currency"}), 400
+        return jsonify({"status": "error", "message": "no_currency"}), 400
     
     symbol = f"{currency}-USDT"
     
-    # Thread starten zur Ausführung
-    threading.Thread(target=execute_trade_bingx, args=(symbol, tf)).start()
+    # Starte Short-Logik in eigenem Thread
+    threading.Thread(target=execute_reversal_short, args=(symbol,)).start()
     
-    return jsonify({"status": "processing", "symbol": symbol}), 200
+    return jsonify({"status": "short_triggered", "symbol": symbol}), 200
 
 if __name__ == "__main__":
-    # Port 5000 ist Standard
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
