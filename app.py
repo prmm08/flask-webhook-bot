@@ -24,10 +24,10 @@ app = Flask(__name__)
 
 # Globale Settings
 RSI_TIMEFRAME = "1m"
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 4.5, 1.5, 0.5
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.5, 3.0
 TRADE_SIZE = 10    
 LEVERAGE = 10
-OI_THRESHOLD_USDT = 20000000.0 
+OI_THRESHOLD_USDT = 10000000.0 
 
 order_lock = threading.Lock()
 
