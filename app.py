@@ -1,4 +1,4 @@
-# -------- V 2.6 LONG: BINGX FUTURES - NUR LONG WENN RSI >= 75 --------
+# -------- V 2.6 LONG: BINGX FUTURES - NUR LONG WENN RSI >= 70 --------
 
 import time
 import hmac
@@ -21,7 +21,7 @@ app = Flask(__name__)
 
 # Globale Settings
 RSI_TIMEFRAME = "1m"
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.5, 3.0, 1.5
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 3.0, 1.5, 3.0
 TRADE_SIZE = 10  # USDT
 LEVERAGE = 10
 
@@ -118,7 +118,7 @@ def monitor_trade(symbol, entry, tp, sl, be_trigger):
 
         time.sleep(3)
 
-# ---------------- EXECUTION LOGIC (NUR LONG WENN RSI >= 75) ----------------
+# ---------------- EXECUTION LOGIC (NUR LONG WENN RSI >= 70) ----------------
 
 def execute_trade_bingx(symbol):
     with order_lock:
@@ -130,14 +130,14 @@ def execute_trade_bingx(symbol):
         if not ohlcv_asset: return
         rsi = calc_rsi([float(c["close"]) for c in ohlcv_asset])
         
-        # BEDINGUNG: RSI >= 75 für LONG
-        if rsi >= 75:
+        # BEDINGUNG: RSI >= 70 für LONG
+        if rsi >= 70:
             price = get_price_bingx(symbol)
             if not price: return
             
             qty = round(TRADE_SIZE / price, 6)
             
-            print(f"[ENTRY] LONG {symbol} @ {price} | RSI: {rsi:.1f} (>= 75 Bedingung erfüllt)")
+            print(f"[ENTRY] LONG {symbol} @ {price} | RSI: {rsi:.1f} (>= 70 Bedingung erfüllt)")
 
             ts = str(int(time.time() * 1000))
             # side: BUY, positionSide: LONG
@@ -155,7 +155,7 @@ def execute_trade_bingx(symbol):
             threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger)).start()
         
         else:
-            print(f"[RSI FILTER] Kein Signal für {symbol}. RSI={rsi:.1f} ist unter 75.")
+            print(f"[RSI FILTER] Kein Signal für {symbol}. RSI={rsi:.1f} ist unter 70.")
 
 # ---------------- WEBHOOK ----------------
 
