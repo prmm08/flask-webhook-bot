@@ -21,7 +21,7 @@ app = Flask(__name__)
 
 # Globale Settings
 RSI_TIMEFRAME = "1m"
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.5, 1.5, 2.0
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.5, 3.0, 0.5
 TRADE_SIZE = 80  # USDT
 LEVERAGE = 20
 
@@ -94,7 +94,29 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
 
 # ---------------- MONITORING ----------------
 
+def monitor_trade(symbol, entry, tp, sl, be_trigger):
+    be_active = False
+    while has_active_position(symbol):
+        curr = get_price_bingx(symbol)
+        if not curr: time.sleep(2); continue
 
+        # Profit bei LONG: Preis > Trigger
+        if not be_active and curr >= be_trigger:
+            be_active = True
+            print(f"[BE STATUS] {symbol} Profit erreicht. BE-Schutz ist jetzt scharf.")
+
+        # Wenn BE scharf ist: Schließen sobald Kurs zurück am Entry ist (Preis <= Entry)
+        if be_active and curr <= entry:
+            print(f"[BE EXIT] {symbol} Kurs zurück am Entry. Schließe Position.")
+            close_position_market(symbol)
+            break
+        
+        # Lokaler Sicherheits-Check auf TP (oben) oder SL (unten)
+        if curr >= tp or curr <= sl:
+            close_position_market(symbol)
+            break
+
+        time.sleep(3)
 
 # ---------------- EXECUTION LOGIC (NUR LONG WENN RSI >= 75) ----------------
 
@@ -130,7 +152,7 @@ def execute_trade_bingx(symbol):
             be_trigger = price * (1 + BE_PERCENT / 100)
             
             set_tp_sl(symbol, qty, tp, sl)
-            #threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger)).start()
+            threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger)).start()
         
         else:
             print(f"[RSI FILTER] Kein Signal für {symbol}. RSI={rsi:.1f} ist unter 75.")
