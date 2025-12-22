@@ -88,7 +88,7 @@ def execute_trade_bingx(symbol):
     rsi = calc_rsi([float(c["close"]) for c in ohlcv_asset])
     
     # NEUE BEDINGUNG: Nur wenn RSI >= 70
-    if RSI >= 70:
+    if rsi >= 70:
         price = get_price_bingx(symbol)
         if not price: return
         qty = round(TRADE_SIZE / price, 6)
@@ -126,7 +126,7 @@ def execute_trade_bingx(symbol):
         set_tp_sl(symbol, qty, tp_short, sl_short, side_short)
         
     else:
-        print(f"[RSI FILTER] Kein Signal für {symbol}. RSI={rsi:.1f} ist unter 75.")
+        print(f"[RSI FILTER] Kein Signal für {symbol}. RSI={rsi:.1f} ist unter 70.")
 
 # ---------------- WEBHOOK ----------------
 
