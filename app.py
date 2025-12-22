@@ -21,7 +21,7 @@ app = Flask(__name__)
 
 # Globale Settings
 RSI_TIMEFRAME = "1m"
-TP_PERCENT, SL_PERCENT = 1.0, 1.5 # BE_PERCENT entfernt
+TP_PERCENT, SL_PERCENT = 1.5, 0.5 # BE_PERCENT entfernt
 TRADE_SIZE = 10  # USDT (Größe PRO Position, d.h. 20 USDT total pro Signal)
 LEVERAGE = 10
 
