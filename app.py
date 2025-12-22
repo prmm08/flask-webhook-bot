@@ -94,29 +94,7 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
 
 # ---------------- MONITORING ----------------
 
-def monitor_trade(symbol, entry, tp, sl, be_trigger):
-    be_active = False
-    while has_active_position(symbol):
-        curr = get_price_bingx(symbol)
-        if not curr: time.sleep(2); continue
 
-        # Profit bei LONG: Preis > Trigger
-        if not be_active and curr >= be_trigger:
-            be_active = True
-            print(f"[BE STATUS] {symbol} Profit erreicht. BE-Schutz ist jetzt scharf.")
-
-        # Wenn BE scharf ist: Schließen sobald Kurs zurück am Entry ist (Preis <= Entry)
-        if be_active and curr <= entry:
-            print(f"[BE EXIT] {symbol} Kurs zurück am Entry. Schließe Position.")
-            close_position_market(symbol)
-            break
-        
-        # Lokaler Sicherheits-Check auf TP (oben) oder SL (unten)
-        if curr >= tp or curr <= sl:
-            close_position_market(symbol)
-            break
-
-        time.sleep(3)
 
 # ---------------- EXECUTION LOGIC (NUR LONG WENN RSI >= 70) ----------------
 
