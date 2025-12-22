@@ -130,7 +130,7 @@ def execute_trade_bingx(symbol):
             be_trigger = price * (1 + BE_PERCENT / 100)
             
             set_tp_sl(symbol, qty, tp, sl)
-            threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger)).start()
+            #threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger)).start()
         
         else:
             print(f"[RSI FILTER] Kein Signal für {symbol}. RSI={rsi:.1f} ist unter 70.")
