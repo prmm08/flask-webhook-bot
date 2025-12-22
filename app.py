@@ -1,4 +1,4 @@
-# -------- V 2.7: BINGX FUTURES - LONG (RSI >= 75) & SHORT (RSI <= 50) --------
+# -------- V 2.6 LONG: BINGX FUTURES - NUR LONG WENN RSI >= 75 --------
 
 import time
 import hmac
@@ -79,52 +79,46 @@ def close_position_market(symbol):
     requests.post(url, headers={"X-BX-APIKEY": API_KEY})
     print(f"[EXIT] {symbol} Markt-Close ausgeführt.")
 
-def set_tp_sl(symbol, qty, tp_price, sl_price, side):
-    # Wenn wir LONG sind (BUY), ist der Exit SELL. Wenn wir SHORT sind (SELL), ist der Exit BUY.
-    exit_side = "SELL" if side == "LONG" else "BUY"
-    
+def set_tp_sl(symbol, qty, tp_price, sl_price):
+    exit_side = "SELL" # Exit side for LONG
     def place_order(price, o_type):
         ts = str(int(time.time() * 1000))
         params = {
-            "symbol": symbol, "side": exit_side, "positionSide": side,
+            "symbol": symbol, "side": exit_side, "positionSide": "LONG",
             "type": o_type, "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
             "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts
         }
         requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}", headers={"X-BX-APIKEY": API_KEY})
-    
     place_order(tp_price, "TAKE_PROFIT_MARKET")
     place_order(sl_price, "STOP_MARKET")
 
 # ---------------- MONITORING ----------------
 
-def monitor_trade(symbol, entry, tp, sl, be_trigger, side):
+def monitor_trade(symbol, entry, tp, sl, be_trigger):
     be_active = False
     while has_active_position(symbol):
         curr = get_price_bingx(symbol)
         if not curr: time.sleep(2); continue
 
-        if side == "LONG":
-            # Break-Even Aktivierung
-            if not be_active and curr >= be_trigger:
-                be_active = True
-                print(f"[BE STATUS] {symbol} (LONG) Profit erreicht. BE-Schutz scharf.")
-            # Break-Even Exit oder TP/SL Check
-            if (be_active and curr <= entry) or (curr >= tp or curr <= sl):
-                close_position_market(symbol)
-                break
-        else: # SHORT
-            # Break-Even Aktivierung (Preis fällt unter Trigger)
-            if not be_active and curr <= be_trigger:
-                be_active = True
-                print(f"[BE STATUS] {symbol} (SHORT) Profit erreicht. BE-Schutz scharf.")
-            # Break-Even Exit (Preis steigt zurück auf Entry) oder TP/SL Check
-            if (be_active and curr >= entry) or (curr <= tp or curr >= sl):
-                close_position_market(symbol)
-                break
+        # Profit bei LONG: Preis > Trigger
+        if not be_active and curr >= be_trigger:
+            be_active = True
+            print(f"[BE STATUS] {symbol} Profit erreicht. BE-Schutz ist jetzt scharf.")
+
+        # Wenn BE scharf ist: Schließen sobald Kurs zurück am Entry ist (Preis <= Entry)
+        if be_active and curr <= entry:
+            print(f"[BE EXIT] {symbol} Kurs zurück am Entry. Schließe Position.")
+            close_position_market(symbol)
+            break
+        
+        # Lokaler Sicherheits-Check auf TP (oben) oder SL (unten)
+        if curr >= tp or curr <= sl:
+            close_position_market(symbol)
+            break
 
         time.sleep(3)
 
-# ---------------- EXECUTION LOGIC ----------------
+# ---------------- EXECUTION LOGIC (NUR LONG WENN RSI >= 75) ----------------
 
 def execute_trade_bingx(symbol):
     with order_lock:
@@ -136,45 +130,32 @@ def execute_trade_bingx(symbol):
         if not ohlcv_asset: return
         rsi = calc_rsi([float(c["close"]) for c in ohlcv_asset])
         
-        side = None
+        # BEDINGUNG: RSI >= 75 für LONG
         if rsi >= 75:
-            side = "LONG"
-        elif rsi <= 50:
-            side = "SHORT"
-            
-        if side:
             price = get_price_bingx(symbol)
             if not price: return
+            
             qty = round(TRADE_SIZE / price, 6)
             
-            print(f"[ENTRY] {side} {symbol} @ {price} | RSI: {rsi:.1f}")
+            print(f"[ENTRY] LONG {symbol} @ {price} | RSI: {rsi:.1f} (>= 75 Bedingung erfüllt)")
 
             ts = str(int(time.time() * 1000))
-            order_side = "BUY" if side == "LONG" else "SELL"
-            
-            entry_p = {
-                "symbol": symbol, "side": order_side, "positionSide": side, 
-                "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts
-            }
+            # side: BUY, positionSide: LONG
+            entry_p = {"symbol": symbol, "side": "BUY", "positionSide": "LONG", "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts}
             requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_p.items()))}&signature={sign_bingx(entry_p)}", headers={"X-BX-APIKEY": API_KEY})
 
             time.sleep(2)
             
-            # Kalkulationen basierend auf Richtung
-            if side == "LONG":
-                tp = price * (1 + TP_PERCENT / 100)
-                sl = price * (1 - SL_PERCENT / 100)
-                be_trigger = price * (1 + BE_PERCENT / 100)
-            else: # SHORT
-                tp = price * (1 - TP_PERCENT / 100)
-                sl = price * (1 + SL_PERCENT / 100)
-                be_trigger = price * (1 - BE_PERCENT / 100)
+            # Kalkulationen für LONG
+            tp = price * (1 + TP_PERCENT / 100)
+            sl = price * (1 - SL_PERCENT / 100)
+            be_trigger = price * (1 + BE_PERCENT / 100)
             
-            set_tp_sl(symbol, qty, tp, sl, side)
-            threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger, side)).start()
+            set_tp_sl(symbol, qty, tp, sl)
+            threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger)).start()
         
         else:
-            print(f"[RSI FILTER] Kein Signal für {symbol}. RSI={rsi:.1f} (Neutral).")
+            print(f"[RSI FILTER] Kein Signal für {symbol}. RSI={rsi:.1f} ist unter 75.")
 
 # ---------------- WEBHOOK ----------------
 
