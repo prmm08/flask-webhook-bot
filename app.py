@@ -22,8 +22,8 @@ app = Flask(__name__)
 # Globale Settings
 RSI_TIMEFRAME = "1m"
 TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.5, 1.5, 2.0
-TRADE_SIZE = 10  # USDT
-LEVERAGE = 10
+TRADE_SIZE = 40  # USDT
+LEVERAGE = 20
 
 order_lock = threading.Lock()
 
