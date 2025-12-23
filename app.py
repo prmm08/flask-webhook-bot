@@ -1,4 +1,4 @@
-# -------- V 3.5: BINGX FUTURES - VERBESSERTES LOGGING/FEHLERANALYSE --------
+# -------- V 3.6: BINGX FUTURES - FIX SIGNATURE ERROR (100001) --------
 
 import time
 import hmac
@@ -15,78 +15,64 @@ API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
-# Setup Logging, um Flask's Output besser zu sehen
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
 # --- Strategie Settings ---
-RSI_TIMEFRAME = "1m"
-RSI_PERIOD = 14
-RSI_THRESHOLD = 75
-
-EMA_TIMEFRAME = "5m"
-EMA_PERIOD = 50
-
-LEVERAGE = 10
-TRADE_SIZE = 10
+RSI_TIMEFRAME, RSI_PERIOD, RSI_THRESHOLD = "1m", 14, 75
+EMA_TIMEFRAME, EMA_PERIOD = "5m", 50
+LEVERAGE, TRADE_SIZE = 10, 10
 TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.0, 1.5, 0.5 
 
 # ---------------- SIGNING & HELPERS ----------------
 
-def sign_bingx(params):
-    query_string = urllib.parse.urlencode(sorted(params.items()))
-    return hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
-
-def send_signed_request(method, endpoint, params, headers=None):
-    """Zentralisierte Funktion für API Requests mit Logging."""
+def send_signed_request(method, endpoint, params):
+    """Verbesserte Signatur-Logik für BingX V2 API."""
     try:
-        url = f"{BINGX_BASE}{endpoint}"
+        # 1. Timestamp hinzufügen falls nötig
+        if method == "POST" or "user" in endpoint:
+            params["timestamp"] = str(int(time.time() * 1000))
         
-        # Signatur berechnen
-        if 'timestamp' in params:
-            params["signature"] = sign_bingx(params)
-            qs = urllib.parse.urlencode(sorted(params.items()))
-            full_url = f"{url}?{qs}"
-        else:
-            # Für GET/Price Endpunkte ohne Signatur
-            full_url = f"{url}?{urllib.parse.urlencode(params)}"
+        # 2. Parameter alphabetisch sortieren für den Query String
+        sorted_params = collections.OrderedDict(sorted(params.items()))
+        query_string = urllib.parse.urlencode(sorted_params)
         
-        # Headers für authentifizierte Requests
-        request_headers = {"X-BX-APIKEY": API_KEY}
-        if headers:
-            request_headers.update(headers)
+        # 3. Signatur NUR über den Query String generieren
+        signature = hmac.new(
+            API_SECRET.encode("utf-8"), 
+            query_string.encode("utf-8"), 
+            hashlib.sha256
+        ).hexdigest()
+        
+        full_url = f"{BINGX_BASE}{endpoint}?{query_string}&signature={signature}"
+        headers = {"X-BX-APIKEY": API_KEY, "Accept": "application/json"}
 
-        logging.info(f"Sending Request: {method} {full_url}")
+        logging.info(f"Request: {method} {endpoint}")
         
         if method == "POST":
-            r = requests.post(full_url, headers=request_headers, timeout=10)
-        elif method == "GET":
-            r = requests.get(full_url, headers=request_headers, timeout=10)
+            r = requests.post(full_url, headers=headers, timeout=10)
+        else:
+            r = requests.get(full_url, headers=headers, timeout=10)
         
-        # Logge die rohe Antwort
-        logging.info(f"API Response ({endpoint}): {r.status_code} - {r.text}")
-        r.raise_for_status() # Löst Ausnahme bei 4xx/5xx Fehlern aus
-        return r.json()
+        res_json = r.json()
+        if res_json.get("code") != 0:
+            logging.error(f"BingX Error {res_json.get('code')}: {res_json.get('msg')}")
+        return res_json
 
-    except requests.exceptions.HTTPError as e:
-        logging.error(f"HTTP Error for {endpoint}: {e.response.text}")
-        return None
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Network Error for {endpoint}: {e}")
+    except Exception as e:
+        logging.error(f"Request Exception: {e}")
         return None
 
+import collections # Für OrderedDict
+
+# --- Hilfsfunktionen für Daten ---
 def get_price_bingx(symbol):
     r = send_signed_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-    if r and r.get("code") == 0:
-        return float(r["data"]["price"])
-    return None
+    return float(r["data"]["price"]) if r and r.get("code") == 0 else None
 
-def get_ohlcv(symbol, interval="1m", limit=100):
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = send_signed_request("GET", "/openApi/swap/v2/quote/klines", params)
-    if r and r.get("code") == 0:
-        return r.get("data", [])
-    return []
+def get_ohlcv(symbol, interval, limit):
+    r = send_signed_request("GET", "/openApi/swap/v2/quote/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    return r.get("data", []) if r and r.get("code") == 0 else []
 
 # ---------------- INDIKATOREN ----------------
 
@@ -94,139 +80,83 @@ def calc_rsi(closes, period):
     if len(closes) < period + 1: return 50
     gains = [max(0, closes[-i] - closes[-i-1]) for i in range(1, period + 1)]
     losses = [abs(min(0, closes[-i] - closes[-i-1])) for i in range(1, period + 1)]
-    avg_gain = sum(gains) / period or 0.0001
-    avg_loss = sum(losses) / period or 0.0001
+    avg_gain, avg_loss = sum(gains)/period, sum(losses)/period
+    if avg_loss == 0: return 100
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 def calc_ema(closes, period):
     if not closes: return 0
-    if len(closes) < 2: return closes[-1]
     alpha = 2 / (period + 1)
-    current_ema = closes[0]
+    ema = closes[0]
     for price in closes[1:]:
-        current_ema = (price * alpha) + (current_ema * (1 - alpha))
-    return current_ema
+        ema = (price * alpha) + (ema * (1 - alpha))
+    return ema
 
-# ---------------- POSITION ACTIONS ----------------
+# ---------------- TRADING LOGIC ----------------
 
-def has_active_position(symbol):
-    ts = str(int(time.time() * 1000))
-    r = send_signed_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol, "timestamp": ts})
-    if r and r.get("code") == 0:
-        for p in r.get("data", []):
-             if abs(float(p.get("positionAmt", 0))) > 0 and p.get("positionSide") == "LONG": return True
-    return False
-
-def set_tp_sl(symbol, qty, tp_price, sl_price):
-    def place_order(price, o_type):
-        ts = str(int(time.time() * 1000))
-        params = {
-            "symbol": symbol, "side": "SELL", "positionSide": "LONG",
-            "type": o_type, "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
-            "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts
-        }
-        # Nutzt die neue, loggende Request-Funktion
-        send_signed_request("POST", "/openApi/swap/v2/trade/order", params)
-
-    place_order(tp_price, "TAKE_PROFIT_MARKET")
-    place_order(sl_price, "STOP_MARKET")
-
-# ---------------- MONITORING BE ----------------
-
-def monitor_be(symbol, entry_price, be_trigger_price):
-    be_active = False
-    while has_active_position(symbol):
+def monitor_be(symbol, entry_price, be_trigger):
+    while True:
+        time.sleep(5)
         curr = get_price_bingx(symbol)
-        if not curr: time.sleep(2); continue
+        if not curr: continue
+        
+        # Prüfen ob Position noch offen
+        pos = send_signed_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
+        has_pos = any(float(p["positionAmt"]) != 0 for p in pos.get("data", [])) if pos else False
+        if not has_pos: break
 
-        if not be_active and curr >= be_trigger_price:
-            be_active = True
-            logging.info(f"[BE STATUS] {symbol} Profit erreicht. Ziehe SL auf Entry ({entry_price}) nach.")
-            
-            # 1. Alle Stop-Orders stornieren
-            ts_cancel = str(int(time.time() * 1000))
-            send_signed_request("POST", "/openApi/swap/v2/trade/cancelAllOpenOrders", {"symbol": symbol, "timestamp": ts_cancel})
-            time.sleep(1)
-
-            # 2. Aktuelle Positionsmenge holen und neue SL setzen
-            ts_pos = str(int(time.time() * 1000))
-            r_pos = send_signed_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol, "timestamp": ts_pos})
-            
-            qty = 0
-            if r_pos and r_pos.get("code") == 0:
-                 for p in r_pos.get("data", []):
-                      if abs(float(p.get("positionAmt", 0))) > 0 and p.get("positionSide") == "LONG": 
-                          qty = float(p.get("positionAmt"))
-                          break
-            
-            if qty > 0:
-                ts_new_sl = str(int(time.time() * 1000))
-                params_new_sl = {
-                    "symbol": symbol, "side": "SELL", "positionSide": "LONG",
-                    "type": "STOP_MARKET", "quantity": str(qty), "stopPrice": "{:.6f}".format(entry_price),
-                    "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts_new_sl
-                }
-                send_signed_request("POST", "/openApi/swap/v2/trade/order", params_new_sl)
-                logging.info(f"[BE SUCCESS] Neuer SL bei Entry Price {entry_price} gesetzt.")
-            break 
-        time.sleep(3)
-
-# ---------------- EXECUTION LOGIC ----------------
+        if curr >= be_trigger:
+            logging.info(f"BE Trigger hit for {symbol}. Moving SL to {entry_price}")
+            send_signed_request("POST", "/openApi/swap/v2/trade/cancelAllOpenOrders", {"symbol": symbol})
+            # Neuen SL setzen (Menge aus Position holen)
+            qty = next(abs(float(p["positionAmt"])) for p in pos["data"] if float(p["positionAmt"]) != 0)
+            send_signed_request("POST", "/openApi/swap/v2/trade/order", {
+                "symbol": symbol, "side": "SELL", "positionSide": "LONG",
+                "type": "STOP_MARKET", "quantity": str(qty), "stopPrice": f"{entry_price:.6f}",
+                "workingType": "MARK_PRICE", "closePosition": "true"
+            })
+            break
 
 def execute_trade_bingx(symbol):
-    if has_active_position(symbol): return
-            
-    ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 5)
-    if not ohlcv_rsi: return
-    closes_rsi = [float(c["close"]) for c in ohlcv_rsi]
-    rsi = calc_rsi(closes_rsi, RSI_PERIOD)
-    
-    ohlcv_ema = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD + 5)
-    if not ohlcv_ema: return
-    closes_ema = [float(c["close"]) for c in ohlcv_ema]
-    ema = calc_ema(closes_ema, EMA_PERIOD)
-    
-    current_price = get_price_bingx(symbol)
-    if not current_price: return
-    
-    if current_price > ema and rsi >= RSI_THRESHOLD:
-        qty = round(TRADE_SIZE / current_price, 6)
-        
-        logging.info(f"[ENTRY LONG] {symbol} | RSI: {rsi:.1f} | EMA: {ema:.2f}")
-        
-        entry_params = {
-            "symbol": symbol, "side": "BUY", "positionSide": "LONG", 
-            "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), 
-            "timestamp": str(int(time.time() * 1000))
-        }
-        
-        send_signed_request("POST", "/openApi/swap/v2/trade/order", entry_params)
-        
-        tp = current_price * (1 + TP_PERCENT / 100)
-        sl = current_price * (1 - SL_PERCENT / 100)
-        be_trigger = current_price * (1 + BE_PERCENT / 100)
+    # RSI & EMA Checks
+    c_rsi = [float(x["close"]) for x in get_ohlcv(symbol, RSI_TIMEFRAME, RSI_PERIOD+2)]
+    c_ema = [float(x["close"]) for x in get_ohlcv(symbol, EMA_TIMEFRAME, EMA_PERIOD+2)]
+    if not c_rsi or not c_ema: return
 
-        time.sleep(2) # Pause für Orderverarbeitung
-        set_tp_sl(symbol, qty, tp, sl)
-        threading.Thread(target=monitor_be, args=(symbol, current_price, be_trigger)).start()
+    rsi, ema, price = calc_rsi(c_rsi, RSI_PERIOD), calc_ema(c_ema, EMA_PERIOD), get_price_bingx(symbol)
+    
+    if price > ema and rsi >= RSI_THRESHOLD:
+        logging.info(f"SIGNAL {symbol}: RSI={rsi:.1f}, EMA={ema:.2f}. Executing LONG.")
+        qty = round(TRADE_SIZE / price, 6)
         
-    else:
-        reason = f"Trend ({EMA_TIMEFRAME}:{EMA_PERIOD}) negativ" if not is_uptrend else f"RSI ({RSI_TIMEFRAME}:{RSI_PERIOD}) {rsi:.1f} < {RSI_THRESHOLD}"
-        logging.info(f"[SKIP] {symbol}: {reason}")
+        # 1. Entry Order
+        send_signed_request("POST", "/openApi/swap/v2/trade/order", {
+            "symbol": symbol, "side": "BUY", "positionSide": "LONG",
+            "type": "MARKET", "quantity": str(qty)
+        })
+        
+        # 2. TP & SL
+        time.sleep(2)
+        tp, sl = price * (1 + TP_PERCENT/100), price * (1 - SL_PERCENT/100)
+        send_signed_request("POST", "/openApi/swap/v2/trade/order", {
+            "symbol": symbol, "side": "SELL", "positionSide": "LONG",
+            "type": "TAKE_PROFIT_MARKET", "quantity": str(qty), "stopPrice": f"{tp:.6f}", "closePosition": "true"
+        })
+        send_signed_request("POST", "/openApi/swap/v2/trade/order", {
+            "symbol": symbol, "side": "SELL", "positionSide": "LONG",
+            "type": "STOP_MARKET", "quantity": str(qty), "stopPrice": f"{sl:.6f}", "closePosition": "true"
+        })
+        
+        threading.Thread(target=monitor_be, args=(symbol, price, price*(1+BE_PERCENT/100))).start()
 
-# ---------------- WEBHOOK ----------------
-
-@app.route("/testorder", methods=["POST", "GET"])
-def handle_alert():
-    if request.method == "GET": return jsonify({"status": "ok"}), 200
+@app.route("/testorder", methods=["POST"])
+def handle_webhook():
     data = request.get_json(silent=True) or {}
-    currency = str(data.get("currency", "")).upper()
-    if not currency: return jsonify({"status": "ignored"}), 200
-    symbol = f"{currency}-USDT"
-    
-    threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
-    return jsonify({"status": "processing", "symbol": symbol}), 200
+    symbol = f"{data.get('currency', '').upper()}-USDT"
+    if "USDT" in symbol:
+        threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
+    return jsonify({"status": "received"}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
