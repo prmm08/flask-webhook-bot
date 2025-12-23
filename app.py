@@ -1,4 +1,4 @@
-# -------- V 3.1: BINGX FUTURES - LONG ONLY (UNABHÄNGIGE TF, EMA & RSI FILTER) --------
+# -------- V 3.2: BINGX FUTURES - LONG ONLY (UNABHÄNGIGE TF, EMA & RSI FILTER) - EINZELPOSITIONEN --------
 
 import time
 import hmac
@@ -24,8 +24,8 @@ RSI_TIMEFRAME = "1m"
 RSI_PERIOD = 14       # Unabhängige RSI Periode
 RSI_THRESHOLD = 75    # Schwellenwert für Long-Entry
 
-EMA_TIMEFRAME = "5m"  # NEU: Unabhängiger Timeframe für EMA
-EMA_PERIOD = 50       # Unabhängige EMA Periode (Trendfilter)
+EMA_TIMEFRAME = "30m"  # NEU: Unabhängiger Timeframe für EMA
+EMA_PERIOD = 100       # Unabhängige EMA Periode (Trendfilter)
 
 LEVERAGE = 10
 TRADE_SIZE = 10       # USDT pro Trade
@@ -52,6 +52,17 @@ def get_ohlcv(symbol, interval="1m", limit=100):
         r = requests.get(url, params=params, timeout=10).json()
         return r.get("data", [])
     except: return []
+
+# NEU: Funktion zur Abfrage offener Positionen
+def get_open_positions():
+    ts = str(int(time.time() * 1000))
+    params = {"timestamp": ts}
+    url = f"{BINGX_BASE}/openApi/swap/v2/user/positions?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
+    try:
+        r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        return r.get("data", [])
+    except:
+        return []
 
 # ---------------- INDIKATOREN ----------------
 
@@ -92,15 +103,21 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
 
 def execute_trade_bingx(symbol):
     
+    # NEU: Prüfen, ob bereits eine Position offen ist
+    positions = get_open_positions()
+    for position in positions:
+        # Prüft auf das Symbol UND dass es eine LONG Position ist
+        if position['symbol'] == symbol and float(position['longQty']) > 0:
+            print(f"[SKIP] {symbol}: Position bereits offen ({position['longQty']} Qty).")
+            return # Skript beenden, wenn Position bereits existiert
+
     # 1. Daten für RSI Timeframe abrufen
-    # Benötigt mindestens Period + 1 Kerzen für die Berechnung
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
     if not ohlcv_rsi: return
     closes_rsi = [float(c["close"]) for c in ohlcv_rsi]
     rsi = calc_rsi(closes_rsi, RSI_PERIOD)
     
     # 2. Daten für EMA Timeframe abrufen
-    # Benötigt mindestens Period Kerzen für die Berechnung
     ohlcv_ema = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD)
     if not ohlcv_ema: return
     closes_ema = [float(c["close"]) for c in ohlcv_ema]
