@@ -19,10 +19,10 @@ logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
 # --- Strategie Settings ---
-RSI_TIMEFRAME, RSI_PERIOD, RSI_THRESHOLD = "1m", 14, 75
-EMA_TIMEFRAME, EMA_PERIOD = "5m", 50
+RSI_TIMEFRAME, RSI_PERIOD, RSI_THRESHOLD = "1m", 14, 70
+EMA_TIMEFRAME, EMA_PERIOD = "10m", 50
 LEVERAGE, TRADE_SIZE = 10, 10
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 1.0, 1.5, 0.5 
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 2.0, 1.0, 0.5
 
 # ---------------- SIGNING & HELPERS ----------------
 
