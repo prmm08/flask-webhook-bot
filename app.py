@@ -1,4 +1,4 @@
-# -------- V 3.3: BINGX FUTURES - LONG ONLY (TP/SL/BE BEI BINGX) --------
+# -------- V 3.4: BINGX FUTURES - KORREKTUR EMA BERECHNUNG --------
 
 import time
 import hmac
@@ -19,19 +19,17 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
-# --- Strategie Settings (Unabhängige Perioden & Timeframes) ---
+# --- Strategie Settings ---
 RSI_TIMEFRAME = "1m"
-RSI_PERIOD = 14       # Unabhängige RSI Periode
-RSI_THRESHOLD = 70    # Schwellenwert für Long-Entry
+RSI_PERIOD = 14
+RSI_THRESHOLD = 70
 
-EMA_TIMEFRAME = "5m"  # Unabhängiger Timeframe für EMA
-EMA_PERIOD = 50       # Unabhängige EMA Periode (Trendfilter)
+EMA_TIMEFRAME = "5m"
+EMA_PERIOD = 50
 
 LEVERAGE = 10
-TRADE_SIZE = 10       # USDT pro Trade
-
-# TP/SL/BE Prozent
-TP_PERCENT, SL_PERCENT, BE_PERCENT = 2.0, 1.0, 0.5
+TRADE_SIZE = 10
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 2.0, 1.0, 0.5 
 
 # ---------------- SIGNING & HELPERS ----------------
 
@@ -54,7 +52,7 @@ def get_ohlcv(symbol, interval="1m", limit=100):
         return r.get("data", [])
     except: return []
 
-# ---------------- INDIKATOREN ----------------
+# ---------------- INDIKATOREN (KORRIGIERT) ----------------
 
 def calc_rsi(closes, period):
     if len(closes) < period + 1: return 50
@@ -66,12 +64,22 @@ def calc_rsi(closes, period):
     return 100 - (100 / (1 + rs))
 
 def calc_ema(closes, period):
-    if len(closes) < period: return closes[-1]
+    """
+    KORREKTUR: Initialisiert ema als Float (erster Schließungspreis), 
+    nicht als Liste.
+    """
+    if not closes: return 0
+    if len(closes) < 2: return closes[0]
+    
     alpha = 2 / (period + 1)
-    ema = closes
+    # Startwert ist der erste Preis in der Liste (Float)
+    current_ema = closes[0] 
+    
+    # Berechne EMA über die restliche Liste
     for price in closes[1:]:
-        ema = (price * alpha) + (ema * (1 - alpha))
-    return ema
+        current_ema = (price * alpha) + (current_ema * (1 - alpha))
+    
+    return current_ema
 
 # ---------------- POSITION ACTIONS ----------------
 
@@ -87,7 +95,6 @@ def has_active_position(symbol):
     except: return False
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
-    """ Platziert TP und SL Orders an der Börse. """
     def place_order(price, o_type):
         ts = str(int(time.time() * 1000))
         params = {
@@ -95,9 +102,7 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
             "type": o_type, "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
             "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts
         }
-        r = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}", headers={"X-BX-APIKEY": API_KEY}).json()
-        if r.get("code") != 0:
-            print(f"[ERROR] Fehler beim Setzen von {o_type}: {r.get('msg')}")
+        requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}", headers={"X-BX-APIKEY": API_KEY})
 
     place_order(tp_price, "TAKE_PROFIT_MARKET")
     place_order(sl_price, "STOP_MARKET")
@@ -106,30 +111,22 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
 
 def monitor_be(symbol, entry_price, be_trigger_price):
     be_active = False
-    print(f"[MONITOR BE] Warte auf BE-Trigger ({be_trigger_price}) für {symbol}.")
-    
     while has_active_position(symbol):
         curr = get_price_bingx(symbol)
         if not curr: time.sleep(2); continue
 
         if not be_active and curr >= be_trigger_price:
             be_active = True
-            print(f"[BE STATUS] {symbol} Profit erreicht. Aktualisiere SL auf Entry Price ({entry_price}).")
+            print(f"[BE STATUS] {symbol} Profit erreicht. Ziehe SL auf Entry ({entry_price}) nach.")
             
-            # --- Hier findet das Nachziehen statt ---
-            # 1. Alle ausstehenden Stop-Orders stornieren (nur SL, TP bleibt)
+            # 1. Alle Stop-Orders stornieren
             ts_cancel = str(int(time.time() * 1000))
             params_cancel = {"symbol": symbol, "timestamp": ts_cancel}
             requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/cancelAllOpenOrders?{urllib.parse.urlencode(sorted(params_cancel.items()))}&signature={sign_bingx(params_cancel)}", headers={"X-BX-APIKEY": API_KEY})
 
             time.sleep(1)
 
-            # 2. Neue SL-Order am Entry Price platzieren
-            # Die Menge muss hier leider statisch sein oder erneut abgefragt werden, 
-            # da BingX keine einfache "Modify SL" Funktion bietet. Wir nutzen TRADE_SIZE
-            # für die Schätzung der ursprünglichen Menge (ungenau, aber notwendig).
-
-            # Bessere Methode: Positionsdaten abfragen um genaue Menge zu erhalten
+            # 2. Aktuelle Positionsmenge holen
             qty = 0
             ts_pos = str(int(time.time() * 1000))
             params_pos = {"symbol": symbol, "timestamp": ts_pos}
@@ -148,26 +145,20 @@ def monitor_be(symbol, entry_price, be_trigger_price):
                     "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts_new_sl
                 }
                 requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params_new_sl.items()))}&signature={sign_bingx(params_new_sl)}", headers={"X-BX-APIKEY": API_KEY})
-                print(f"[BE SUCCESS] Neuer SL bei Entry Price {entry_price} gesetzt.")
-
-            break # Monitoring-Thread kann beendet werden, da SL nun bei BE liegt und TP aktiv ist.
-        
+            break 
         time.sleep(3)
 
 # ---------------- EXECUTION LOGIC ----------------
 
 def execute_trade_bingx(symbol):
-    
-    if has_active_position(symbol):
-        print(f"[SKIP] Position für {symbol} existiert bereits. Warte auf Exit/BE.")
-        return
+    if has_active_position(symbol): return
             
-    ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
+    ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 5)
     if not ohlcv_rsi: return
     closes_rsi = [float(c["close"]) for c in ohlcv_rsi]
     rsi = calc_rsi(closes_rsi, RSI_PERIOD)
     
-    ohlcv_ema = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD)
+    ohlcv_ema = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD + 5)
     if not ohlcv_ema: return
     closes_ema = [float(c["close"]) for c in ohlcv_ema]
     ema = calc_ema(closes_ema, EMA_PERIOD)
@@ -175,35 +166,25 @@ def execute_trade_bingx(symbol):
     current_price = get_price_bingx(symbol)
     if not current_price: return
     
-    is_uptrend = current_price > ema
-    is_overbought = rsi >= RSI_THRESHOLD
-    
-    if is_uptrend and is_overbought:
+    if current_price > ema and rsi >= RSI_THRESHOLD:
         qty = round(TRADE_SIZE / current_price, 6)
         ts = str(int(time.time() * 1000))
         
-        print(f"[ENTRY LONG] {symbol} @ {current_price} | RSI({RSI_TIMEFRAME}:{RSI_PERIOD}): {rsi:.1f} | EMA({EMA_TIMEFRAME}:{EMA_PERIOD}): {ema:.2f}")
+        print(f"[ENTRY LONG] {symbol} | RSI: {rsi:.1f} | EMA: {ema:.2f}")
         
         entry_params = {
             "symbol": symbol, "side": "BUY", "positionSide": "LONG", 
             "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts
         }
-        
         requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_params.items()))}&signature={sign_bingx(entry_params)}", headers={"X-BX-APIKEY": API_KEY})
         
         tp = current_price * (1 + TP_PERCENT / 100)
         sl = current_price * (1 - SL_PERCENT / 100)
         be_trigger = current_price * (1 + BE_PERCENT / 100)
 
-        time.sleep(1) # Kurze Pause, damit Entry sicher durch ist
-        set_tp_sl(symbol, qty, tp, sl) # TP und SL Orders an Börse senden
-        
-        # Starte den BE Monitoring Thread, der nur den SL nachzieht
+        time.sleep(1)
+        set_tp_sl(symbol, qty, tp, sl)
         threading.Thread(target=monitor_be, args=(symbol, current_price, be_trigger)).start()
-        
-    else:
-        reason = f"Trend ({EMA_TIMEFRAME}:{EMA_PERIOD}) negativ" if not is_uptrend else f"RSI ({RSI_TIMEFRAME}:{RSI_PERIOD}) {rsi:.1f} < {RSI_THRESHOLD}"
-        print(f"[SKIP] {symbol}: {reason}")
 
 # ---------------- WEBHOOK ----------------
 
@@ -214,7 +195,6 @@ def handle_alert():
     currency = str(data.get("currency", "")).upper()
     if not currency: return jsonify({"status": "ignored"}), 200
     symbol = f"{currency}-USDT"
-    
     threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
     return jsonify({"status": "processing", "symbol": symbol}), 200
 
