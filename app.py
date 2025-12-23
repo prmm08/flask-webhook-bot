@@ -24,7 +24,7 @@ RSI_TIMEFRAME = "1m"
 RSI_PERIOD = 14       # Unabhängige RSI Periode
 RSI_THRESHOLD = 70    # Schwellenwert für Long-Entry
 
-EMA_TIMEFRAME = "10m"  # NEU: Unabhängiger Timeframe für EMA
+EMA_TIMEFRAME = "15m"  # NEU: Unabhängiger Timeframe für EMA
 EMA_PERIOD = 50       # Unabhängige EMA Periode (Trendfilter)
 
 LEVERAGE = 10
