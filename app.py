@@ -29,7 +29,7 @@ EMA_PERIOD = 50       # Unabhängige EMA Periode (Trendfilter)
 
 LEVERAGE = 10
 TRADE_SIZE = 10       # USDT pro Trade
-TP_PERCENT, SL_PERCENT = 1.5, 1.5
+TP_PERCENT, SL_PERCENT = 3.0, 1.5
 
 # ---------------- SIGNING & HELPERS ----------------
 
