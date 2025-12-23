@@ -22,7 +22,7 @@ app = Flask(__name__)
 # --- Strategie Settings (Unabhängige Perioden & Timeframes) ---
 RSI_TIMEFRAME = "1m"
 RSI_PERIOD = 14       # Unabhängige RSI Periode
-RSI_THRESHOLD = 70    # Schwellenwert für Long-Entry
+RSI_THRESHOLD = 75    # Schwellenwert für Long-Entry
 
 EMA_TIMEFRAME = "5m"  # NEU: Unabhängiger Timeframe für EMA
 EMA_PERIOD = 50       # Unabhängige EMA Periode (Trendfilter)
