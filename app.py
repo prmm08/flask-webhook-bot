@@ -136,6 +136,17 @@ def execute_trade_bingx(symbol):
 
 # ---------------- START ----------------
 
+@app.route("/testorder", methods=["POST", "GET"])
+def handle_alert():
+    if request.method == "GET": return jsonify({"status": "ok"}), 200
+    data = request.get_json(silent=True) or {}
+    currency = str(data.get("currency", "")).upper()
+    if not currency: return jsonify({"status": "ignored"}), 200
+    symbol = f"{currency}-USDT"
+    
+    threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
+    return jsonify({"status": "processing", "symbol": symbol}), 200
+
 if __name__ == "__main__":
     # Startet den Überwachungs-Thread für Break-Even
     threading.Thread(target=monitor_break_even, daemon=True).start()
