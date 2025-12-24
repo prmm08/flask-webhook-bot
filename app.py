@@ -23,16 +23,16 @@ app = Flask(__name__)
 RSI_TIMEFRAME = "1m"
 RSI_PERIOD = 14
 RSI_THRESHOLD = 75
-EMA_TIMEFRAME = "5m"
-EMA_PERIOD = 50       # Kurzer EMA (50)
+EMA_TIMEFRAME = "3m"
+EMA_PERIOD = 200       # Kurzer EMA (50)
 EMA_PERIOD_LONG = 200 # Langer EMA (200)
 
 LEVERAGE = 10
 TRADE_SIZE = 10       
-TP_PERCENT, SL_PERCENT = 1.5, 3.0
+TP_PERCENT, SL_PERCENT = 3.0, 1.5
 
 # --- Break-Even Settings ---
-BE_ACTIVATION_PERCENT = 0.5
+BE_ACTIVATION_PERCENT = 1.0
 active_be_positions = {}
 
 # ---------------- SIGNING & HELPERS ----------------
@@ -183,6 +183,7 @@ def handle_alert():
     if request.method == "GET": return jsonify({"status": "ok"}), 200
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
+    
     if not currency: return jsonify({"status": "ignored"}), 200
     symbol = f"{currency}-USDT"
     threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
