@@ -1,18 +1,21 @@
-# -------- V 4.4: BINGX FUTURES - MULTI-ENTRY (EMA HIERARCHIE + BE MONITOR) --------
+# -------- V 4.5: BINGX FUTURES - MULTI-ENTRY (ALLE FUNKTIONEN + FIX) --------
 
 import time, hmac, hashlib, requests, os, urllib.parse, threading
 from flask import Flask, request, jsonify
+import logging
 
 # --- API Konfiguration ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
 # --- Strategie Settings ---
 RSI_TIMEFRAME, RSI_PERIOD, RSI_THRESHOLD = "1m", 14, 75
-EMA_TIMEFRAME, EMA_PERIOD_SHORT, EMA_PERIOD_LONG = "3m", 50, 200
+EMA_TIMEFRAME, EMA_PERIOD_SHORT, EMA_PERIOD_LONG = "5m", 50, 200
 LEVERAGE, TRADE_SIZE = 10, 10
 TP_PERCENT, SL_PERCENT = 3.0, 1.5
 
@@ -65,7 +68,7 @@ def calc_ema(closes, period):
     if not closes or len(closes) < 1: return 0
     if len(closes) < period: return float(closes[-1])
     alpha = 2 / (period + 1)
-    ema = float(closes[0]) # FIX: Zugriff auf den ersten Index
+    ema = float(closes[0]) # FIX: Verwende Index [0]
     for price in closes[1:]:
         ema = (float(price) * alpha) + (ema * (1 - alpha))
     return ema
@@ -90,6 +93,9 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
             "workingType": "MARKET_PRICE", "closePosition": "true", "timestamp": ts
         }
         requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}", headers={"X-BX-APIKEY": API_KEY})
+    
+    # Debugging der Preise
+    print(f"Setze TP/SL für {symbol}. TP: {tp_price:.5f}, SL: {sl_price:.5f}")
     place_order(tp_price, "TAKE_PROFIT_MARKET")
     place_order(sl_price, "STOP_MARKET")
 
@@ -116,10 +122,12 @@ def monitor_break_even():
                     if active_be_positions.get(symbol) and current_price <= entry_price:
                         close_position_market(symbol)
                         if symbol in active_be_positions: del active_be_positions[symbol]
-        except: pass
+        except Exception as e:
+            # print(f"[MONITOR ERROR] {e}") # Zu viele Logs
+            pass
         time.sleep(10)
 
-# ---------------- EXECUTION LOGIC ----------------
+# ---------------- EXECUTION LOGIC (INKL TP/SL FIX) ----------------
 
 def execute_trade_bingx(symbol):
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
@@ -127,6 +135,7 @@ def execute_trade_bingx(symbol):
     ohlcv_ema_long = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD_LONG)
     
     if not ohlcv_rsi or not ohlcv_ema_short or not ohlcv_ema_long:
+        print(f"[ERROR] Nicht genügend Marktdaten für {symbol}")
         return
     
     rsi = calc_rsi([float(c["close"]) for c in ohlcv_rsi], RSI_PERIOD)
@@ -135,7 +144,6 @@ def execute_trade_bingx(symbol):
     current_price = get_price_bingx(symbol)
     
     if current_price:
-        # Bedingung: RSI >= Threshold UND Preis > EMA Long UND EMA Long > EMA Short
         if rsi >= RSI_THRESHOLD and current_price > ema_long and ema_long > ema_short:
             qty = round(TRADE_SIZE / current_price, 6)
             ts = str(int(time.time() * 1000))
@@ -143,10 +151,16 @@ def execute_trade_bingx(symbol):
                 "symbol": symbol, "side": "BUY", "positionSide": "LONG", 
                 "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts
             }
-            requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_params.items()))}&signature={sign_bingx(entry_params)}", headers={"X-BX-APIKEY": API_KEY})
-            time.sleep(1)
+            # ORDER PLATZIEREN
+            entry_response = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_params.items()))}&signature={sign_bingx(entry_params)}", headers={"X-BX-APIKEY": API_KEY}).json()
+            print(f"[ENTRY RESPONSE] {entry_response}")
+            
+            # WICHTIG: Kurze Pause, damit BingX die Position erkennt, bevor TP/SL gesetzt wird
+            time.sleep(2) 
+            
+            # TP/SL PLATZIEREN
             set_tp_sl(symbol, qty, current_price*(1+TP_PERCENT/100), current_price*(1-SL_PERCENT/100))
-            print(f"[ENTRY] {symbol} ausgeführt.")
+            print(f"[ENTRY] {symbol} ausgeführt und TP/SL gesetzt.")
         else:
             print(f"[SKIP] {symbol} Filter nicht erfüllt.")
 
@@ -163,10 +177,5 @@ def handle_alert():
     return jsonify({"status": "processing", "symbol": symbol}), 200
 
 if __name__ == "__main__":
-    # Monitor startet im Hintergrund
     threading.Thread(target=monitor_break_even, daemon=True).start()
-    # Debug Logging für Flask wieder ausschalten, da wir eigenes Logging haben
-    # (Dies wurde im ursprünglichen Code gemacht)
-    # log = logging.getLogger('werkzeug')
-    # log.setLevel(logging.ERROR) 
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
