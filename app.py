@@ -1,34 +1,19 @@
-# -------- V 4.2: BINGX FUTURES - EMA CALCULATION FIX (LIST INDEX) --------
+# -------- V 4.4: BINGX FUTURES - MULTI-ENTRY (EMA HIERARCHIE + BE MONITOR) --------
 
-import time
-import hmac
-import hashlib
-import requests
-import os
-import urllib.parse
-import threading
+import time, hmac, hashlib, requests, os, urllib.parse, threading
 from flask import Flask, request, jsonify
-import logging
 
 # --- API Konfiguration ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
 # --- Strategie Settings ---
-RSI_TIMEFRAME = "1m"
-RSI_PERIOD = 14
-RSI_THRESHOLD = 75
-EMA_TIMEFRAME = "3m"
-EMA_PERIOD_SHORT = 50   
-EMA_PERIOD_LONG = 200   
-
-LEVERAGE = 10
-TRADE_SIZE = 10       
+RSI_TIMEFRAME, RSI_PERIOD, RSI_THRESHOLD = "1m", 14, 75
+EMA_TIMEFRAME, EMA_PERIOD_SHORT, EMA_PERIOD_LONG = "3m", 50, 200
+LEVERAGE, TRADE_SIZE = 10, 10
 TP_PERCENT, SL_PERCENT = 3.0, 1.5
 
 # --- Break-Even Settings ---
@@ -65,7 +50,7 @@ def get_open_positions():
         return r.get("data", [])
     except: return []
 
-# ---------------- INDIKATOREN (FIXED) ----------------
+# ---------------- INDIKATOREN ----------------
 
 def calc_rsi(closes, period):
     if len(closes) < period + 1: return 50
@@ -77,14 +62,10 @@ def calc_rsi(closes, period):
     return 100 - (100 / (1 + rs))
 
 def calc_ema(closes, period):
-    """Berechnet den EMA korrekt durch Zugriff auf den ersten Index der Liste."""
     if not closes or len(closes) < 1: return 0
-    # Falls weniger Daten als Periode vorhanden, nimm den letzten Preis
     if len(closes) < period: return float(closes[-1])
-    
     alpha = 2 / (period + 1)
-    # FIX: Nutze closes[0] statt der ganzen Liste closes
-    ema = float(closes[0]) 
+    ema = float(closes[0]) # FIX: Zugriff auf den ersten Index
     for price in closes[1:]:
         ema = (float(price) * alpha) + (ema * (1 - alpha))
     return ema
@@ -97,8 +78,7 @@ def close_position_market(symbol):
         "symbol": symbol, "side": "SELL", "positionSide": "LONG",
         "type": "MARKET", "closePosition": "true", "timestamp": ts
     }
-    url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
-    requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+    requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}", headers={"X-BX-APIKEY": API_KEY})
     print(f"[BREAK-EVEN] {symbol} Position geschlossen.")
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
@@ -113,7 +93,7 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
     place_order(tp_price, "TAKE_PROFIT_MARKET")
     place_order(sl_price, "STOP_MARKET")
 
-# ---------------- MONITOR & EXECUTION ----------------
+# ---------------- BREAK-EVEN MONITOR ----------------
 
 def monitor_break_even():
     while True:
@@ -138,6 +118,8 @@ def monitor_break_even():
                         if symbol in active_be_positions: del active_be_positions[symbol]
         except: pass
         time.sleep(10)
+
+# ---------------- EXECUTION LOGIC ----------------
 
 def execute_trade_bingx(symbol):
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
@@ -165,6 +147,8 @@ def execute_trade_bingx(symbol):
             time.sleep(1)
             set_tp_sl(symbol, qty, current_price*(1+TP_PERCENT/100), current_price*(1-SL_PERCENT/100))
             print(f"[ENTRY] {symbol} ausgeführt.")
+        else:
+            print(f"[SKIP] {symbol} Filter nicht erfüllt.")
 
 # ---------------- WEBHOOK ----------------
 
@@ -179,5 +163,10 @@ def handle_alert():
     return jsonify({"status": "processing", "symbol": symbol}), 200
 
 if __name__ == "__main__":
+    # Monitor startet im Hintergrund
     threading.Thread(target=monitor_break_even, daemon=True).start()
+    # Debug Logging für Flask wieder ausschalten, da wir eigenes Logging haben
+    # (Dies wurde im ursprünglichen Code gemacht)
+    # log = logging.getLogger('werkzeug')
+    # log.setLevel(logging.ERROR) 
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
