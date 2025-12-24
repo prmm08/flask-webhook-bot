@@ -29,10 +29,10 @@ EMA_PERIOD_LONG = 200 # Langer EMA (200)
 
 LEVERAGE = 10
 TRADE_SIZE = 10       
-TP_PERCENT, SL_PERCENT = 3.0, 1.5
+TP_PERCENT, SL_PERCENT = 1.5, 3.0
 
 # --- Break-Even Settings ---
-BE_ACTIVATION_PERCENT = 1.5
+BE_ACTIVATION_PERCENT = 0.5
 active_be_positions = {}
 
 # ---------------- SIGNING & HELPERS ----------------
@@ -161,7 +161,7 @@ def execute_trade_bingx(symbol):
     
     if current_price:
         # Bedingung: RSI >= Threshold UND Preis > EMA 50 UND Preis < EMA 200
-        if rsi >= RSI_THRESHOLD and current_price > ema_short and current_price < ema_long:
+        if rsi >= RSI_THRESHOLD and current_price > ema_short:# and current_price < ema_long:
             qty = round(TRADE_SIZE / current_price, 6)
             ts = str(int(time.time() * 1000))
             entry_params = {
