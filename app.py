@@ -1,4 +1,4 @@
-# -------- V 3.6: BINGX FUTURES - LONG ONLY + BE LOGIK + EINFACH-WEBHOOK --------
+# -------- V 3.7: BINGX FUTURES - KORRIGIERTE POSITIONSPRÜFUNG --------
 
 import time
 import hmac
@@ -27,11 +27,11 @@ EMA_TIMEFRAME = "5m"
 EMA_PERIOD = 50
 LEVERAGE = 10
 TRADE_SIZE = 10       
-TP_PERCENT, SL_PERCENT = 5.0, 1.5
+TP_PERCENT, SL_PERCENT = 3.0, 1.5
 
 # --- Break-Even Settings ---
-BE_ACTIVATION_PERCENT = 0.5  # Ab 1% Gewinn wird BE scharf geschaltet
-active_be_positions = {}     # Interner Speicher für BE Status
+BE_ACTIVATION_PERCENT = 1.0
+active_be_positions = {}
 
 # ---------------- SIGNING & HELPERS ----------------
 
@@ -55,16 +55,18 @@ def get_ohlcv(symbol, interval="1m", limit=100):
     except: return []
 
 def get_open_positions():
+    """Holt alle aktuell offenen Positionen und normalisiert sie."""
     ts = str(int(time.time() * 1000))
     params = {"timestamp": ts}
     url = f"{BINGX_BASE}/openApi/swap/v2/user/positions?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
     try:
         r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        # Die API liefert eine Liste von Positionsobjekten
         return r.get("data", [])
     except: return []
 
-# ---------------- INDIKATOREN ----------------
-
+# ---------------- INDIKATOREN (Unverändert) ----------------
+# ... (Funktionen calc_rsi, calc_ema sind unverändert) ...
 def calc_rsi(closes, period):
     if len(closes) < period + 1: return 50
     gains = [max(0, closes[-i] - closes[-i-1]) for i in range(1, period + 1)]
@@ -77,13 +79,13 @@ def calc_rsi(closes, period):
 def calc_ema(closes, period):
     if len(closes) < period: return closes[-1]
     alpha = 2 / (period + 1)
-    ema = closes[0]
+    ema = closes
     for price in closes[1:]:
         ema = (price * alpha) + (ema * (1 - alpha))
     return ema
 
-# ---------------- POSITION ACTIONS ----------------
-
+# ---------------- POSITION ACTIONS (Unverändert) ----------------
+# ... (Funktionen close_position_market, set_tp_sl sind unverändert) ...
 def close_position_market(symbol):
     ts = str(int(time.time() * 1000))
     params = {
@@ -106,34 +108,38 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
     place_order(tp_price, "TAKE_PROFIT_MARKET")
     place_order(sl_price, "STOP_MARKET")
 
-# ---------------- BREAK-EVEN MONITOR ----------------
+# ---------------- BREAK-EVEN MONITOR (Geändert) ----------------
 
 def monitor_break_even():
     while True:
         try:
             positions = get_open_positions()
-            active_symbols_in_account = [p['symbol'] for p in positions if float(p['longQty']) > 0]
             
-            # Aufräumen der internen BE-Liste
+            # Sammle alle aktuell offenen LONG Positionssymbole aus der API-Antwort
+            active_long_symbols = [
+                p['symbol'] for p in positions 
+                if p.get('positionSide') == 'LONG' and float(p.get('positionAmt', 0)) > 0
+            ]
+            
+            # Aufräumen der internen BE-Liste (entferne Symbole, die nicht mehr offen sind)
             for sym in list(active_be_positions.keys()):
-                if sym not in active_symbols_in_account:
+                if sym not in active_long_symbols:
                     del active_be_positions[sym]
 
             for pos in positions:
-                symbol = pos['symbol']
-                if float(pos['longQty']) > 0:
+                # WICHTIG: Prüfe hier konsistent auf positionSide 'LONG'
+                if pos.get('positionSide') == 'LONG' and float(pos.get('positionAmt', 0)) > 0:
+                    symbol = pos['symbol']
                     entry_price = float(pos['avgPrice'])
                     current_price = get_price_bingx(symbol)
                     if not current_price: continue
 
                     profit_pct = (current_price - entry_price) / entry_price * 100
 
-                    # Markiere als BE-bereit
                     if profit_pct >= BE_ACTIVATION_PERCENT and symbol not in active_be_positions:
                         active_be_positions[symbol] = True
                         print(f"[BE-MODUS] Aktiviert für {symbol} (Profit: {profit_pct:.2f}%)")
 
-                    # Schließe wenn Preis zurück auf Entry
                     if active_be_positions.get(symbol) and current_price <= entry_price:
                         close_position_market(symbol)
                         if symbol in active_be_positions: del active_be_positions[symbol]
@@ -141,15 +147,23 @@ def monitor_break_even():
             print(f"[MONITOR ERROR] {e}")
         time.sleep(10)
 
-# ---------------- EXECUTION LOGIC ----------------
+# ---------------- EXECUTION LOGIC (Geändert) ----------------
 
 def execute_trade_bingx(symbol):
-    # Nur ein Order pro Position
+    # Nur ein Order pro Position: Jetzt mit korrekter Feldprüfung
     positions = get_open_positions()
-    if any(p['symbol'] == symbol and float(p['longQty']) > 0 for p in positions):
+    is_position_open = any(
+        p['symbol'] == symbol and 
+        p.get('positionSide') == 'LONG' and 
+        float(p.get('positionAmt', 0)) > 0 
+        for p in positions
+    )
+
+    if is_position_open:
         print(f"[SKIP] {symbol} bereits offen.")
         return
 
+    # Rest der Logik (Indikatoren, Order Platzierung)
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
     ohlcv_ema = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD)
     if not ohlcv_rsi or not ohlcv_ema: return
@@ -173,7 +187,7 @@ def execute_trade_bingx(symbol):
     else:
         print(f"[SKIP] {symbol} Filter nicht erfüllt.")
 
-# ---------------- WEBHOOK ----------------
+# ---------------- WEBHOOK (Unverändert) ----------------
 
 @app.route("/testorder", methods=["POST", "GET"])
 def handle_alert():
@@ -191,6 +205,5 @@ def handle_alert():
     return jsonify({"status": "processing", "symbol": symbol}), 200
 
 if __name__ == "__main__":
-    # Monitor startet im Hintergrund
     threading.Thread(target=monitor_break_even, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
