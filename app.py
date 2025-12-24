@@ -1,4 +1,4 @@
-# -------- V 4.1: BINGX FUTURES - MULTI-ENTRY (GEÄNDERTE EMA HIERARCHIE) --------
+# -------- V 4.2: BINGX FUTURES - EMA CALCULATION FIX (LIST INDEX) --------
 
 import time
 import hmac
@@ -24,8 +24,8 @@ RSI_TIMEFRAME = "1m"
 RSI_PERIOD = 14
 RSI_THRESHOLD = 75
 EMA_TIMEFRAME = "3m"
-EMA_PERIOD_SHORT = 50   # Kurzer EMA (50)
-EMA_PERIOD_LONG = 200   # Langer EMA (200)
+EMA_PERIOD_SHORT = 50   
+EMA_PERIOD_LONG = 200   
 
 LEVERAGE = 10
 TRADE_SIZE = 10       
@@ -65,7 +65,7 @@ def get_open_positions():
         return r.get("data", [])
     except: return []
 
-# ---------------- INDIKATOREN ----------------
+# ---------------- INDIKATOREN (FIXED) ----------------
 
 def calc_rsi(closes, period):
     if len(closes) < period + 1: return 50
@@ -77,10 +77,14 @@ def calc_rsi(closes, period):
     return 100 - (100 / (1 + rs))
 
 def calc_ema(closes, period):
+    """Berechnet den EMA korrekt durch Zugriff auf den ersten Index der Liste."""
     if not closes or len(closes) < 1: return 0
-    if len(closes) < period: return closes[-1]
+    # Falls weniger Daten als Periode vorhanden, nimm den letzten Preis
+    if len(closes) < period: return float(closes[-1])
+    
     alpha = 2 / (period + 1)
-    ema = float(closes)
+    # FIX: Nutze closes[0] statt der ganzen Liste closes
+    ema = float(closes[0]) 
     for price in closes[1:]:
         ema = (float(price) * alpha) + (ema * (1 - alpha))
     return ema
@@ -109,14 +113,13 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
     place_order(tp_price, "TAKE_PROFIT_MARKET")
     place_order(sl_price, "STOP_MARKET")
 
-# ---------------- BREAK-EVEN MONITOR ----------------
+# ---------------- MONITOR & EXECUTION ----------------
 
 def monitor_break_even():
     while True:
         try:
             positions = get_open_positions()
             active_long_symbols = [p['symbol'] for p in positions if p.get('positionSide') == 'LONG' and float(p.get('positionAmt', 0)) > 0]
-            
             for sym in list(active_be_positions.keys()):
                 if sym not in active_long_symbols: del active_be_positions[sym]
 
@@ -127,34 +130,26 @@ def monitor_break_even():
                     current_price = get_price_bingx(symbol)
                     if not current_price: continue
                     profit_pct = (current_price - entry_price) / entry_price * 100
-                    
                     if profit_pct >= BE_ACTIVATION_PERCENT and symbol not in active_be_positions:
                         active_be_positions[symbol] = True
                         print(f"[BE-MODUS] Aktiviert für {symbol}")
-                        
                     if active_be_positions.get(symbol) and current_price <= entry_price:
                         close_position_market(symbol)
                         if symbol in active_be_positions: del active_be_positions[symbol]
         except: pass
         time.sleep(10)
 
-# ---------------- EXECUTION LOGIC (GEÄNDERT) ----------------
-
 def execute_trade_bingx(symbol):
-    # Daten für Indikatoren abrufen
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
     ohlcv_ema_short = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD_SHORT)
     ohlcv_ema_long = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD_LONG)
     
     if not ohlcv_rsi or not ohlcv_ema_short or not ohlcv_ema_long:
-        print(f"[ERROR] Nicht genügend Marktdaten für {symbol}")
         return
     
-    # Indikatoren berechnen
     rsi = calc_rsi([float(c["close"]) for c in ohlcv_rsi], RSI_PERIOD)
     ema_short = calc_ema([float(c["close"]) for c in ohlcv_ema_short], EMA_PERIOD_SHORT)
     ema_long = calc_ema([float(c["close"]) for c in ohlcv_ema_long], EMA_PERIOD_LONG)
-    
     current_price = get_price_bingx(symbol)
     
     if current_price:
@@ -167,12 +162,9 @@ def execute_trade_bingx(symbol):
                 "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts
             }
             requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_params.items()))}&signature={sign_bingx(entry_params)}", headers={"X-BX-APIKEY": API_KEY})
-            
             time.sleep(1)
             set_tp_sl(symbol, qty, current_price*(1+TP_PERCENT/100), current_price*(1-SL_PERCENT/100))
-            print(f"[ENTRY] {symbol} @ {current_price} ausgeführt.")
-        else:
-            print(f"[SKIP] {symbol} Filter nicht erfüllt (RSI: {rsi:.1f} | Preis > EMA200: {current_price > ema_long} | EMA200 > EMA50: {ema_long > ema_short}).")
+            print(f"[ENTRY] {symbol} ausgeführt.")
 
 # ---------------- WEBHOOK ----------------
 
