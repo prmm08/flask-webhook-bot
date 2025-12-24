@@ -135,7 +135,7 @@ def execute_trade_bingx(symbol):
     ohlcv_ema_long = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD_LONG)
     
     if not ohlcv_rsi or not ohlcv_ema_short or not ohlcv_ema_long:
-        print(f"[ERROR] Nicht genügend Marktdaten für {symbol}")
+        #print(f"[ERROR] Nicht genügend Marktdaten für {symbol}")
         return
     
     rsi = calc_rsi([float(c["close"]) for c in ohlcv_rsi], RSI_PERIOD)
