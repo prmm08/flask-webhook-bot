@@ -1,4 +1,4 @@
-# -------- V 3.8: BINGX FUTURES - EMA CALCULATION FIX --------
+# -------- V 3.9: BINGX FUTURES - EMA 50/200 & RSI FILTER --------
 
 import time
 import hmac
@@ -24,13 +24,15 @@ RSI_TIMEFRAME = "1m"
 RSI_PERIOD = 14
 RSI_THRESHOLD = 75
 EMA_TIMEFRAME = "15m"
-EMA_PERIOD = 50
+EMA_PERIOD = 50       # Kurzer EMA (50)
+EMA_PERIOD_LONG = 200 # Langer EMA (200)
+
 LEVERAGE = 10
 TRADE_SIZE = 10       
 TP_PERCENT, SL_PERCENT = 5.0, 1.5
 
 # --- Break-Even Settings ---
-BE_ACTIVATION_PERCENT = 0.5
+BE_ACTIVATION_PERCENT = 1.5
 active_be_positions = {}
 
 # ---------------- SIGNING & HELPERS ----------------
@@ -63,7 +65,7 @@ def get_open_positions():
         return r.get("data", [])
     except: return []
 
-# ---------------- INDIKATOREN (FIXED) ----------------
+# ---------------- INDIKATOREN ----------------
 
 def calc_rsi(closes, period):
     if len(closes) < period + 1: return 50
@@ -75,13 +77,20 @@ def calc_rsi(closes, period):
     return 100 - (100 / (1 + rs))
 
 def calc_ema(closes, period):
-    """Berechnet den EMA korrekt."""
     if not closes or len(closes) < 1: return 0
     if len(closes) < period: return closes[-1]
-    
     alpha = 2 / (period + 1)
-    # WICHTIG: Startwert ist der erste Preis als Zahl, nicht die Liste
-    ema = float(closes[0]) 
+    ema = float(closes[0])
+    for price in closes[1:]:
+        ema = (float(price) * alpha) + (ema * (1 - alpha))
+    return ema
+
+# Ich habe calc_ema dupliziert, da die Logik für beide EMAs identisch ist, nur die Perioden sind anders.
+def calc_ema_long(closes, period):
+    if not closes or len(closes) < 1: return 0
+    if len(closes) < period: return closes[-1]
+    alpha = 2 / (period + 1)
+    ema = float(closes[0])
     for price in closes[1:]:
         ema = (float(price) * alpha) + (ema * (1 - alpha))
     return ema
@@ -104,13 +113,13 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
         params = {
             "symbol": symbol, "side": "SELL", "positionSide": "LONG",
             "type": o_type, "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
-            "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts
+            "workingType": "MARKET_PRICE", "closePosition": "true", "timestamp": ts
         }
         requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}", headers={"X-BX-APIKEY": API_KEY})
     place_order(tp_price, "TAKE_PROFIT_MARKET")
     place_order(sl_price, "STOP_MARKET")
 
-# ---------------- MONITOR & EXECUTION ----------------
+# ---------------- BREAK-EVEN MONITOR ----------------
 
 def monitor_break_even():
     while True:
@@ -136,35 +145,56 @@ def monitor_break_even():
         except: pass
         time.sleep(10)
 
+# ---------------- EXECUTION LOGIC (GEÄNDERT) ----------------
+
 def execute_trade_bingx(symbol):
-    # Check ob bereits offen
     positions = get_open_positions()
-    if any(p['symbol'] == symbol and p.get('positionSide') == 'LONG' and float(p.get('positionAmt', 0)) > 0 for p in positions):
+    is_position_open = any(p['symbol'] == symbol and p.get('positionSide') == 'LONG' and float(p.get('positionAmt', 0)) > 0 for p in positions)
+
+    if is_position_open:
         print(f"[SKIP] {symbol} bereits offen.")
         return
 
+    # Daten für Indikatoren abrufen
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
-    ohlcv_ema = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD)
+    ohlcv_ema_short = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD)
+    # NEU: Daten für den langen EMA abrufen (gleicher Timeframe)
+    ohlcv_ema_long = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD_LONG)
     
-    if not ohlcv_rsi or not ohlcv_ema:
-        print(f"[ERROR] Keine Marktdaten für {symbol}")
+    if not ohlcv_rsi or not ohlcv_ema_short or not ohlcv_ema_long:
+        #print(f"[ERROR] Nicht genügend Marktdaten für {symbol}")
         return
     
+    # Indikatoren berechnen
     rsi = calc_rsi([float(c["close"]) for c in ohlcv_rsi], RSI_PERIOD)
-    ema = calc_ema([float(c["close"]) for c in ohlcv_ema], EMA_PERIOD)
+    ema_short = calc_ema([float(c["close"]) for c in ohlcv_ema_short], EMA_PERIOD)
+    ema_long = calc_ema_long([float(c["close"]) for c in ohlcv_ema_long], EMA_PERIOD_LONG) # NEU: langen EMA berechnen
+    
     current_price = get_price_bingx(symbol)
     
-    if current_price and current_price > ema and rsi >= RSI_THRESHOLD:
-        qty = round(TRADE_SIZE / current_price, 6)
-        ts = str(int(time.time() * 1000))
-        entry_params = {
-            "symbol": symbol, "side": "BUY", "positionSide": "LONG", 
-            "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts
-        }
-        requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_params.items()))}&signature={sign_bingx(entry_params)}", headers={"X-BX-APIKEY": API_KEY})
-        time.sleep(1)
-        set_tp_sl(symbol, qty, current_price*(1+TP_PERCENT/100), current_price*(1-SL_PERCENT/100))
-        print(f"[ENTRY] {symbol} ausgeführt.")
+    if current_price:
+        # Prüfen der 3 Bedingungen: RSI, Preis > EMA50, Preis < EMA200
+        is_uptrend_short = current_price > ema_short
+        is_uptrend_long = current_price > ema_long # Wird verwendet, um die Unterordnung zu prüfen
+        is_overbought_rsi = rsi >= RSI_THRESHOLD
+        
+        # NEUE FILTER-KOMBINATION
+        if is_overbought_rsi and is_uptrend_short and not is_uptrend_long:
+             
+            qty = round(TRADE_SIZE / current_price, 6)
+            ts = str(int(time.time() * 1000))
+            entry_params = {
+                "symbol": symbol, "side": "BUY", "positionSide": "LONG", 
+                "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts
+            }
+            requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_params.items()))}&signature={sign_bingx(entry_params)}", headers={"X-BX-APIKEY": API_KEY})
+            
+            time.sleep(1)
+            set_tp_sl(symbol, qty, current_price*(1+TP_PERCENT/100), current_price*(1-SL_PERCENT/100))
+            print(f"[ENTRY] {symbol} @ {current_price} ausgeführt (RSI: {rsi:.1f}, EMA50: {ema_short:.2f}, EMA200: {ema_long:.2f}).")
+        else:
+            print(f"[SKIP] {symbol} Filter nicht erfüllt (RSI: {rsi:.1f} | Preis > EMA50: {is_uptrend_short} | Preis < EMA200: {not is_uptrend_long}).")
+
 
 # ---------------- WEBHOOK ----------------
 
