@@ -17,10 +17,10 @@ app = Flask(__name__)
 RSI_TIMEFRAME, RSI_PERIOD, RSI_THRESHOLD = "1m", 14, 75
 EMA_TIMEFRAME, EMA_PERIOD_SHORT, EMA_PERIOD_LONG = "5m", 50, 200
 LEVERAGE, TRADE_SIZE = 10, 10
-TP_PERCENT, SL_PERCENT = 3.0, 1.5
+TP_PERCENT, SL_PERCENT = 1.5, 1.5
 
 # --- Break-Even Settings ---
-BE_ACTIVATION_PERCENT = 1.0
+BE_ACTIVATION_PERCENT = 1.5
 active_be_positions = {}
 
 # ---------------- SIGNING & HELPERS ----------------
