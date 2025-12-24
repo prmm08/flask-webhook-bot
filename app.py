@@ -1,4 +1,4 @@
-# -------- V 3.7: BINGX FUTURES - KORRIGIERTE POSITIONSPRÜFUNG --------
+# -------- V 3.8: BINGX FUTURES - EMA CALCULATION FIX --------
 
 import time
 import hmac
@@ -55,18 +55,16 @@ def get_ohlcv(symbol, interval="1m", limit=100):
     except: return []
 
 def get_open_positions():
-    """Holt alle aktuell offenen Positionen und normalisiert sie."""
     ts = str(int(time.time() * 1000))
     params = {"timestamp": ts}
     url = f"{BINGX_BASE}/openApi/swap/v2/user/positions?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
     try:
         r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
-        # Die API liefert eine Liste von Positionsobjekten
         return r.get("data", [])
     except: return []
 
-# ---------------- INDIKATOREN (Unverändert) ----------------
-# ... (Funktionen calc_rsi, calc_ema sind unverändert) ...
+# ---------------- INDIKATOREN (FIXED) ----------------
+
 def calc_rsi(closes, period):
     if len(closes) < period + 1: return 50
     gains = [max(0, closes[-i] - closes[-i-1]) for i in range(1, period + 1)]
@@ -77,15 +75,19 @@ def calc_rsi(closes, period):
     return 100 - (100 / (1 + rs))
 
 def calc_ema(closes, period):
+    """Berechnet den EMA korrekt."""
+    if not closes or len(closes) < 1: return 0
     if len(closes) < period: return closes[-1]
+    
     alpha = 2 / (period + 1)
-    ema = closes
+    # WICHTIG: Startwert ist der erste Preis als Zahl, nicht die Liste
+    ema = float(closes[0]) 
     for price in closes[1:]:
-        ema = (price * alpha) + (ema * (1 - alpha))
+        ema = (float(price) * alpha) + (ema * (1 - alpha))
     return ema
 
-# ---------------- POSITION ACTIONS (Unverändert) ----------------
-# ... (Funktionen close_position_market, set_tp_sl sind unverändert) ...
+# ---------------- POSITION ACTIONS ----------------
+
 def close_position_market(symbol):
     ts = str(int(time.time() * 1000))
     params = {
@@ -94,7 +96,7 @@ def close_position_market(symbol):
     }
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
     requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-    print(f"[BREAK-EVEN] {symbol} bei Entry geschlossen.")
+    print(f"[BREAK-EVEN] {symbol} geschlossen.")
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
     def place_order(price, o_type):
@@ -108,65 +110,45 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
     place_order(tp_price, "TAKE_PROFIT_MARKET")
     place_order(sl_price, "STOP_MARKET")
 
-# ---------------- BREAK-EVEN MONITOR (Geändert) ----------------
+# ---------------- MONITOR & EXECUTION ----------------
 
 def monitor_break_even():
     while True:
         try:
             positions = get_open_positions()
-            
-            # Sammle alle aktuell offenen LONG Positionssymbole aus der API-Antwort
-            active_long_symbols = [
-                p['symbol'] for p in positions 
-                if p.get('positionSide') == 'LONG' and float(p.get('positionAmt', 0)) > 0
-            ]
-            
-            # Aufräumen der internen BE-Liste (entferne Symbole, die nicht mehr offen sind)
+            active_long_symbols = [p['symbol'] for p in positions if p.get('positionSide') == 'LONG' and float(p.get('positionAmt', 0)) > 0]
             for sym in list(active_be_positions.keys()):
-                if sym not in active_long_symbols:
-                    del active_be_positions[sym]
+                if sym not in active_long_symbols: del active_be_positions[sym]
 
             for pos in positions:
-                # WICHTIG: Prüfe hier konsistent auf positionSide 'LONG'
                 if pos.get('positionSide') == 'LONG' and float(pos.get('positionAmt', 0)) > 0:
                     symbol = pos['symbol']
                     entry_price = float(pos['avgPrice'])
                     current_price = get_price_bingx(symbol)
                     if not current_price: continue
-
                     profit_pct = (current_price - entry_price) / entry_price * 100
-
                     if profit_pct >= BE_ACTIVATION_PERCENT and symbol not in active_be_positions:
                         active_be_positions[symbol] = True
-                        print(f"[BE-MODUS] Aktiviert für {symbol} (Profit: {profit_pct:.2f}%)")
-
+                        print(f"[BE-MODUS] Aktiviert für {symbol}")
                     if active_be_positions.get(symbol) and current_price <= entry_price:
                         close_position_market(symbol)
                         if symbol in active_be_positions: del active_be_positions[symbol]
-        except Exception as e:
-            print(f"[MONITOR ERROR] {e}")
+        except: pass
         time.sleep(10)
 
-# ---------------- EXECUTION LOGIC (Geändert) ----------------
-
 def execute_trade_bingx(symbol):
-    # Nur ein Order pro Position: Jetzt mit korrekter Feldprüfung
+    # Check ob bereits offen
     positions = get_open_positions()
-    is_position_open = any(
-        p['symbol'] == symbol and 
-        p.get('positionSide') == 'LONG' and 
-        float(p.get('positionAmt', 0)) > 0 
-        for p in positions
-    )
-
-    if is_position_open:
+    if any(p['symbol'] == symbol and p.get('positionSide') == 'LONG' and float(p.get('positionAmt', 0)) > 0 for p in positions):
         print(f"[SKIP] {symbol} bereits offen.")
         return
 
-    # Rest der Logik (Indikatoren, Order Platzierung)
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
     ohlcv_ema = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD)
-    if not ohlcv_rsi or not ohlcv_ema: return
+    
+    if not ohlcv_rsi or not ohlcv_ema:
+        print(f"[ERROR] Keine Marktdaten für {symbol}")
+        return
     
     rsi = calc_rsi([float(c["close"]) for c in ohlcv_rsi], RSI_PERIOD)
     ema = calc_ema([float(c["close"]) for c in ohlcv_ema], EMA_PERIOD)
@@ -180,28 +162,20 @@ def execute_trade_bingx(symbol):
             "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts
         }
         requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_params.items()))}&signature={sign_bingx(entry_params)}", headers={"X-BX-APIKEY": API_KEY})
-        
         time.sleep(1)
         set_tp_sl(symbol, qty, current_price*(1+TP_PERCENT/100), current_price*(1-SL_PERCENT/100))
-        print(f"[ENTRY] {symbol} @ {current_price} ausgeführt.")
-    else:
-        print(f"[SKIP] {symbol} Filter nicht erfüllt.")
+        print(f"[ENTRY] {symbol} ausgeführt.")
 
-# ---------------- WEBHOOK (Unverändert) ----------------
+# ---------------- WEBHOOK ----------------
 
 @app.route("/testorder", methods=["POST", "GET"])
 def handle_alert():
     if request.method == "GET": return jsonify({"status": "ok"}), 200
-    
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
-    
-    if not currency: 
-        return jsonify({"status": "ignored", "reason": "No currency provided"}), 200
-    
+    if not currency: return jsonify({"status": "ignored"}), 200
     symbol = f"{currency}-USDT"
     threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
-    
     return jsonify({"status": "processing", "symbol": symbol}), 200
 
 if __name__ == "__main__":
