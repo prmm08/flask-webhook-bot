@@ -1,4 +1,4 @@
-# -------- V 4.0: BINGX FUTURES - MULTI-ENTRY (EMA 50/200 & RSI FILTER) --------
+# -------- V 4.1: BINGX FUTURES - MULTI-ENTRY (GEÄNDERTE EMA HIERARCHIE) --------
 
 import time
 import hmac
@@ -24,12 +24,12 @@ RSI_TIMEFRAME = "1m"
 RSI_PERIOD = 14
 RSI_THRESHOLD = 75
 EMA_TIMEFRAME = "3m"
-EMA_PERIOD = 200       # Kurzer EMA (50)
-EMA_PERIOD_LONG = 200 # Langer EMA (200)
+EMA_PERIOD_SHORT = 50   # Kurzer EMA (50)
+EMA_PERIOD_LONG = 200   # Langer EMA (200)
 
 LEVERAGE = 10
 TRADE_SIZE = 10       
-TP_PERCENT, SL_PERCENT = 3.0, 3.0
+TP_PERCENT, SL_PERCENT = 3.0, 1.5
 
 # --- Break-Even Settings ---
 BE_ACTIVATION_PERCENT = 1.0
@@ -80,7 +80,7 @@ def calc_ema(closes, period):
     if not closes or len(closes) < 1: return 0
     if len(closes) < period: return closes[-1]
     alpha = 2 / (period + 1)
-    ema = float(closes[0])
+    ema = float(closes)
     for price in closes[1:]:
         ema = (float(price) * alpha) + (ema * (1 - alpha))
     return ema
@@ -103,7 +103,7 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
         params = {
             "symbol": symbol, "side": "SELL", "positionSide": "LONG",
             "type": o_type, "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
-            "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts
+            "workingType": "MARKET_PRICE", "closePosition": "true", "timestamp": ts
         }
         requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}", headers={"X-BX-APIKEY": API_KEY})
     place_order(tp_price, "TAKE_PROFIT_MARKET")
@@ -138,30 +138,28 @@ def monitor_break_even():
         except: pass
         time.sleep(10)
 
-# ---------------- EXECUTION LOGIC (MULTI-ENTRY) ----------------
+# ---------------- EXECUTION LOGIC (GEÄNDERT) ----------------
 
 def execute_trade_bingx(symbol):
-    # Prüfung auf offene Positionen entfernt -> Multi-Entry aktiv.
-
     # Daten für Indikatoren abrufen
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
-    ohlcv_ema_short = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD)
+    ohlcv_ema_short = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD_SHORT)
     ohlcv_ema_long = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD_LONG)
     
     if not ohlcv_rsi or not ohlcv_ema_short or not ohlcv_ema_long:
-        #print(f"[ERROR] Nicht genügend Marktdaten für {symbol}")
+        print(f"[ERROR] Nicht genügend Marktdaten für {symbol}")
         return
     
     # Indikatoren berechnen
     rsi = calc_rsi([float(c["close"]) for c in ohlcv_rsi], RSI_PERIOD)
-    ema_short = calc_ema([float(c["close"]) for c in ohlcv_ema_short], EMA_PERIOD)
+    ema_short = calc_ema([float(c["close"]) for c in ohlcv_ema_short], EMA_PERIOD_SHORT)
     ema_long = calc_ema([float(c["close"]) for c in ohlcv_ema_long], EMA_PERIOD_LONG)
     
     current_price = get_price_bingx(symbol)
     
     if current_price:
-        # Bedingung: RSI >= Threshold UND Preis > EMA 50 UND Preis < EMA 200
-        if rsi >= RSI_THRESHOLD and current_price > ema_short:# and current_price < ema_long:
+        # Bedingung: RSI >= Threshold UND Preis > EMA Long UND EMA Long > EMA Short
+        if rsi >= RSI_THRESHOLD and current_price > ema_long and ema_long > ema_short:
             qty = round(TRADE_SIZE / current_price, 6)
             ts = str(int(time.time() * 1000))
             entry_params = {
@@ -172,9 +170,9 @@ def execute_trade_bingx(symbol):
             
             time.sleep(1)
             set_tp_sl(symbol, qty, current_price*(1+TP_PERCENT/100), current_price*(1-SL_PERCENT/100))
-            print(f"[ENTRY] {symbol} @ {current_price} (RSI: {rsi:.1f}, EMA50: {ema_short:.2f}, EMA200: {ema_long:.2f}).")
+            print(f"[ENTRY] {symbol} @ {current_price} ausgeführt.")
         else:
-            print(f"[SKIP] {symbol} Filter nicht erfüllt.")
+            print(f"[SKIP] {symbol} Filter nicht erfüllt (RSI: {rsi:.1f} | Preis > EMA200: {current_price > ema_long} | EMA200 > EMA50: {ema_long > ema_short}).")
 
 # ---------------- WEBHOOK ----------------
 
@@ -183,7 +181,6 @@ def handle_alert():
     if request.method == "GET": return jsonify({"status": "ok"}), 200
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
-    
     if not currency: return jsonify({"status": "ignored"}), 200
     symbol = f"{currency}-USDT"
     threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
