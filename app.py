@@ -27,10 +27,10 @@ EMA_TIMEFRAME = "5m"
 EMA_PERIOD = 50
 LEVERAGE = 10
 TRADE_SIZE = 10       
-TP_PERCENT, SL_PERCENT = 3.0, 1.5
+TP_PERCENT, SL_PERCENT = 5.0, 1.5
 
 # --- Break-Even Settings ---
-BE_ACTIVATION_PERCENT = 1.0
+BE_ACTIVATION_PERCENT = 0.5
 active_be_positions = {}
 
 # ---------------- SIGNING & HELPERS ----------------
