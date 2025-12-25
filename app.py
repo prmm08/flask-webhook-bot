@@ -1,4 +1,4 @@
-# -------- V 4.8: BINGX FUTURES - KORREKTER WORKINGTYPE FIX --------
+# -------- V 4.9: BINGX FUTURES - EMA LIST FIX & WORKINGTYPE UPDATE --------
 
 import time, hmac, hashlib, requests, os, urllib.parse, threading, json, logging
 from flask import Flask, request, jsonify
@@ -19,7 +19,7 @@ app = Flask(__name__)
 RSI_TIMEFRAME, RSI_PERIOD, RSI_THRESHOLD = "1m", 14, 75
 EMA_TIMEFRAME, EMA_PERIOD_SHORT, EMA_PERIOD_LONG = "5m", 50, 200
 LEVERAGE, TRADE_SIZE = 10, 10
-TP_PERCENT, SL_PERCENT = 3.0, 1.5
+TP_PERCENT, SL_PERCENT = 5.0, 1.5
 
 # --- Break-Even Settings ---
 BE_ACTIVATION_PERCENT = 1.0
@@ -55,7 +55,7 @@ def get_open_positions():
         return r.get("data", [])
     except: return []
 
-# ---------------- INDIKATOREN ----------------
+# ---------------- INDIKATOREN (FIXED) ----------------
 
 def calc_rsi(closes, period):
     if len(closes) < period + 1: return 50
@@ -67,10 +67,13 @@ def calc_rsi(closes, period):
     return 100 - (100 / (1 + rs))
 
 def calc_ema(closes, period):
+    """Berechnet den EMA korrekt (Fix: Zugriff auf Index 0)."""
     if not closes or len(closes) < 1: return 0
     if len(closes) < period: return float(closes[-1])
+    
     alpha = 2 / (period + 1)
-    ema = float(closes) 
+    # FIX: Startwert ist der erste Wert der Liste, nicht die Liste selbst
+    ema = float(closes[0]) 
     for price in closes[1:]:
         ema = (float(price) * alpha) + (ema * (1 - alpha))
     return ema
@@ -87,8 +90,8 @@ def close_position_market(symbol):
     logging.info(f"[BREAK-EVEN] {symbol} Position geschlossen.")
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
-    # FIX: workingType auf CONTRACT_PRICE geändert, um API-Fehler zu vermeiden
-    def place_order_robust(price, o_type, w_type="CONTRACT_PRICE"):
+    # FIX: workingType basierend auf API-Error auf MARK_PRICE gesetzt
+    def place_order_robust(price, o_type, w_type="MARK_PRICE"):
         for i in range(5): 
             ts = str(int(time.time() * 1000))
             params = {
@@ -109,8 +112,7 @@ def set_tp_sl(symbol, qty, tp_price, sl_price):
     place_order_robust(tp_price, "TAKE_PROFIT_MARKET")
     place_order_robust(sl_price, "STOP_MARKET")
 
-
-# ---------------- MONITOREN (Unverändert) ----------------
+# ---------------- MONITOREN ----------------
 
 def monitor_break_even():
     while True:
@@ -133,20 +135,17 @@ def monitor_break_even():
                     if active_be_positions.get(symbol) and current_price <= entry_price:
                         close_position_market(symbol)
                         if symbol in active_be_positions: del active_be_positions[symbol]
-        except Exception as e:
-            logging.debug(f"Monitor Tick Error: {e}")
+        except: pass
         time.sleep(10)
 
 def keep_alive_monitor():
     while True:
-        time.sleep(60)
+        time.sleep(60) # 1 Minute
         try:
             requests.get(f"{APP_URL}/testorder", timeout=10)
-            # logging.info("[KEEPALIVE] Ping erfolgreich.") # Weniger Logs
-        except Exception as e:
-            logging.warning(f"[KEEPALIVE] Ping fehlgeschlagen: {e}")
+        except: pass
 
-# ---------------- EXECUTION LOGIC (Unverändert, aber calls fixed set_tp_sl) ----------------
+# ---------------- EXECUTION LOGIC ----------------
 
 def execute_trade_bingx(symbol):
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
@@ -163,6 +162,7 @@ def execute_trade_bingx(symbol):
     current_price = get_price_bingx(symbol)
     
     if current_price:
+        # Logik: RSI >= 75 UND Preis > EMA200 UND EMA200 > EMA50
         if rsi >= RSI_THRESHOLD and current_price > ema_long and ema_long > ema_short:
             qty = round(TRADE_SIZE / current_price, 6)
             ts = str(int(time.time() * 1000))
@@ -174,14 +174,14 @@ def execute_trade_bingx(symbol):
             
             if res.get("code") == 0:
                 logging.info(f"[ORDER] {symbol} Entry bei {current_price}")
-                # Wartezeit und TP/SL Logik sind in set_tp_sl_robust integriert
+                time.sleep(2)
                 set_tp_sl(symbol, qty, current_price*(1+TP_PERCENT/100), current_price*(1-SL_PERCENT/100))
             else:
                 logging.error(f"Entry Error: {res.get('msg')}")
         else:
             logging.info(f"[SKIP] {symbol} Filter nicht erfüllt.")
 
-# ---------------- WEBHOOK (Unverändert) ----------------
+# ---------------- WEBHOOK ----------------
 
 @app.route("/testorder", methods=["POST", "GET"])
 def handle_alert():
