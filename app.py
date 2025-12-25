@@ -1,26 +1,30 @@
-# -------- V 4.5: BINGX FUTURES - MULTI-ENTRY (ALLE FUNKTIONEN + FIX) --------
+# -------- V 4.7: BINGX FUTURES - KEEPALIVE (1 MIN) + HIGH-RELIABILITY TP/SL --------
 
-import time, hmac, hashlib, requests, os, urllib.parse, threading
+import time, hmac, hashlib, requests, os, urllib.parse, threading, json, logging
 from flask import Flask, request, jsonify
-import logging
 
 # --- API Konfiguration ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
+# WICHTIG: Setze deine Render/App URL in den Umgebungsvariablen für den Keep-Alive Ping
+APP_URL = os.getenv("APP_URL", "http://localhost:5000") 
 
+# Logging Setup
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
+log.setLevel(logging.ERROR) 
+
 app = Flask(__name__)
 
 # --- Strategie Settings ---
 RSI_TIMEFRAME, RSI_PERIOD, RSI_THRESHOLD = "1m", 14, 75
-EMA_TIMEFRAME, EMA_PERIOD_SHORT, EMA_PERIOD_LONG = "5m", 50, 200
+EMA_TIMEFRAME, EMA_PERIOD_SHORT, EMA_PERIOD_LONG = "3m", 50, 200
 LEVERAGE, TRADE_SIZE = 10, 10
-TP_PERCENT, SL_PERCENT = 1.5, 1.5
+TP_PERCENT, SL_PERCENT = 5.0, 1.5
 
 # --- Break-Even Settings ---
-BE_ACTIVATION_PERCENT = 1.5
+BE_ACTIVATION_PERCENT = 1.0
 active_be_positions = {}
 
 # ---------------- SIGNING & HELPERS ----------------
@@ -68,7 +72,7 @@ def calc_ema(closes, period):
     if not closes or len(closes) < 1: return 0
     if len(closes) < period: return float(closes[-1])
     alpha = 2 / (period + 1)
-    ema = float(closes[0]) # FIX: Verwende Index [0]
+    ema = float(closes[0])
     for price in closes[1:]:
         ema = (float(price) * alpha) + (ema * (1 - alpha))
     return ema
@@ -82,24 +86,30 @@ def close_position_market(symbol):
         "type": "MARKET", "closePosition": "true", "timestamp": ts
     }
     requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}", headers={"X-BX-APIKEY": API_KEY})
-    print(f"[BREAK-EVEN] {symbol} Position geschlossen.")
+    logging.info(f"[BREAK-EVEN] {symbol} geschlossen.")
 
 def set_tp_sl(symbol, qty, tp_price, sl_price):
-    def place_order(price, o_type):
-        ts = str(int(time.time() * 1000))
-        params = {
-            "symbol": symbol, "side": "SELL", "positionSide": "LONG",
-            "type": o_type, "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
-            "workingType": "MARKET_PRICE", "closePosition": "true", "timestamp": ts
-        }
-        requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}", headers={"X-BX-APIKEY": API_KEY})
-    
-    # Debugging der Preise
-    print(f"Setze TP/SL für {symbol}. TP: {tp_price:.5f}, SL: {sl_price:.5f}")
-    place_order(tp_price, "TAKE_PROFIT_MARKET")
-    place_order(sl_price, "STOP_MARKET")
+    def place_order_robust(price, o_type):
+        # BingX braucht manchmal einen Moment, bis die Margin für neue Orders frei ist
+        for i in range(5): 
+            ts = str(int(time.time() * 1000))
+            params = {
+                "symbol": symbol, "side": "SELL", "positionSide": "LONG",
+                "type": o_type, "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
+                "workingType": "MARKET_PRICE", "closePosition": "true", "timestamp": ts
+            }
+            response = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}", headers={"X-BX-APIKEY": API_KEY}).json()
+            if response.get("code") == 0:
+                logging.info(f"SUCCESS: {o_type} für {symbol} platziert.")
+                return True
+            logging.warning(f"RETRY {i+1}/5: {o_type} für {symbol} fehlgeschlagen: {response.get('msg')}")
+            time.sleep(2)
+        return False
 
-# ---------------- BREAK-EVEN MONITOR ----------------
+    threading.Thread(target=place_order_robust, args=(tp_price, "TAKE_PROFIT_MARKET")).start()
+    threading.Thread(target=place_order_robust, args=(sl_price, "STOP_MARKET")).start()
+
+# ---------------- MONITOREN ----------------
 
 def monitor_break_even():
     while True:
@@ -118,16 +128,25 @@ def monitor_break_even():
                     profit_pct = (current_price - entry_price) / entry_price * 100
                     if profit_pct >= BE_ACTIVATION_PERCENT and symbol not in active_be_positions:
                         active_be_positions[symbol] = True
-                        print(f"[BE-MODUS] Aktiviert für {symbol}")
+                        logging.info(f"[BE-READY] {symbol} erreicht {BE_ACTIVATION_PERCENT}% Gewinn.")
                     if active_be_positions.get(symbol) and current_price <= entry_price:
                         close_position_market(symbol)
                         if symbol in active_be_positions: del active_be_positions[symbol]
         except Exception as e:
-            # print(f"[MONITOR ERROR] {e}") # Zu viele Logs
-            pass
+            logging.debug(f"Monitor Tick Error: {e}")
         time.sleep(10)
 
-# ---------------- EXECUTION LOGIC (INKL TP/SL FIX) ----------------
+def keep_alive_monitor():
+    """Ping alle 60 Sekunden, um Inaktivität zu verhindern."""
+    while True:
+        time.sleep(60)
+        try:
+            requests.get(f"{APP_URL}/testorder", timeout=10)
+            logging.info("[KEEPALIVE] Ping erfolgreich.")
+        except Exception as e:
+            logging.warning(f"[KEEPALIVE] Ping fehlgeschlagen: {e}")
+
+# ---------------- EXECUTION LOGIC ----------------
 
 def execute_trade_bingx(symbol):
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
@@ -135,7 +154,7 @@ def execute_trade_bingx(symbol):
     ohlcv_ema_long = get_ohlcv(symbol, EMA_TIMEFRAME, limit=EMA_PERIOD_LONG)
     
     if not ohlcv_rsi or not ohlcv_ema_short or not ohlcv_ema_long:
-        #print(f"[ERROR] Nicht genügend Marktdaten für {symbol}")
+        logging.error(f"Datenfehler für {symbol}")
         return
     
     rsi = calc_rsi([float(c["close"]) for c in ohlcv_rsi], RSI_PERIOD)
@@ -144,6 +163,7 @@ def execute_trade_bingx(symbol):
     current_price = get_price_bingx(symbol)
     
     if current_price:
+        # Logik: RSI >= 75 UND Preis > EMA200 UND EMA200 > EMA50
         if rsi >= RSI_THRESHOLD and current_price > ema_long and ema_long > ema_short:
             qty = round(TRADE_SIZE / current_price, 6)
             ts = str(int(time.time() * 1000))
@@ -151,31 +171,33 @@ def execute_trade_bingx(symbol):
                 "symbol": symbol, "side": "BUY", "positionSide": "LONG", 
                 "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts
             }
-            # ORDER PLATZIEREN
-            entry_response = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_params.items()))}&signature={sign_bingx(entry_params)}", headers={"X-BX-APIKEY": API_KEY}).json()
-            print(f"[ENTRY RESPONSE] {entry_response}")
+            res = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_params.items()))}&signature={sign_bingx(entry_params)}", headers={"X-BX-APIKEY": API_KEY}).json()
             
-            # WICHTIG: Kurze Pause, damit BingX die Position erkennt, bevor TP/SL gesetzt wird
-            time.sleep(2) 
-            
-            # TP/SL PLATZIEREN
-            set_tp_sl(symbol, qty, current_price*(1+TP_PERCENT/100), current_price*(1-SL_PERCENT/100))
-            print(f"[ENTRY] {symbol} ausgeführt und TP/SL gesetzt.")
+            if res.get("code") == 0:
+                logging.info(f"[ORDER] {symbol} Entry bei {current_price}")
+                time.sleep(3) # Mehr Zeit für BingX zum Verarbeiten der Position
+                set_tp_sl(symbol, qty, current_price*(1+TP_PERCENT/100), current_price*(1-SL_PERCENT/100))
+            else:
+                logging.error(f"Entry Error: {res.get('msg')}")
         else:
-            print(f"[SKIP] {symbol} Filter nicht erfüllt.")
+            logging.info(f"[SKIP] {symbol} Filter nicht erfüllt (RSI: {rsi:.1f})")
 
 # ---------------- WEBHOOK ----------------
 
 @app.route("/testorder", methods=["POST", "GET"])
 def handle_alert():
-    if request.method == "GET": return jsonify({"status": "ok"}), 200
+    if request.method == "GET": 
+        return jsonify({"status": "active"}), 200
+    
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
-    if not currency: return jsonify({"status": "ignored"}), 200
+    if not currency: return jsonify({"status": "no_currency"}), 200
+    
     symbol = f"{currency}-USDT"
     threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
     return jsonify({"status": "processing", "symbol": symbol}), 200
 
 if __name__ == "__main__":
     threading.Thread(target=monitor_break_even, daemon=True).start()
+    threading.Thread(target=keep_alive_monitor, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
