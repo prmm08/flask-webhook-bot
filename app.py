@@ -167,7 +167,7 @@ def execute_trade_bingx(symbol):
             qty = round(TRADE_SIZE / current_price, 6)
             ts = str(int(time.time() * 1000))
             entry_params = {
-                "symbol": symbol, "side": "BUY", "positionSide": "LONG", 
+                "symbol": symbol, "side": "SELL", "positionSide": "SHORT", 
                 "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts
             }
             res = requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_params.items()))}&signature={sign_bingx(entry_params)}", headers={"X-BX-APIKEY": API_KEY}).json()
