@@ -19,7 +19,7 @@ app = Flask(__name__)
 LEVERAGE = 10
 TRADE_SIZE = 10
 TP_PERCENT = 20          # TP basiert auf Durchschnittspreis
-SL_PERCENT_HARD = 5    # Fixer SL = -20% vom ersten Entry
+SL_PERCENT_HARD = 5.0    # Fixer SL = -20% vom ersten Entry
 
 # --- DCA Settings ---
 DCA_STEP_PERCENT = 5.0  # -5% vom letzten DCA-Preis → neuer LONG
