@@ -1,4 +1,4 @@
-# -------- V 5.2 SHORT + DCA: BINGX FUTURES --------
+# -------- V 5.2 LONG + DCA: BINGX FUTURES --------
 
 import time, hmac, hashlib, requests, os, urllib.parse, threading, logging
 from flask import Flask, request, jsonify
@@ -19,11 +19,11 @@ app = Flask(__name__)
 LEVERAGE = 10
 TRADE_SIZE = 10
 TP_PERCENT = 5          # TP basiert auf Durchschnittspreis
-SL_PERCENT_HARD = 20      # Fixer SL = +20% vom ersten Entry
+SL_PERCENT_HARD = 20    # Fixer SL = -20% vom ersten Entry
 
 # --- DCA Settings ---
-DCA_STEP_PERCENT = 5.0    # +5% vom letzten DCA-Preis → neuer Short
-DCA_MAX_COUNT = 3         # max. 3 Nachkäufe
+DCA_STEP_PERCENT = 5.0  # -5% vom letzten DCA-Preis → neuer LONG
+DCA_MAX_COUNT = 3       # max. 3 Nachkäufe
 
 # DCA-State pro Symbol
 dca_states = {}
@@ -47,7 +47,7 @@ def get_price_bingx(symbol):
 def close_position_market(symbol):
     ts = str(int(time.time() * 1000))
     params = {
-        "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
+        "symbol": symbol, "side": "SELL", "positionSide": "LONG",
         "type": "MARKET", "closePosition": "true", "timestamp": ts
     }
     requests.post(
@@ -56,7 +56,7 @@ def close_position_market(symbol):
         f"&signature={sign_bingx(params)}",
         headers={"X-BX-APIKEY": API_KEY}
     )
-    logging.info(f"[CLOSE] {symbol} SHORT Position geschlossen.")
+    logging.info(f"[CLOSE] {symbol} LONG Position geschlossen.")
 
     if symbol in dca_states:
         del dca_states[symbol]
@@ -68,7 +68,7 @@ def place_sl_once(symbol, qty, sl_price):
     def place(price):
         ts = str(int(time.time() * 1000))
         params = {
-            "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
+            "symbol": symbol, "side": "SELL", "positionSide": "LONG",
             "type": "STOP_MARKET", "quantity": str(qty),
             "stopPrice": "{:.6f}".format(price),
             "workingType": "MARK_PRICE",
@@ -94,12 +94,12 @@ def set_tp_dynamic(symbol, qty, avg_entry):
     """
     TP wird nach jedem DCA neu gesetzt.
     """
-    tp_price = avg_entry * (1 - TP_PERCENT / 100)
+    tp_price = avg_entry * (1 + TP_PERCENT / 100)
 
     def place(price):
         ts = str(int(time.time() * 1000))
         params = {
-            "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
+            "symbol": symbol, "side": "SELL", "positionSide": "LONG",
             "type": "TAKE_PROFIT_MARKET", "quantity": str(qty),
             "stopPrice": "{:.6f}".format(price),
             "workingType": "MARK_PRICE",
@@ -145,18 +145,18 @@ def monitor_dca(symbol):
             sl_price = state["sl_price"]
 
             # --- HARTE NOTBREMSE ---
-            if current_price >= sl_price:
-                logging.warning(f"[STOP] {symbol} Preis erreicht SL. Schließe Position.")
+            if current_price <= sl_price:
+                logging.warning(f"[STOP] {symbol} Preis unter SL. Schließe Position.")
                 close_position_market(symbol)
                 break
 
             # --- DCA TRIGGER ---
-            if dca_count < DCA_MAX_COUNT and current_price >= last_dca_price * 1.05:
-                logging.info(f"[DCA] Trigger für {symbol}: +5% erreicht. DCA #{dca_count+1}")
+            if dca_count < DCA_MAX_COUNT and current_price <= last_dca_price * 0.95:
+                logging.info(f"[DCA] Trigger für {symbol}: -5% erreicht. DCA #{dca_count+1}")
 
                 ts = str(int(time.time() * 1000))
                 params = {
-                    "symbol": symbol, "side": "SELL", "positionSide": "SHORT",
+                    "symbol": symbol, "side": "BUY", "positionSide": "LONG",
                     "type": "MARKET", "quantity": str(base_qty),
                     "leverage": str(LEVERAGE), "timestamp": ts
                 }
@@ -193,14 +193,13 @@ def monitor_dca(symbol):
 def execute_trade_bingx(symbol):
     current_price = get_price_bingx(symbol)
     if not current_price:
-        logging.error(f"[ERROR] Preisfehler für {symbol}")
         return
 
     qty = round(TRADE_SIZE / current_price, 6)
     ts = str(int(time.time() * 1000))
 
     entry_params = {
-        "symbol": symbol, "side": "SELL", "positionSide": "SHORT",
+        "symbol": symbol, "side": "BUY", "positionSide": "LONG",
         "type": "MARKET", "quantity": str(qty),
         "leverage": str(LEVERAGE), "timestamp": ts
     }
@@ -216,10 +215,10 @@ def execute_trade_bingx(symbol):
         logging.error(f"[ERROR] Entry Error: {res.get('msg')}")
         return
 
-    logging.info(f"[ORDER] SHORT Entry {symbol} @ {current_price}")
+    logging.info(f"[ORDER] LONG Entry {symbol} @ {current_price}")
 
     initial_entry = current_price
-    sl_price = initial_entry * 1.20
+    sl_price = initial_entry * 0.80  # -20%
 
     dca_states[symbol] = {
         "initial_entry": initial_entry,
