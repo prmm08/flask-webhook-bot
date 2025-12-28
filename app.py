@@ -1,4 +1,4 @@
-# -------- V 5.2 LONG + DCA: BINGX FUTURES --------
+# -------- V 5.3 LONG + DCA: BINGX FUTURES --------
 
 import time, hmac, hashlib, requests, os, urllib.parse, threading, logging
 from flask import Flask, request, jsonify
@@ -218,9 +218,10 @@ def execute_trade_bingx(symbol):
     logging.info(f"[ORDER] LONG Entry {symbol} @ {current_price}")
 
     # -------------------------
-    # ✔️ KORRIGIERTER SL-BLOCK
+    # ✔️ KORREKTER SL-BLOCK
     # -------------------------
-    sl_price = initial_entry * (1 - SL_PERCENT_HARD / 100)  # z.B. -5%
+    initial_entry = current_price
+    sl_price = initial_entry * (1 - SL_PERCENT_HARD / 100)
     # -------------------------
 
     dca_states[symbol] = {
