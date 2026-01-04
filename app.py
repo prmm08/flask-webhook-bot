@@ -138,9 +138,9 @@ def execute_trade_bingx(symbol):
         
         side = None
         if rsi >= 80:
-            side = "LONG"
-        elif rsi <= 25:
             side = "SHORT"
+        elif rsi <= 25:
+            side = "LONG"
             
         if side:
             price = get_price_bingx(symbol)
