@@ -1,32 +1,31 @@
-# -------- V 5.3 LONG + DCA: BINGX FUTURES --------
+# -------- V 2.7: BINGX FUTURES - LONG (RSI >= 75) & SHORT (RSI <= 50) --------
 
-import time, hmac, hashlib, requests, os, urllib.parse, threading, logging
+import time
+import hmac
+import hashlib
+import requests
+import os
+import urllib.parse
+import threading
 from flask import Flask, request, jsonify
+import logging
 
 # --- API Konfiguration ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
-APP_URL = os.getenv("APP_URL", "http://localhost:5000")
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
-
 app = Flask(__name__)
 
-# --- Strategie Settings ---
+# Globale Settings
+RSI_TIMEFRAME = "1m"
+TP_PERCENT, SL_PERCENT, BE_PERCENT = 5.0, 5.0, 1.0
+TRADE_SIZE = 10  # USDT
 LEVERAGE = 10
-TRADE_SIZE = 10
-TP_PERCENT = 20          # Beispiel: +20%
-SL_PERCENT_HARD = 5      # Beispiel: -5%
 
-# --- DCA Settings ---
-DCA_STEP_PERCENT = 5.0   # -5% vom letzten DCA-Preis → neuer LONG
-DCA_MAX_COUNT = 3        # max. 3 Nachkäufe
-
-# DCA-State pro Symbol
-dca_states = {}
+order_lock = threading.Lock()
 
 # ---------------- SIGNING & HELPERS ----------------
 
@@ -39,229 +38,156 @@ def get_price_bingx(symbol):
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
         r = requests.get(url, params={"symbol": symbol}, timeout=10).json()
         return float(r["data"]["price"])
-    except:
-        return None
+    except: return None
+
+def get_ohlcv(symbol, interval="1m", limit=100):
+    try:
+        url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = requests.get(url, params=params, timeout=10).json()
+        return r.get("data", [])
+    except: return []
+
+def calc_rsi(closes, period=14):
+    if len(closes) < period + 1: return 50
+    gains = [max(0, closes[-i] - closes[-i-1]) for i in range(1, period + 1)]
+    losses = [abs(min(0, closes[-i] - closes[-i-1])) for i in range(1, period + 1)]
+    avg_gain = sum(gains) / period or 0.0001
+    avg_loss = sum(losses) / period or 0.0001
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 # ---------------- POSITION ACTIONS ----------------
 
+def has_active_position(symbol):
+    try:
+        ts = str(int(time.time() * 1000))
+        params = {"symbol": symbol, "timestamp": ts}
+        params["signature"] = sign_bingx(params)
+        r = requests.get(f"{BINGX_BASE}/openApi/swap/v2/user/positions", params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        for p in r.get("data", []):
+             if abs(float(p.get("positionAmt", 0))) > 0: return True
+        return False
+    except: return False
+
 def close_position_market(symbol):
     ts = str(int(time.time() * 1000))
-    params = {
-        "symbol": symbol, "side": "SELL", "positionSide": "LONG",
-        "type": "MARKET", "closePosition": "true", "timestamp": ts
-    }
-    requests.post(
-        f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
-        f"{urllib.parse.urlencode(sorted(params.items()))}"
-        f"&signature={sign_bingx(params)}",
-        headers={"X-BX-APIKEY": API_KEY}
-    )
-    logging.info(f"[CLOSE] {symbol} LONG Position geschlossen.")
+    params = {"symbol": symbol, "timestamp": ts}
+    qs = urllib.parse.urlencode(sorted(params.items()))
+    sig = sign_bingx(params)
+    url = f"{BINGX_BASE}/openApi/swap/v2/trade/closeAllPositions?{qs}&signature={sig}"
+    requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+    print(f"[EXIT] {symbol} Markt-Close ausgeführt.")
 
-    if symbol in dca_states:
-        del dca_states[symbol]
-
-def place_sl_once(symbol, qty, sl_price):
-    """
-    Fixer SL, wird nur einmal gesetzt.
-    """
-    def place(price):
+def set_tp_sl(symbol, qty, tp_price, sl_price, side):
+    # Wenn wir LONG sind (BUY), ist der Exit SELL. Wenn wir SHORT sind (SELL), ist der Exit BUY.
+    exit_side = "SELL" if side == "LONG" else "BUY"
+    
+    def place_order(price, o_type):
         ts = str(int(time.time() * 1000))
         params = {
-            "symbol": symbol, "side": "SELL", "positionSide": "LONG",
-            "type": "STOP_MARKET", "quantity": str(qty),
-            "stopPrice": "{:.6f}".format(price),
-            "workingType": "MARK_PRICE",
-            "closePosition": "true",
-            "timestamp": ts
+            "symbol": symbol, "side": exit_side, "positionSide": side,
+            "type": o_type, "quantity": str(qty), "stopPrice": "{:.6f}".format(price),
+            "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": ts
         }
-        return requests.post(
-            f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
-            f"{urllib.parse.urlencode(sorted(params.items()))}"
-            f"&signature={sign_bingx(params)}",
-            headers={"X-BX-APIKEY": API_KEY}
-        ).json()
+        requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}", headers={"X-BX-APIKEY": API_KEY})
+    
+    place_order(tp_price, "TAKE_PROFIT_MARKET")
+    place_order(sl_price, "STOP_MARKET")
 
-    for i in range(5):
-        r = place(sl_price)
-        if r.get("code") == 0:
-            logging.info(f"[SL] Fixer SL gesetzt bei {sl_price:.6f}")
-            return
-        logging.warning(f"[SL] Retry {i+1}/5: {r.get('msg')}")
-        time.sleep(2)
+# ---------------- MONITORING ----------------
 
-def set_tp_dynamic(symbol, qty, avg_entry):
-    """
-    TP wird nach jedem DCA neu gesetzt.
-    """
-    tp_price = avg_entry * (1 + TP_PERCENT / 100)
+def monitor_trade(symbol, entry, tp, sl, be_trigger, side):
+    be_active = False
+    while has_active_position(symbol):
+        curr = get_price_bingx(symbol)
+        if not curr: time.sleep(2); continue
 
-    def place(price):
-        ts = str(int(time.time() * 1000))
-        params = {
-            "symbol": symbol, "side": "SELL", "positionSide": "LONG",
-            "type": "TAKE_PROFIT_MARKET", "quantity": str(qty),
-            "stopPrice": "{:.6f}".format(price),
-            "workingType": "MARK_PRICE",
-            "closePosition": "true",
-            "timestamp": ts
-        }
-        return requests.post(
-            f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
-            f"{urllib.parse.urlencode(sorted(params.items()))}"
-            f"&signature={sign_bingx(params)}",
-            headers={"X-BX-APIKEY": API_KEY}
-        ).json()
-
-    for i in range(5):
-        r = place(tp_price)
-        if r.get("code") == 0:
-            logging.info(f"[TP] TP gesetzt bei {tp_price:.6f}")
-            return
-        logging.warning(f"[TP] Retry {i+1}/5: {r.get('msg')}")
-        time.sleep(2)
-
-# ---------------- DCA MONITOR ----------------
-
-def monitor_dca(symbol):
-    logging.info(f"[DCA] Monitor gestartet für {symbol}")
-
-    while True:
-        try:
-            state = dca_states.get(symbol)
-            if not state or not state["active"]:
+        if side == "LONG":
+            # Break-Even Aktivierung
+            if not be_active and curr >= be_trigger:
+                be_active = True
+                print(f"[BE STATUS] {symbol} (LONG) Profit erreicht. BE-Schutz scharf.")
+            # Break-Even Exit oder TP/SL Check
+            if (be_active and curr <= entry) or (curr >= tp or curr <= sl):
+                close_position_market(symbol)
                 break
-
-            current_price = get_price_bingx(symbol)
-            if not current_price:
-                time.sleep(5)
-                continue
-
-            initial_entry = state["initial_entry"]
-            last_dca_price = state["last_dca_price"]
-            total_qty = state["total_qty"]
-            base_qty = state["base_qty"]
-            dca_count = state["dca_count"]
-            sl_price = state["sl_price"]
-
-            # --- HARTE NOTBREMSE ---
-            if current_price <= sl_price:
-                logging.warning(f"[STOP] {symbol} Preis unter SL. Schließe Position.")
+        else: # SHORT
+            # Break-Even Aktivierung (Preis fällt unter Trigger)
+            if not be_active and curr <= be_trigger:
+                be_active = True
+                print(f"[BE STATUS] {symbol} (SHORT) Profit erreicht. BE-Schutz scharf.")
+            # Break-Even Exit (Preis steigt zurück auf Entry) oder TP/SL Check
+            if (be_active and curr >= entry) or (curr <= tp or curr >= sl):
                 close_position_market(symbol)
                 break
 
-            # --- DCA TRIGGER ---
-            if dca_count < DCA_MAX_COUNT and current_price <= last_dca_price * 0.95:
-                logging.info(f"[DCA] Trigger für {symbol}: -5% erreicht. DCA #{dca_count+1}")
-
-                ts = str(int(time.time() * 1000))
-                params = {
-                    "symbol": symbol, "side": "BUY", "positionSide": "LONG",
-                    "type": "MARKET", "quantity": str(base_qty),
-                    "leverage": str(LEVERAGE), "timestamp": ts
-                }
-                r = requests.post(
-                    f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
-                    f"{urllib.parse.urlencode(sorted(params.items()))}"
-                    f"&signature={sign_bingx(params)}",
-                    headers={"X-BX-APIKEY": API_KEY}
-                ).json()
-
-                if r.get("code") == 0:
-                    new_total = total_qty + base_qty
-                    new_avg = (state["avg_entry"] * total_qty + current_price * base_qty) / new_total
-
-                    state["avg_entry"] = new_avg
-                    state["last_dca_price"] = current_price
-                    state["total_qty"] = new_total
-                    state["dca_count"] += 1
-                    dca_states[symbol] = state
-
-                    logging.info(f"[DCA] Neuer avg={new_avg:.6f}, qty={new_total}")
-
-                    time.sleep(2)
-                    set_tp_dynamic(symbol, new_total, new_avg)
-
-            time.sleep(5)
-
-        except Exception as e:
-            logging.error(f"[DCA] Fehler: {e}")
-            time.sleep(5)
+        time.sleep(3)
 
 # ---------------- EXECUTION LOGIC ----------------
 
 def execute_trade_bingx(symbol):
-    current_price = get_price_bingx(symbol)
-    if not current_price:
-        return
+    with order_lock:
+        if has_active_position(symbol):
+            print(f"[SKIP] Position für {symbol} existiert bereits.")
+            return
+            
+        ohlcv_asset = get_ohlcv(symbol, RSI_TIMEFRAME)
+        if not ohlcv_asset: return
+        rsi = calc_rsi([float(c["close"]) for c in ohlcv_asset])
+        
+        side = None
+        if rsi >= 80:
+            side = "LONG"
+        elif rsi <= 25:
+            side = "SHORT"
+            
+        if side:
+            price = get_price_bingx(symbol)
+            if not price: return
+            qty = round(TRADE_SIZE / price, 6)
+            
+            print(f"[ENTRY] {side} {symbol} @ {price} | RSI: {rsi:.1f}")
 
-    qty = round(TRADE_SIZE / current_price, 6)
-    ts = str(int(time.time() * 1000))
+            ts = str(int(time.time() * 1000))
+            order_side = "BUY" if side == "LONG" else "SELL"
+            
+            entry_p = {
+                "symbol": symbol, "side": order_side, "positionSide": side, 
+                "type": "MARKET", "quantity": str(qty), "leverage": str(LEVERAGE), "timestamp": ts
+            }
+            requests.post(f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(entry_p.items()))}&signature={sign_bingx(entry_p)}", headers={"X-BX-APIKEY": API_KEY})
 
-    entry_params = {
-        "symbol": symbol, "side": "BUY", "positionSide": "LONG",
-        "type": "MARKET", "quantity": str(qty),
-        "leverage": str(LEVERAGE), "timestamp": ts
-    }
-
-    res = requests.post(
-        f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
-        f"{urllib.parse.urlencode(sorted(entry_params.items()))}"
-        f"&signature={sign_bingx(entry_params)}",
-        headers={"X-BX-APIKEY": API_KEY}
-    ).json()
-
-    if res.get("code") != 0:
-        logging.error(f"[ERROR] Entry Error: {res.get('msg')}")
-        return
-
-    logging.info(f"[ORDER] LONG Entry {symbol} @ {current_price}")
-
-    # -------------------------
-    # ✔️ KORREKTER SL-BLOCK
-    # -------------------------
-    initial_entry = current_price
-    sl_price = initial_entry * (1 - SL_PERCENT_HARD / 100)
-    # -------------------------
-
-    dca_states[symbol] = {
-        "initial_entry": initial_entry,
-        "avg_entry": initial_entry,
-        "last_dca_price": initial_entry,
-        "total_qty": qty,
-        "base_qty": qty,
-        "dca_count": 0,
-        "sl_price": sl_price,
-        "active": True
-    }
-
-    time.sleep(2)
-    place_sl_once(symbol, qty, sl_price)
-
-    time.sleep(2)
-    set_tp_dynamic(symbol, qty, initial_entry)
-
-    threading.Thread(target=monitor_dca, args=(symbol,), daemon=True).start()
+            time.sleep(2)
+            
+            # Kalkulationen basierend auf Richtung
+            if side == "LONG":
+                tp = price * (1 + TP_PERCENT / 100)
+                sl = price * (1 - SL_PERCENT / 100)
+                be_trigger = price * (1 + BE_PERCENT / 100)
+            else: # SHORT
+                tp = price * (1 - TP_PERCENT / 100)
+                sl = price * (1 + SL_PERCENT / 100)
+                be_trigger = price * (1 - BE_PERCENT / 100)
+            
+            set_tp_sl(symbol, qty, tp, sl, side)
+            threading.Thread(target=monitor_trade, args=(symbol, price, tp, sl, be_trigger, side)).start()
+        
+        else:
+            print(f"[RSI FILTER] Kein Signal für {symbol}. RSI={rsi:.1f} (Neutral).")
 
 # ---------------- WEBHOOK ----------------
 
 @app.route("/testorder", methods=["POST", "GET"])
 def handle_alert():
-    if request.method == "GET":
-        return jsonify({"status": "active"}), 200
-
+    if request.method == "GET": return jsonify({"status": "ok"}), 200
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
-
-    if not currency:
-        return jsonify({"status": "no_currency"}), 200
-
+    if not currency: return jsonify({"status": "ignored"}), 200
     symbol = f"{currency}-USDT"
+    
     threading.Thread(target=execute_trade_bingx, args=(symbol,)).start()
-
     return jsonify({"status": "processing", "symbol": symbol}), 200
-
-# ---------------- MAIN ----------------
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
