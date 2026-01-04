@@ -162,7 +162,7 @@ def execute_trade_bingx(symbol):
 
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
     if not ohlcv_rsi:
-        print(f"[ERROR] Keine RSI-Daten für {symbol}")
+        #print(f"[ERROR] Keine RSI-Daten für {symbol}")
         return
 
     closes = [float(c["close"]) for c in ohlcv_rsi]
