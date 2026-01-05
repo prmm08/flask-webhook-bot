@@ -20,7 +20,7 @@ log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
 # --- Strategie Settings ---
-RSI_TIMEFRAME = "1m"
+RSI_TIMEFRAME = "5m"
 RSI_PERIOD = 14
 LEVERAGE = 10
 TRADE_SIZE = 10
