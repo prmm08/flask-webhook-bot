@@ -1,4 +1,4 @@
-# -------- V 3.9: BINGX FUTURES - RSI ONLY --------
+# -------- V 4.0: BINGX FUTURES - RSI ONLY + BE LONG & SHORT --------
 
 import time
 import hmac
@@ -24,11 +24,12 @@ RSI_TIMEFRAME = "5m"
 RSI_PERIOD = 14
 LEVERAGE = 10
 TRADE_SIZE = 10
-TP_PERCENT, SL_PERCENT = 3.5, 3.5
+TP_PERCENT = 2.5
+SL_PERCENT = 2.5
 
-# --- Break-Even Settings (nur LONG) ---
+# --- Break-Even Settings ---
 BE_ACTIVATION_PERCENT = 1.0
-active_be_positions = {}
+active_be_positions = {}   # {symbol: {"side": "LONG"/"SHORT", "entry": float}}
 
 # ---------------- SIGNING & HELPERS ----------------
 
@@ -89,8 +90,8 @@ def close_position_market(symbol, side):
     }
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?" \
           f"{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
-    requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-    print(f"[CLOSE] {symbol} {side} geschlossen.")
+    r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+    print(f"[CLOSE] {symbol} {side} geschlossen. Resp={r.text}")
 
 def set_tp_sl(symbol, qty, tp_price, sl_price, side):
     def place_order(price, o_type):
@@ -106,49 +107,62 @@ def set_tp_sl(symbol, qty, tp_price, sl_price, side):
             "closePosition": "true",
             "timestamp": ts
         }
-        requests.post(
-            f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
-            f"{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}",
-            headers={"X-BX-APIKEY": API_KEY}
-        )
+        url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?" \
+              f"{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
+        r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+        print(f"[TP/SL] {symbol} {side} {o_type} @ {price:.6f} → {r.text}")
 
     place_order(tp_price, "TAKE_PROFIT_MARKET")
     place_order(sl_price, "STOP_MARKET")
 
-# ---------------- BREAK-EVEN MONITOR (nur LONG) ----------------
+# ---------------- BREAK-EVEN MONITOR (LONG & SHORT) ----------------
 
 def monitor_break_even():
     while True:
         try:
             positions = get_open_positions()
-            active_long_symbols = [
-                p['symbol'] for p in positions
-                if p.get('positionSide') == 'LONG' and float(p.get('positionAmt', 0)) > 0
-            ]
 
+            # Entferne BE-Einträge für geschlossene Positionen
+            active_symbols = {p["symbol"] for p in positions if float(p.get("positionAmt", 0)) != 0}
             for sym in list(active_be_positions.keys()):
-                if sym not in active_long_symbols:
+                if sym not in active_symbols:
                     del active_be_positions[sym]
 
             for pos in positions:
-                if pos.get('positionSide') == 'LONG' and float(pos.get('positionAmt', 0)) > 0:
-                    symbol = pos['symbol']
-                    entry_price = float(pos['avgPrice'])
-                    current_price = get_price_bingx(symbol)
-                    if not current_price:
-                        continue
+                symbol = pos["symbol"]
+                side = pos.get("positionSide")
+                amt = float(pos.get("positionAmt", 0))
+                if amt == 0:
+                    continue
 
-                    profit_pct = (current_price - entry_price) / entry_price * 100
+                entry = float(pos["avgPrice"])
+                current = get_price_bingx(symbol)
+                if not current:
+                    continue
 
-                    if profit_pct >= BE_ACTIVATION_PERCENT and symbol not in active_be_positions:
-                        active_be_positions[symbol] = True
-                        print(f"[BE] Aktiviert für {symbol}")
+                # Profit % abhängig von LONG/SHORT
+                if side == "LONG":
+                    profit_pct = (current - entry) / entry * 100
+                else:  # SHORT
+                    profit_pct = (entry - current) / entry * 100
 
-                    if active_be_positions.get(symbol) and current_price <= entry_price:
+                # BE aktivieren
+                if profit_pct >= BE_ACTIVATION_PERCENT and symbol not in active_be_positions:
+                    active_be_positions[symbol] = {"side": side, "entry": entry}
+                    print(f"[BE] Aktiviert für {symbol} ({side})")
+
+                # BE schließen
+                if symbol in active_be_positions:
+                    if side == "LONG" and current <= entry:
                         close_position_market(symbol, "LONG")
                         del active_be_positions[symbol]
-        except:
-            pass
+
+                    if side == "SHORT" and current >= entry:
+                        close_position_market(symbol, "SHORT")
+                        del active_be_positions[symbol]
+
+        except Exception as e:
+            print("[BE ERROR]", e)
 
         time.sleep(10)
 
@@ -162,20 +176,17 @@ def execute_trade_bingx(symbol):
 
     ohlcv_rsi = get_ohlcv(symbol, RSI_TIMEFRAME, limit=RSI_PERIOD + 1)
     if not ohlcv_rsi:
-        #print(f"[ERROR] Keine RSI-Daten für {symbol}")
         return
 
     closes = [float(c["close"]) for c in ohlcv_rsi]
     rsi = calc_rsi(closes, RSI_PERIOD)
     current_price = get_price_bingx(symbol)
-
     if not current_price:
-        print(f"[ERROR] Kein Preis für {symbol}")
         return
 
     qty = round(TRADE_SIZE / current_price, 6)
 
-    # -------- LONG ENTRY (RSI <= 25) --------
+    # LONG ENTRY
     if rsi <= 25:
         ts = str(int(time.time() * 1000))
         params = {
@@ -183,16 +194,17 @@ def execute_trade_bingx(symbol):
             "type": "MARKET", "quantity": str(qty),
             "leverage": str(LEVERAGE), "timestamp": ts
         }
-        requests.post(
-            f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
-            f"{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}",
-            headers={"X-BX-APIKEY": API_KEY}
-        )
+        url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?" \
+              f"{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
+        requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+
+        tp = current_price * (1 + TP_PERCENT / 100)
+        sl = current_price * (1 - SL_PERCENT / 100)
         time.sleep(1)
-        set_tp_sl(symbol, qty, current_price * 1.05, current_price * 0.985, "LONG")
+        set_tp_sl(symbol, qty, tp, sl, "LONG")
         print(f"[LONG ENTRY] {symbol} RSI={rsi:.2f}")
 
-    # -------- SHORT ENTRY (RSI >= 80) --------
+    # SHORT ENTRY
     elif rsi >= 80:
         ts = str(int(time.time() * 1000))
         params = {
@@ -200,13 +212,14 @@ def execute_trade_bingx(symbol):
             "type": "MARKET", "quantity": str(qty),
             "leverage": str(LEVERAGE), "timestamp": ts
         }
-        requests.post(
-            f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
-            f"{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}",
-            headers={"X-BX-APIKEY": API_KEY}
-        )
+        url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?" \
+              f"{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
+        requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+
+        tp = current_price * (1 - TP_PERCENT / 100)
+        sl = current_price * (1 + SL_PERCENT / 100)
         time.sleep(1)
-        set_tp_sl(symbol, qty, current_price * 0.95, current_price * 1.015, "SHORT")
+        set_tp_sl(symbol, qty, tp, sl, "SHORT")
         print(f"[SHORT ENTRY] {symbol} RSI={rsi:.2f}")
 
 # ---------------- WEBHOOK ----------------
@@ -229,6 +242,8 @@ def handle_alert():
 
 # ---------------- START ----------------
 
+# BE-Monitor immer starten (auch unter Gunicorn/Render)
+threading.Thread(target=monitor_break_even, daemon=True).start()
+
 if __name__ == "__main__":
-    threading.Thread(target=monitor_break_even, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
