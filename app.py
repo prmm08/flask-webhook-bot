@@ -46,7 +46,7 @@ def get_price(symbol):
             params={"symbol": symbol},
             timeout=10
         ).json()
-        print("[DEBUG] Price Response:", r)
+        #print("[DEBUG] Price Response:", r)
         return float(r["data"]["price"])
     except:
         return None
@@ -61,7 +61,7 @@ def get_positions():
     )
     try:
         r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}, timeout=10)
-        print("[DEBUG] Positions RAW:", r.text)
+        #print("[DEBUG] Positions RAW:", r.text)
         data = r.json()
         return data.get("data", [])
     except:
@@ -91,7 +91,7 @@ def reset_tp_sl(symbol):
             f"&signature={sign_bingx(params)}"
         )
         r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}).json()
-        print("[DEBUG] OpenOrders:", r)
+        #print("[DEBUG] OpenOrders:", r)
 
         data = r.get("data", [])
         if not isinstance(data, list):
@@ -107,7 +107,7 @@ def reset_tp_sl(symbol):
                 f"&signature={sign_bingx(params2)}"
             )
             r2 = requests.post(url2, headers={"X-BX-APIKEY": API_KEY})
-            print("[DEBUG] Cancel TP/SL:", r2.text)
+            #print("[DEBUG] Cancel TP/SL:", r2.text)
 
     except Exception as e:
         print("[TP/SL RESET ERROR]", e)
@@ -119,7 +119,7 @@ def set_tp_sl(symbol):
         None
     )
     if not pos:
-        print("[DEBUG] No position for TP/SL")
+        #print("[DEBUG] No position for TP/SL")
         return
 
     side = pos["positionSide"]
@@ -150,7 +150,7 @@ def set_tp_sl(symbol):
             f"&signature={sign_bingx(params)}"
         )
         r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-        print("[DEBUG] TP/SL Response:", r.text)
+        #print("[DEBUG] TP/SL Response:", r.text)
 
     place(tp, "TAKE_PROFIT_MARKET")
     place(sl, "STOP_MARKET")
@@ -206,7 +206,7 @@ def monitor_dca():
                         f"&signature={sign_bingx(params)}"
                     )
                     r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-                    print("[DEBUG] DCA Order:", r.text)
+                    #print("[DEBUG] DCA Order:", r.text)
 
                     d["executed"] += 1
 
@@ -221,7 +221,7 @@ def monitor_dca():
 # ---------------- ENTRY ----------------
 
 def execute_trade(symbol, direction):
-    print("[DEBUG] ENTRY START", symbol, direction)
+    ##print("[DEBUG] ENTRY START", symbol, direction)
 
     if not symbol_exists(symbol):
         print(f"[ERROR] Symbol {symbol} existiert NICHT auf BingX Futures.")
@@ -233,7 +233,7 @@ def execute_trade(symbol, direction):
         return
 
     price = get_price(symbol)
-    print("[DEBUG] price:", price)
+    ##print("[DEBUG] price:", price)
 
     if not price:
         print("[ERROR] Kein Preis → Abbruch")
@@ -259,7 +259,7 @@ def execute_trade(symbol, direction):
         f"&signature={sign_bingx(params)}"
     )
     r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-    print("[DEBUG] Entry Response:", r.text)
+    ##print("[DEBUG] Entry Response:", r.text)
 
     active_dca[symbol] = {"side": direction, "entry": price, "executed": 0}
 
@@ -273,7 +273,7 @@ def execute_trade(symbol, direction):
 @app.route("/testorder", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
-    print("[DEBUG] Incoming:", data)
+    #print("[DEBUG] Incoming:", data)
 
     currency = str(data.get("currency", "")).upper()
     direction = str(data.get("direction", "")).upper()
