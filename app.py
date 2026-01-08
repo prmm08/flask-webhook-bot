@@ -1,4 +1,4 @@
-# -------- V 7.1: BINGX FUTURES - DIRECT ENTRY + MARKET-DCA + GLOBAL TP/SL --------
+# -------- V 7.2: BINGX FUTURES - DIRECT ENTRY + MARKET-DCA + GLOBAL TP/SL (STABLE) --------
 
 import time
 import hmac
@@ -26,7 +26,7 @@ TP_PERCENT = 1
 SL_PERCENT = 50
 
 # --- DCA Settings ---
-DCA_COUNT = 4
+DCA_COUNT = 3
 DCA_DEVIATION_PERCENT = 5
 DCA_VOLUME_MULTIPLIER = 2
 
@@ -66,15 +66,23 @@ def reset_tp_sl(symbol):
         url = f"{BINGX_BASE}/openApi/swap/v2/trade/openOrders?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
         r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}).json()
 
-        for order in r.get("data", []):
+        data = r.get("data", [])
+
+        # FIX: Wenn data kein Array ist → keine offenen Orders
+        if not isinstance(data, list):
+            print(f"[TP/SL RESET] Keine offenen TP/SL Orders für {symbol}.")
+            return
+
+        for order in data:
             oid = order["orderId"]
             ts2 = str(int(time.time() * 1000))
             params2 = {"orderId": oid, "symbol": symbol, "timestamp": ts2}
             url2 = f"{BINGX_BASE}/openApi/swap/v2/trade/cancelOrder?{urllib.parse.urlencode(sorted(params2.items()))}&signature={sign_bingx(params2)}"
             requests.post(url2, headers={"X-BX-APIKEY": API_KEY})
 
-        if r.get("data"):
+        if data:
             print(f"[TP/SL RESET] Alle TP/SL Orders für {symbol} gelöscht.")
+
     except Exception as e:
         print("[TP/SL RESET ERROR]", e)
 
@@ -109,6 +117,7 @@ def set_tp_sl_for_position(symbol):
 
     place(tp_price, "TAKE_PROFIT_MARKET")
     place(sl_price, "STOP_MARKET")
+
     print(f"[TP/SL SET] {symbol} side={side} qty={qty:.6f} TP={tp_price:.4f} SL={sl_price:.4f}")
 
 # ---------------- DCA MONITOR ----------------
@@ -148,8 +157,9 @@ def monitor_dca():
                 deviation = abs((current - entry) / entry * 100)
 
                 if deviation >= (executed + 1) * DCA_DEVIATION_PERCENT:
+
                     base_qty = TRADE_SIZE / entry
-                    qty = base_qty * (DCA_VOLUME_MULTIPLIER ** (executed + 1))
+                    qty = base_qty * (DCA_VOLUME_MULTIPLIER ** (executed + 1))  # FIXED
 
                     side_order = "BUY" if side == "LONG" else "SELL"
 
@@ -194,7 +204,6 @@ def execute_trade_bingx(symbol, direction):
         return
 
     qty = round(TRADE_SIZE / current_price, 6)
-
     side = "BUY" if direction == "LONG" else "SELL"
 
     ts = str(int(time.time() * 1000))
