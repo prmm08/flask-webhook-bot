@@ -219,8 +219,11 @@ def monitor_dca():
 
 # ---------------- ENTRY ----------------
 
-def execute_trade(symbol, direction, leverage, trade_size):
-    print("[DEBUG] ENTRY START", symbol, direction, leverage, trade_size)
+    def execute_trade(symbol, direction, leverage, trade_size):
+        print("[DEBUG] ORDER PARAMS:", params)
+        r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+        print("[DEBUG] Entry Response:", r.text)
+
 
     if not symbol_exists(symbol):
         print(f"[ERROR] Symbol {symbol} existiert NICHT auf BingX Futures.")
