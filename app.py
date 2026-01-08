@@ -20,8 +20,8 @@ log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
 # --- SETTINGS ---
-LEVERAGE = 20
-TRADE_SIZE = 1000
+LEVERAGE = 10
+TRADE_SIZE = 500
 TP_PERCENT = 1
 SL_PERCENT = 50
 
