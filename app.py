@@ -1,4 +1,4 @@
-# -------- V9: DYNAMIC LEVERAGE & TRADE SIZE --------
+# -------- V10: DYNAMIC LEVERAGE & TRADE SIZE (HEDGE MODE) --------
 
 import time
 import hmac
@@ -175,7 +175,12 @@ def monitor_dca():
                     continue
 
                 if symbol not in active_dca:
-                    active_dca[symbol] = {"side": side, "entry": entry, "executed": 0, "trade_size": TRADE_SIZE}
+                    active_dca[symbol] = {
+                        "side": side,
+                        "entry": entry,
+                        "executed": 0,
+                        "trade_size": TRADE_SIZE
+                    }
 
                 d = active_dca[symbol]
                 executed = d["executed"]
@@ -219,19 +224,16 @@ def monitor_dca():
 
 # ---------------- ENTRY ----------------
 
-    def execute_trade(symbol, direction, leverage, trade_size):
-        print("[DEBUG] ORDER PARAMS:", params)
-        r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-        print("[DEBUG] Entry Response:", r.text)
-
+def execute_trade(symbol, direction, leverage, trade_size):
+    print("[DEBUG] ENTRY START", symbol, direction, leverage, trade_size)
 
     if not symbol_exists(symbol):
         print(f"[ERROR] Symbol {symbol} existiert NICHT auf BingX Futures.")
         return
 
     positions = get_positions()
-    if any(p["symbol"] == symbol and float(p["positionAmt"]) != 0 for p in positions):
-        print(f"[SKIP] {symbol} bereits offen.")
+    if any(p["symbol"] == symbol and p["positionSide"] == direction and float(p["positionAmt"]) != 0 for p in positions):
+        print(f"[SKIP] {symbol} {direction} bereits offen.")
         return
 
     price = get_price(symbol)
@@ -254,6 +256,8 @@ def monitor_dca():
         "leverage": str(leverage),
         "timestamp": ts
     }
+
+    print("[DEBUG] ORDER PARAMS:", params)
 
     url = (
         f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
