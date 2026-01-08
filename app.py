@@ -21,7 +21,7 @@ app = Flask(__name__)
 
 # --- Strategie Settings ---
 LEVERAGE = 20
-TRADE_SIZE = 2000
+TRADE_SIZE = 1000
 TP_PERCENT = 1
 SL_PERCENT = 50
 
