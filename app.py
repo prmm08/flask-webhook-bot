@@ -21,9 +21,9 @@ app = Flask(__name__)
 
 # --- SETTINGS ---
 LEVERAGE = 20
-TRADE_SIZE = 1250
+TRADE_SIZE = 10
 TP_PERCENT = 1
-SL_PERCENT = 50
+SL_PERCENT = 20
 
 DCA_COUNT = 3
 DCA_DEVIATION_PERCENT = 5
@@ -221,7 +221,7 @@ def monitor_dca():
 # ---------------- ENTRY ----------------
 
 def execute_trade(symbol, direction):
-    #print("[DEBUG] ENTRY START", symbol, direction)
+    print("[DEBUG] ENTRY START", symbol, direction)
 
     if not symbol_exists(symbol):
         print(f"[ERROR] Symbol {symbol} existiert NICHT auf BingX Futures.")
@@ -233,7 +233,7 @@ def execute_trade(symbol, direction):
         return
 
     price = get_price(symbol)
-    #print("[DEBUG] price:", price)
+    print("[DEBUG] price:", price)
 
     if not price:
         print("[ERROR] Kein Preis → Abbruch")
@@ -259,7 +259,7 @@ def execute_trade(symbol, direction):
         f"&signature={sign_bingx(params)}"
     )
     r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-    #print("[DEBUG] Entry Response:", r.text)
+    print("[DEBUG] Entry Response:", r.text)
 
     active_dca[symbol] = {"side": direction, "entry": price, "executed": 0}
 
