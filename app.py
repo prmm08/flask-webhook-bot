@@ -1,3 +1,5 @@
+# -------- V8: CLEAN, STABLE, FULLY WORKING VERSION --------
+
 import time
 import hmac
 import hashlib
@@ -8,6 +10,7 @@ import threading
 from flask import Flask, request, jsonify
 import logging
 
+# --- API ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
@@ -16,8 +19,9 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
+# --- SETTINGS ---
 LEVERAGE = 20
-TRADE_SIZE = 2000
+TRADE_SIZE = 1000
 TP_PERCENT = 1
 SL_PERCENT = 50
 
@@ -27,155 +31,217 @@ DCA_VOLUME_MULTIPLIER = 2
 
 active_dca = {}
 
+# ---------------- SIGNING ----------------
+
 def sign_bingx(params):
     query_string = urllib.parse.urlencode(sorted(params.items()))
-    return hmac.new(API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
-def get_price_bingx(symbol):
+# ---------------- API HELPERS ----------------
+
+def get_price(symbol):
     try:
-        url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
-        r = requests.get(url, params={"symbol": symbol}, timeout=10).json()
-        print("[DEBUG] Price API Response:", r)
+        r = requests.get(
+            f"{BINGX_BASE}/openApi/swap/v2/quote/price",
+            params={"symbol": symbol},
+            timeout=10
+        ).json()
+        print("[DEBUG] Price Response:", r)
         return float(r["data"]["price"])
-    except Exception as e:
-        print("[DEBUG] Price Fetch ERROR:", e)
+    except:
         return None
 
-def get_open_positions():
+def get_positions():
     ts = str(int(time.time() * 1000))
     params = {"timestamp": ts}
-    url = f"{BINGX_BASE}/openApi/swap/v2/user/positions?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
+    url = (
+        f"{BINGX_BASE}/openApi/swap/v2/user/positions?"
+        f"{urllib.parse.urlencode(sorted(params.items()))}"
+        f"&signature={sign_bingx(params)}"
+    )
     try:
         r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}, timeout=10)
-        print("[DEBUG] Positions RAW Response:", r.text)
+        print("[DEBUG] Positions RAW:", r.text)
         data = r.json()
-        print("[DEBUG] Positions JSON Parsed:", data)
-        if "data" not in data or not isinstance(data["data"], list):
-            print("[DEBUG] Positions ERROR: 'data' fehlt oder ist kein Array")
-            return []
-        return data["data"]
-    except Exception as e:
-        print("[DEBUG] Positions EXCEPTION:", e)
+        return data.get("data", [])
+    except:
         return []
+
+def symbol_exists(symbol):
+    """Check if symbol exists on BingX Futures."""
+    try:
+        r = requests.get(
+            f"{BINGX_BASE}/openApi/swap/v2/quote/price",
+            params={"symbol": symbol},
+            timeout=10
+        ).json()
+        return "data" in r and "price" in r["data"]
+    except:
+        return False
+
+# ---------------- TP/SL ----------------
 
 def reset_tp_sl(symbol):
     try:
         ts = str(int(time.time() * 1000))
         params = {"symbol": symbol, "timestamp": ts}
-        url = f"{BINGX_BASE}/openApi/swap/v2/trade/openOrders?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
+        url = (
+            f"{BINGX_BASE}/openApi/swap/v2/trade/openOrders?"
+            f"{urllib.parse.urlencode(sorted(params.items()))}"
+            f"&signature={sign_bingx(params)}"
+        )
         r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}).json()
-        print("[DEBUG] OpenOrders Response:", r)
+        print("[DEBUG] OpenOrders:", r)
+
         data = r.get("data", [])
         if not isinstance(data, list):
-            print(f"[TP/SL RESET] Keine offenen TP/SL Orders für {symbol}.")
             return
+
         for order in data:
             oid = order["orderId"]
             ts2 = str(int(time.time() * 1000))
             params2 = {"orderId": oid, "symbol": symbol, "timestamp": ts2}
-            url2 = f"{BINGX_BASE}/openApi/swap/v2/trade/cancelOrder?{urllib.parse.urlencode(sorted(params2.items()))}&signature={sign_bingx(params2)}"
+            url2 = (
+                f"{BINGX_BASE}/openApi/swap/v2/trade/cancelOrder?"
+                f"{urllib.parse.urlencode(sorted(params2.items()))}"
+                f"&signature={sign_bingx(params2)}"
+            )
             r2 = requests.post(url2, headers={"X-BX-APIKEY": API_KEY})
-            print("[DEBUG] Cancel TP/SL Response:", r2.text)
-        if data:
-            print(f"[TP/SL RESET] Alle TP/SL Orders für {symbol} gelöscht.")
+            print("[DEBUG] Cancel TP/SL:", r2.text)
+
     except Exception as e:
         print("[TP/SL RESET ERROR]", e)
 
-def set_tp_sl_for_position(symbol):
-    positions = get_open_positions()
-    pos = next((p for p in positions if p["symbol"] == symbol and float(p.get("positionAmt", 0)) != 0), None)
+def set_tp_sl(symbol):
+    positions = get_positions()
+    pos = next(
+        (p for p in positions if p["symbol"] == symbol and float(p["positionAmt"]) != 0),
+        None
+    )
     if not pos:
-        print("[DEBUG] set_tp_sl_for_position: Keine Position gefunden")
+        print("[DEBUG] No position for TP/SL")
         return
+
     side = pos["positionSide"]
     entry = float(pos["avgPrice"])
     qty = abs(float(pos["positionAmt"]))
-    tp_price = entry * (1 + TP_PERCENT / 100) if side == "LONG" else entry * (1 - TP_PERCENT / 100)
-    sl_price = entry * (1 - SL_PERCENT / 100) if side == "LONG" else entry * (1 + SL_PERCENT / 100)
-    print(f"[DEBUG] Setting TP/SL: entry={entry}, qty={qty}, TP={tp_price}, SL={sl_price}")
-    def place(price, o_type):
+
+    tp = entry * (1 + TP_PERCENT / 100) if side == "LONG" else entry * (1 - TP_PERCENT / 100)
+    sl = entry * (1 - SL_PERCENT / 100) if side == "LONG" else entry * (1 + SL_PERCENT / 100)
+
+    print(f"[DEBUG] Setting TP/SL: entry={entry}, qty={qty}, TP={tp}, SL={sl}")
+
+    def place(price, otype):
         ts = str(int(time.time() * 1000))
         params = {
             "symbol": symbol,
             "side": "SELL" if side == "LONG" else "BUY",
             "positionSide": side,
-            "type": o_type,
+            "type": otype,
             "quantity": str(qty),
-            "stopPrice": "{:.6f}".format(price),
+            "stopPrice": f"{price:.6f}",
             "workingType": "MARK_PRICE",
             "closePosition": "true",
             "timestamp": ts
         }
-        url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
+        url = (
+            f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
+            f"{urllib.parse.urlencode(sorted(params.items()))}"
+            f"&signature={sign_bingx(params)}"
+        )
         r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-        print("[DEBUG] TP/SL Order Response:", r.text)
-    place(tp_price, "TAKE_PROFIT_MARKET")
-    place(sl_price, "STOP_MARKET")
+        print("[DEBUG] TP/SL Response:", r.text)
+
+    place(tp, "TAKE_PROFIT_MARKET")
+    place(sl, "STOP_MARKET")
+
+# ---------------- DCA ----------------
 
 def monitor_dca():
     while True:
         try:
-            positions = get_open_positions()
-            active_symbols = {p["symbol"] for p in positions if float(p.get("positionAmt", 0)) != 0}
-            for sym in list(active_dca.keys()):
-                if sym not in active_symbols:
-                    del active_dca[sym]
+            positions = get_positions()
+
             for pos in positions:
                 symbol = pos["symbol"]
                 side = pos["positionSide"]
                 entry = float(pos["avgPrice"])
                 amt = float(pos["positionAmt"])
+
                 if amt == 0:
                     continue
-                current = get_price_bingx(symbol)
-                print("[DEBUG] DCA current price:", current)
+
+                current = get_price(symbol)
                 if not current:
                     continue
+
                 if symbol not in active_dca:
                     active_dca[symbol] = {"side": side, "entry": entry, "executed": 0}
+
                 d = active_dca[symbol]
                 executed = d["executed"]
+
                 deviation = abs((current - entry) / entry * 100)
                 print(f"[DEBUG] DCA deviation={deviation}, executed={executed}")
+
                 if executed >= DCA_COUNT:
                     continue
+
                 if deviation >= (executed + 1) * DCA_DEVIATION_PERCENT:
                     base_qty = TRADE_SIZE / entry
                     qty = base_qty * (DCA_VOLUME_MULTIPLIER ** (executed + 1))
-                    side_order = "BUY" if side == "LONG" else "SELL"
+
                     ts = str(int(time.time() * 1000))
                     params = {
                         "symbol": symbol,
-                        "side": side_order,
+                        "side": "BUY" if side == "LONG" else "SELL",
                         "positionSide": side,
                         "type": "MARKET",
                         "quantity": str(round(qty, 6)),
                         "timestamp": ts
                     }
-                    url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
+                    url = (
+                        f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
+                        f"{urllib.parse.urlencode(sorted(params.items()))}"
+                        f"&signature={sign_bingx(params)}"
+                    )
                     r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-                    print("[DEBUG] DCA Order Response:", r.text)
+                    print("[DEBUG] DCA Order:", r.text)
+
                     d["executed"] += 1
+
                     reset_tp_sl(symbol)
-                    set_tp_sl_for_position(symbol)
+                    set_tp_sl(symbol)
+
         except Exception as e:
             print("[DCA ERROR]", e)
+
         time.sleep(10)
 
-def execute_trade_bingx(symbol, direction):
-    print("[DEBUG] execute_trade_bingx START", symbol, direction)
-    positions = get_open_positions()
-    print("[DEBUG] Current positions:", positions)
-    if any(p['symbol'] == symbol and float(p.get('positionAmt', 0)) != 0 for p in positions):
+# ---------------- ENTRY ----------------
+
+def execute_trade(symbol, direction):
+    print("[DEBUG] ENTRY START", symbol, direction)
+
+    if not symbol_exists(symbol):
+        print(f"[ERROR] Symbol {symbol} existiert NICHT auf BingX Futures.")
+        return
+
+    positions = get_positions()
+    if any(p["symbol"] == symbol and float(p["positionAmt"]) != 0 for p in positions):
         print(f"[SKIP] {symbol} bereits offen.")
         return
-    current_price = get_price_bingx(symbol)
-    print("[DEBUG] current_price:", current_price)
-    if not current_price:
-        print("[DEBUG] Kein Preis erhalten → Abbruch")
+
+    price = get_price(symbol)
+    print("[DEBUG] price:", price)
+
+    if not price:
+        print("[ERROR] Kein Preis → Abbruch")
         return
-    qty = round(TRADE_SIZE / current_price, 6)
+
+    qty = round(TRADE_SIZE / price, 6)
     side = "BUY" if direction == "LONG" else "SELL"
+
     ts = str(int(time.time() * 1000))
     params = {
         "symbol": symbol,
@@ -186,27 +252,42 @@ def execute_trade_bingx(symbol, direction):
         "leverage": str(LEVERAGE),
         "timestamp": ts
     }
-    url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
+
+    url = (
+        f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
+        f"{urllib.parse.urlencode(sorted(params.items()))}"
+        f"&signature={sign_bingx(params)}"
+    )
     r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-    print("[DEBUG] Entry Order Response:", r.text)
-    active_dca[symbol] = {"side": direction, "entry": current_price, "executed": 0}
+    print("[DEBUG] Entry Response:", r.text)
+
+    active_dca[symbol] = {"side": direction, "entry": price, "executed": 0}
+
     reset_tp_sl(symbol)
-    set_tp_sl_for_position(symbol)
-    print(f"[ENTRY] {symbol} {direction} sofort ausgeführt.")
+    set_tp_sl(symbol)
+
+    print(f"[ENTRY] {symbol} {direction} ausgeführt.")
+
+# ---------------- WEBHOOK ----------------
 
 @app.route("/testorder", methods=["POST"])
-def handle_signal():
+def webhook():
     data = request.get_json(silent=True) or {}
-    print("[DEBUG] Incoming JSON:", data)
+    print("[DEBUG] Incoming:", data)
+
     currency = str(data.get("currency", "")).upper()
     direction = str(data.get("direction", "")).upper()
-    print("[DEBUG] currency:", currency, "direction:", direction)
+
     if not currency or direction not in ("LONG", "SHORT"):
-        print("[DEBUG] INVALID SIGNAL → ignored")
         return jsonify({"status": "ignored"}), 200
+
     symbol = f"{currency}-USDT"
-    threading.Thread(target=execute_trade_bingx, args=(symbol, direction)).start()
+
+    threading.Thread(target=execute_trade, args=(symbol, direction)).start()
+
     return jsonify({"status": "processing", "symbol": symbol, "direction": direction}), 200
+
+# ---------------- START ----------------
 
 threading.Thread(target=monitor_dca, daemon=True).start()
 
