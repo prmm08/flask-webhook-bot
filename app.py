@@ -52,14 +52,35 @@ def get_price_bingx(symbol):
 def get_open_positions():
     ts = str(int(time.time() * 1000))
     params = {"timestamp": ts}
-    url = f"{BINGX_BASE}/openApi/swap/v2/user/positions?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
+
+    url = (
+        f"{BINGX_BASE}/openApi/swap/v2/user/positions?"
+        f"{urllib.parse.urlencode(sorted(params.items()))}"
+        f"&signature={sign_bingx(params)}"
+    )
+
     try:
-        r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
-        print("[DEBUG] Positions Response:", r)
-        return r.get("data", [])
+        r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}, timeout=10)
+        print("[DEBUG] Positions RAW Response:", r.text)
+
+        data = r.json()
+        print("[DEBUG] Positions JSON Parsed:", data)
+
+        # Wenn "data" fehlt oder kein Array ist → Fehler
+        if "data" not in data:
+            print("[DEBUG] Positions ERROR: 'data' fehlt in Response")
+            return []
+
+        if not isinstance(data["data"], list):
+            print("[DEBUG] Positions ERROR: 'data' ist kein Array:", data["data"])
+            return []
+
+        return data["data"]
+
     except Exception as e:
-        print("[DEBUG] Positions ERROR:", e)
+        print("[DEBUG] Positions EXCEPTION:", e)
         return []
+
 
 # ---------------- TP/SL HANDLING ----------------
 
