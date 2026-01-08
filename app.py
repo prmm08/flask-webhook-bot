@@ -265,7 +265,9 @@ def execute_trade(symbol, direction, leverage, trade_size):
         f"&signature={sign_bingx(params)}"
     )
     r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+
     print("[DEBUG] Entry Response:", r.text)
+
 
     active_dca[symbol] = {
         "side": direction,
