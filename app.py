@@ -223,7 +223,7 @@ def execute_trade_bingx(symbol, direction):
 
 # ---------------- WEBHOOK ----------------
 
-@app.route("/signal", methods=["POST"])
+@app.route("/testorder", methods=["POST"])
 def handle_signal():
     data = request.get_json(silent=True) or {}
 
