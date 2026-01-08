@@ -149,7 +149,7 @@ def monitor_dca():
 
                 if deviation >= (executed + 1) * DCA_DEVIATION_PERCENT:
                     base_qty = TRADE_SIZE / entry
-                    qty = base_qty * (DCA_VOLUME_MULTIPLIER ** executed)
+                    qty = base_qty * (DCA_VOLUME_MULTIPLIER ** (executed + 1))
 
                     side_order = "BUY" if side == "LONG" else "SELL"
 
