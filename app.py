@@ -20,8 +20,8 @@ log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
 # --- Strategie Settings ---
-LEVERAGE = 10
-TRADE_SIZE = 10
+LEVERAGE = 20
+TRADE_SIZE = 2000
 TP_PERCENT = 1
 SL_PERCENT = 50
 
