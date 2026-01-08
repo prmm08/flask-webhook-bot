@@ -1,4 +1,4 @@
-# -------- V10: DYNAMIC LEVERAGE & TRADE SIZE (HEDGE MODE) --------
+# -------- V11: DYNAMIC LEVERAGE & TP/SL FIX (HEDGE MODE) --------
 
 import time
 import hmac
@@ -121,7 +121,7 @@ def set_tp_sl(symbol):
         print("[DEBUG] No position for TP/SL")
         return
 
-    side = pos["positionSide"]
+    side = pos["positionSide"]  # LONG oder SHORT
     entry = float(pos["avgPrice"])
     qty = abs(float(pos["positionAmt"]))
 
@@ -137,7 +137,6 @@ def set_tp_sl(symbol):
             "side": "SELL" if side == "LONG" else "BUY",
             "positionSide": side,
             "type": otype,
-            "quantity": str(qty),
             "stopPrice": f"{price:.6f}",
             "workingType": "MARK_PRICE",
             "closePosition": "true",
@@ -265,9 +264,7 @@ def execute_trade(symbol, direction, leverage, trade_size):
         f"&signature={sign_bingx(params)}"
     )
     r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-
     print("[DEBUG] Entry Response:", r.text)
-
 
     active_dca[symbol] = {
         "side": direction,
