@@ -1,4 +1,4 @@
-# -------- V 7.2: BINGX FUTURES - DIRECT ENTRY + MARKET-DCA + GLOBAL TP/SL (STABLE) --------
+# -------- V 7.3: BINGX FUTURES - DIRECT ENTRY + MARKET-DCA + GLOBAL TP/SL + DEBUG --------
 
 import time
 import hmac
@@ -28,7 +28,7 @@ SL_PERCENT = 50
 # --- DCA Settings ---
 DCA_COUNT = 3
 DCA_DEVIATION_PERCENT = 5
-DCA_VOLUME_MULTIPLIER = 2
+DCA_VOLUME_MULTIPLIER = 1.5
 
 # --- DCA Tracking ---
 active_dca = {}   # {symbol: {"side": "LONG"/"SHORT", "entry": float, "executed": int}}
@@ -43,8 +43,10 @@ def get_price_bingx(symbol):
     try:
         url = f"{BINGX_BASE}/openApi/swap/v2/quote/price"
         r = requests.get(url, params={"symbol": symbol}, timeout=10).json()
+        print("[DEBUG] Price API Response:", r)
         return float(r["data"]["price"])
-    except:
+    except Exception as e:
+        print("[DEBUG] Price Fetch ERROR:", e)
         return None
 
 def get_open_positions():
@@ -53,8 +55,10 @@ def get_open_positions():
     url = f"{BINGX_BASE}/openApi/swap/v2/user/positions?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
     try:
         r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        print("[DEBUG] Positions Response:", r)
         return r.get("data", [])
-    except:
+    except Exception as e:
+        print("[DEBUG] Positions ERROR:", e)
         return []
 
 # ---------------- TP/SL HANDLING ----------------
@@ -66,9 +70,10 @@ def reset_tp_sl(symbol):
         url = f"{BINGX_BASE}/openApi/swap/v2/trade/openOrders?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
         r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}).json()
 
+        print("[DEBUG] OpenOrders Response:", r)
+
         data = r.get("data", [])
 
-        # FIX: Wenn data kein Array ist → keine offenen Orders
         if not isinstance(data, list):
             print(f"[TP/SL RESET] Keine offenen TP/SL Orders für {symbol}.")
             return
@@ -78,7 +83,8 @@ def reset_tp_sl(symbol):
             ts2 = str(int(time.time() * 1000))
             params2 = {"orderId": oid, "symbol": symbol, "timestamp": ts2}
             url2 = f"{BINGX_BASE}/openApi/swap/v2/trade/cancelOrder?{urllib.parse.urlencode(sorted(params2.items()))}&signature={sign_bingx(params2)}"
-            requests.post(url2, headers={"X-BX-APIKEY": API_KEY})
+            r2 = requests.post(url2, headers={"X-BX-APIKEY": API_KEY})
+            print("[DEBUG] Cancel TP/SL Response:", r2.text)
 
         if data:
             print(f"[TP/SL RESET] Alle TP/SL Orders für {symbol} gelöscht.")
@@ -90,6 +96,7 @@ def set_tp_sl_for_position(symbol):
     positions = get_open_positions()
     pos = next((p for p in positions if p["symbol"] == symbol and float(p.get("positionAmt", 0)) != 0), None)
     if not pos:
+        print("[DEBUG] set_tp_sl_for_position: Keine Position gefunden")
         return
 
     side = pos["positionSide"]
@@ -98,6 +105,8 @@ def set_tp_sl_for_position(symbol):
 
     tp_price = entry * (1 + TP_PERCENT / 100) if side == "LONG" else entry * (1 - TP_PERCENT / 100)
     sl_price = entry * (1 - SL_PERCENT / 100) if side == "LONG" else entry * (1 + SL_PERCENT / 100)
+
+    print(f"[DEBUG] Setting TP/SL: entry={entry}, qty={qty}, TP={tp_price}, SL={sl_price}")
 
     def place(price, o_type):
         ts = str(int(time.time() * 1000))
@@ -113,12 +122,11 @@ def set_tp_sl_for_position(symbol):
             "timestamp": ts
         }
         url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
-        requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+        r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+        print("[DEBUG] TP/SL Order Response:", r.text)
 
     place(tp_price, "TAKE_PROFIT_MARKET")
     place(sl_price, "STOP_MARKET")
-
-    print(f"[TP/SL SET] {symbol} side={side} qty={qty:.6f} TP={tp_price:.4f} SL={sl_price:.4f}")
 
 # ---------------- DCA MONITOR ----------------
 
@@ -138,10 +146,9 @@ def monitor_dca():
                 entry = float(pos["avgPrice"])
                 amt = float(pos["positionAmt"])
 
-                if amt == 0:
-                    continue
-
                 current = get_price_bingx(symbol)
+                print("[DEBUG] DCA current price:", current)
+
                 if not current:
                     continue
 
@@ -151,15 +158,16 @@ def monitor_dca():
                 d = active_dca[symbol]
                 executed = d["executed"]
 
+                deviation = abs((current - entry) / entry * 100)
+                print(f"[DEBUG] DCA deviation={deviation}, executed={executed}")
+
                 if executed >= DCA_COUNT:
                     continue
-
-                deviation = abs((current - entry) / entry * 100)
 
                 if deviation >= (executed + 1) * DCA_DEVIATION_PERCENT:
 
                     base_qty = TRADE_SIZE / entry
-                    qty = base_qty * (DCA_VOLUME_MULTIPLIER ** (executed + 1))  # FIXED
+                    qty = base_qty * (DCA_VOLUME_MULTIPLIER ** (executed + 1))
 
                     side_order = "BUY" if side == "LONG" else "SELL"
 
@@ -177,13 +185,11 @@ def monitor_dca():
                           f"{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
                     r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
 
-                    print(f"[DCA] {symbol} #{executed+1} qty={qty:.6f} deviation={deviation:.2f}% resp={r.text}")
+                    print("[DEBUG] DCA Order Response:", r.text)
 
                     d["executed"] += 1
 
-                    time.sleep(0.5)
                     reset_tp_sl(symbol)
-                    time.sleep(0.5)
                     set_tp_sl_for_position(symbol)
 
         except Exception as e:
@@ -194,13 +200,20 @@ def monitor_dca():
 # ---------------- DIRECT ENTRY (NO FILTERS) ----------------
 
 def execute_trade_bingx(symbol, direction):
+    print("[DEBUG] execute_trade_bingx START", symbol, direction)
+
     positions = get_open_positions()
+    print("[DEBUG] Current positions:", positions)
+
     if any(p['symbol'] == symbol and float(p.get('positionAmt', 0)) != 0 for p in positions):
         print(f"[SKIP] {symbol} bereits offen.")
         return
 
     current_price = get_price_bingx(symbol)
+    print("[DEBUG] current_price:", current_price)
+
     if not current_price:
+        print("[DEBUG] Kein Preis erhalten → Abbruch")
         return
 
     qty = round(TRADE_SIZE / current_price, 6)
@@ -219,13 +232,13 @@ def execute_trade_bingx(symbol, direction):
 
     url = f"{BINGX_BASE}/openApi/swap/v2/trade/order?" \
           f"{urllib.parse.urlencode(sorted(params.items()))}&signature={sign_bingx(params)}"
-    requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+    r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
+
+    print("[DEBUG] Entry Order Response:", r.text)
 
     active_dca[symbol] = {"side": direction, "entry": current_price, "executed": 0}
 
-    time.sleep(1)
     reset_tp_sl(symbol)
-    time.sleep(0.5)
     set_tp_sl_for_position(symbol)
 
     print(f"[ENTRY] {symbol} {direction} sofort ausgeführt.")
@@ -236,10 +249,15 @@ def execute_trade_bingx(symbol, direction):
 def handle_signal():
     data = request.get_json(silent=True) or {}
 
+    print("[DEBUG] Incoming JSON:", data)
+
     currency = str(data.get("currency", "")).upper()
     direction = str(data.get("direction", "")).upper()
 
+    print("[DEBUG] currency:", currency, "direction:", direction)
+
     if not currency or direction not in ("LONG", "SHORT"):
+        print("[DEBUG] INVALID SIGNAL → ignored")
         return jsonify({"status": "ignored"}), 200
 
     symbol = f"{currency}-USDT"
