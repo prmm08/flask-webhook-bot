@@ -1,4 +1,4 @@
-# -------- V8: CLEAN, STABLE, FULLY WORKING VERSION --------
+# -------- V9: DYNAMIC LEVERAGE & TRADE SIZE --------
 
 import time
 import hmac
@@ -19,7 +19,7 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
-# --- SETTINGS ---
+# --- DEFAULT SETTINGS ---
 LEVERAGE = 20
 TRADE_SIZE = 1250
 TP_PERCENT = 1
@@ -68,7 +68,6 @@ def get_positions():
         return []
 
 def symbol_exists(symbol):
-    """Check if symbol exists on BingX Futures."""
     try:
         r = requests.get(
             f"{BINGX_BASE}/openApi/swap/v2/quote/price",
@@ -176,7 +175,7 @@ def monitor_dca():
                     continue
 
                 if symbol not in active_dca:
-                    active_dca[symbol] = {"side": side, "entry": entry, "executed": 0}
+                    active_dca[symbol] = {"side": side, "entry": entry, "executed": 0, "trade_size": TRADE_SIZE}
 
                 d = active_dca[symbol]
                 executed = d["executed"]
@@ -188,7 +187,7 @@ def monitor_dca():
                     continue
 
                 if deviation >= (executed + 1) * DCA_DEVIATION_PERCENT:
-                    base_qty = TRADE_SIZE / entry
+                    base_qty = d["trade_size"] / entry
                     qty = base_qty * (DCA_VOLUME_MULTIPLIER ** (executed + 1))
 
                     ts = str(int(time.time() * 1000))
@@ -220,8 +219,8 @@ def monitor_dca():
 
 # ---------------- ENTRY ----------------
 
-def execute_trade(symbol, direction):
-    print("[DEBUG] ENTRY START", symbol, direction)
+def execute_trade(symbol, direction, leverage, trade_size):
+    print("[DEBUG] ENTRY START", symbol, direction, leverage, trade_size)
 
     if not symbol_exists(symbol):
         print(f"[ERROR] Symbol {symbol} existiert NICHT auf BingX Futures.")
@@ -239,7 +238,7 @@ def execute_trade(symbol, direction):
         print("[ERROR] Kein Preis → Abbruch")
         return
 
-    qty = round(TRADE_SIZE / price, 6)
+    qty = round(trade_size / price, 6)
     side = "BUY" if direction == "LONG" else "SELL"
 
     ts = str(int(time.time() * 1000))
@@ -249,7 +248,7 @@ def execute_trade(symbol, direction):
         "positionSide": direction,
         "type": "MARKET",
         "quantity": str(qty),
-        "leverage": str(LEVERAGE),
+        "leverage": str(leverage),
         "timestamp": ts
     }
 
@@ -261,7 +260,12 @@ def execute_trade(symbol, direction):
     r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
     print("[DEBUG] Entry Response:", r.text)
 
-    active_dca[symbol] = {"side": direction, "entry": price, "executed": 0}
+    active_dca[symbol] = {
+        "side": direction,
+        "entry": price,
+        "executed": 0,
+        "trade_size": trade_size
+    }
 
     reset_tp_sl(symbol)
     set_tp_sl(symbol)
@@ -283,9 +287,21 @@ def webhook():
 
     symbol = f"{currency}-USDT"
 
-    threading.Thread(target=execute_trade, args=(symbol, direction)).start()
+    leverage = int(data.get("leverage", LEVERAGE))
+    trade_size = float(data.get("trade_size", TRADE_SIZE))
 
-    return jsonify({"status": "processing", "symbol": symbol, "direction": direction}), 200
+    threading.Thread(
+        target=execute_trade,
+        args=(symbol, direction, leverage, trade_size)
+    ).start()
+
+    return jsonify({
+        "status": "processing",
+        "symbol": symbol,
+        "direction": direction,
+        "leverage": leverage,
+        "trade_size": trade_size
+    }), 200
 
 # ---------------- START ----------------
 
