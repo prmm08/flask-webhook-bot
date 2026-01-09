@@ -4,8 +4,8 @@ import requests
 import os
 import urllib.parse
 import threading
-import time  
-import json  
+import time
+import json
 
 from flask import Flask, request, jsonify
 import logging
@@ -35,66 +35,93 @@ dca_lock = threading.Lock()
 # ---------------- SIGNING ----------------
 
 def sign_bingx(params):
-    # Generiert die Signatur basierend auf den URL-kodierten Parametern
-    query_string = urllib.parse.urlencode(sorted(params.items()))
+    """
+    Generiert die Signatur basierend auf den URL-kodierten, sortierten Parametern.
+    Erwartet ein Dict oder None. Gibt Hex-HMAC-SHA256 zurück.
+    """
+    if not params:
+        query_string = ""
+    else:
+        # Kopie, damit wir das Original nicht verändern
+        items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
+        query_string = urllib.parse.urlencode(items)
     return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
-# ---------------- API HELPERS (Final Korrigiert) ----------------
+# ---------------- API HELPERS ----------------
 
 def api_request(method, endpoint, params=None):
+    """
+    Korrigierte API-Helper:
+    - GET: Parameter + signature in URL
+    - POST: Alle Parameter in URL + signature in URL, Body leer
+    Rückgabe: parsed JSON oder None
+    """
     url = f"{BINGX_BASE}{endpoint}"
-    
     headers = {"X-BX-APIKEY": API_KEY}
-    
-    if method == 'GET':
-        # Für GET-Anfragen: Signatur als Query-Parameter hinzufügen
-        if params:
-            params["signature"] = sign_bingx(params)
-        
-        # requests.get kodiert die Parameter automatisch in die URL
-        signed_url = f"{url}?{urllib.parse.urlencode(params)}" if params else url
 
+    # Defensive copy
+    params = {} if params is None else dict(params)
+
+    if method == "GET":
         try:
+            # Signatur hinzufügen
+            params_for_sign = dict(params)
+            params_for_sign["timestamp"] = params_for_sign.get("timestamp", params_for_sign.get("timestamp"))
+            signature = sign_bingx(params_for_sign)
+            params_with_sig = dict(params_for_sign)
+            params_with_sig["signature"] = signature
+            query = urllib.parse.urlencode(params_with_sig)
+            signed_url = f"{url}?{query}" if query else url
+
             response = requests.get(signed_url, headers=headers, timeout=10)
-            response.raise_for_status() 
+            response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-             # ... (Fehlerbehandlung bleibt gleich) ...
-            print(f"[API ERROR] Method: {method}, URL: {signed_url}, Error: {e}")
-            if hasattr(response, 'text'):
-                print(f"[API ERROR] Response Body: {response.text}")
+            print(f"[API ERROR] GET {url} → {e}")
+            try:
+                print("[BODY]", response.text)
+            except Exception:
+                pass
             return None
-    
-    elif method == 'POST':
-        # FÜR POST-ANFRAGEN: 
-        # 1. Signatur basierend auf den Parametern generieren und in den Header packen
-        if params:
-            headers["X-BX-SIGNATURE"] = sign_bingx(params)
-        
-        # 2. Den Body als URL-kodierte Daten senden (Standard Content-Type x-www-form-urlencoded)
-        data = urllib.parse.urlencode(params) if params else None
-        
+
+    elif method == "POST":
         try:
-            response = requests.post(url, data=data, headers=headers, timeout=10)
-            response.raise_for_status() 
+            # Build query string from params (may be empty)
+            params_for_sign = dict(params)
+            # Ensure timestamp exists for signed endpoints
+            if "timestamp" not in params_for_sign:
+                params_for_sign["timestamp"] = str(int(time.time() * 1000))
+
+            query = urllib.parse.urlencode(sorted((k, "" if v is None else str(v)) for k, v in params_for_sign.items()))
+            signature = sign_bingx(params_for_sign)
+            signed_url = f"{url}?{query}&signature={signature}" if query else f"{url}?signature={signature}"
+
+            # POST with empty body; BingX expects params in URL for swap v2
+            response = requests.post(signed_url, headers=headers, timeout=10)
+            response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            # ... (Fehlerbehandlung bleibt gleich) ...
-            print(f"[API ERROR] Method: {method}, URL: {url}, Error: {e}")
-            if hasattr(response, 'text'):
-                print(f"[API ERROR] Response Body: {response.text}")
+            print(f"[API ERROR] POST {url} → {e}")
+            try:
+                print("[BODY]", response.text)
+            except Exception:
+                pass
             return None
+    else:
+        raise ValueError("Unsupported HTTP method")
 
 def get_price(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", params={"symbol": symbol})
     if r and "data" in r and "price" in r["data"]:
-        return float(r["data"]["price"])
+        try:
+            return float(r["data"]["price"])
+        except Exception:
+            return None
     return None
 
 def get_positions():
     ts = str(int(time.time() * 1000))
     params = {"timestamp": ts}
-    # api_request("GET") fügt Signatur automatisch hinzu
     r = api_request("GET", "/openApi/swap/v2/user/positions", params=params)
     if r and "data" in r:
         return r.get("data", [])
@@ -104,28 +131,39 @@ def symbol_exists(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", params={"symbol": symbol})
     return r is not None and "data" in r and "price" in r["data"]
 
-# ---------------- TP/SL ----------------
+# ---------------- Leverage ----------------
+
+def set_leverage_for_symbol(symbol, leverage):
+    """
+    Setzt Hebel für ein Symbol. Manche Accounts erfordern das vor Order.
+    """
+    ts = str(int(time.time() * 1000))
+    params = {"symbol": symbol, "leverage": str(leverage), "timestamp": ts}
+    r = api_request("POST", "/openApi/swap/v2/trade/leverage", params=params)
+    if r:
+        print("[DEBUG] Set Leverage Response:", json.dumps(r))
+        return True
+    else:
+        print("[ERROR] Failed to set leverage for", symbol)
+        return False
+
+# ---------------- TP SL ----------------
 
 def reset_tp_sl(symbol):
-    # Diese Funktion muss auch api_request nutzen, um Signature Null Fehler zu vermeiden
     ts = str(int(time.time() * 1000))
     params = {"symbol": symbol, "timestamp": ts}
-    
     r = api_request("GET", "/openApi/swap/v2/trade/openOrders", params=params)
-
-    # BingX gibt hier die Orders eventuell in einem verschachtelten Dict zurück
-    data = r.get("data", {}).get("orders", []) if r else [] 
+    data = r.get("data", {}).get("orders", []) if r else []
 
     for order in data:
-        oid = order["orderId"]
+        oid = order.get("orderId") or order.get("order_id") or order.get("orderId")
+        if not oid:
+            continue
         ts2 = str(int(time.time() * 1000))
         params2 = {"orderId": oid, "symbol": symbol, "timestamp": ts2}
-        
-        # api_request("POST") fügt Signatur automatisch hinzu
         r2 = api_request("POST", "/openApi/swap/v2/trade/cancelOrder", params=params2)
         if r2:
             print("[DEBUG] Cancel TP/SL:", json.dumps(r2))
-
 
 def set_tp_sl(symbol, max_retries=5):
     pos = None
@@ -133,22 +171,25 @@ def set_tp_sl(symbol, max_retries=5):
     while retries < max_retries:
         positions = get_positions()
         pos = next(
-            (p for p in positions if p["symbol"] == symbol and float(p["positionAmt"]) != 0),
+            (p for p in positions if p["symbol"] == symbol and float(p.get("positionAmt", 0)) != 0),
             None
         )
         if pos:
             break
         print(f"[DEBUG] Position noch nicht sichtbar, warte 2s... Versuch {retries + 1}/{max_retries}")
-        time.sleep(2) 
+        time.sleep(2)
         retries += 1
-    
+
     if not pos:
         print("[ERROR] Konnte Position nach Wartezeit nicht finden, TP/SL nicht gesetzt.")
         return
 
-    side = pos["positionSide"]
-    entry = float(pos["avgPrice"])
-    # ... (Berechnung von tp/sl) ...
+    side = pos.get("positionSide", "LONG")
+    entry = float(pos.get("avgPrice", 0))
+    if entry == 0:
+        print("[ERROR] Ungültiger Entry Preis")
+        return
+
     tp = entry * (1 + TP_PERCENT / 100) if side == "LONG" else entry * (1 - TP_PERCENT / 100)
     sl = entry * (1 - SL_PERCENT / 100) if side == "LONG" else entry * (1 + SL_PERCENT / 100)
 
@@ -158,15 +199,14 @@ def set_tp_sl(symbol, max_retries=5):
         ts = str(int(time.time() * 1000))
         params = {
             "symbol": symbol,
-            "side": "SELL" if side == "LONG" else "BUY", 
-            "positionSide": side, 
+            "side": "SELL" if side == "LONG" else "BUY",
+            "positionSide": side,
             "type": otype,
             "stopPrice": f"{price:.6f}",
             "workingType": "MARK_PRICE",
             "closePosition": "true",
             "timestamp": ts
         }
-        # api_request("POST") fügt Signatur automatisch hinzu
         r = api_request("POST", "/openApi/swap/v2/trade/order", params=params)
         if r:
             print(f"[DEBUG] {otype} Response:", json.dumps(r))
@@ -176,7 +216,6 @@ def set_tp_sl(symbol, max_retries=5):
     place(tp, "TAKE_PROFIT_MARKET")
     place(sl, "STOP_MARKET")
 
-
 # ---------------- DCA ----------------
 
 def monitor_dca():
@@ -185,40 +224,47 @@ def monitor_dca():
             positions = get_positions()
 
             for pos in positions:
-                # ... (Logik zur Ermittlung von symbol, side, entry, amt, current bleibt gleich) ...
-                symbol = pos["symbol"]
-                side = pos["positionSide"]
-                entry = float(pos["avgPrice"])
-                amt = float(pos["positionAmt"])
+                symbol = pos.get("symbol")
+                side = pos.get("positionSide")
+                entry = float(pos.get("avgPrice", 0))
+                amt = float(pos.get("positionAmt", 0))
 
-                if amt == 0: continue
+                if not symbol or amt == 0:
+                    continue
+
                 current = get_price(symbol)
-                if not current: continue
-                
+                if not current:
+                    continue
+
                 with dca_lock:
                     if symbol not in active_dca:
                         active_dca[symbol] = {"side": side, "entry": entry, "executed": 0, "trade_size": TRADE_SIZE}
                     d = active_dca[symbol]
                     executed = d["executed"]
 
-                deviation = abs((current - entry) / entry * 100)
-                if executed >= DCA_COUNT: continue
+                deviation = abs((current - entry) / entry * 100) if entry != 0 else 0
+                if executed >= DCA_COUNT:
+                    continue
 
                 if deviation >= (executed + 1) * DCA_DEVIATION_PERCENT:
                     base_qty = d["trade_size"] / entry
                     qty = base_qty * (DCA_VOLUME_MULTIPLIER ** (executed + 1))
                     ts = str(int(time.time() * 1000))
                     params = {
-                        "symbol": symbol, "side": "BUY" if side == "LONG" else "SELL", 
-                        "positionSide": side, "type": "MARKET", "quantity": str(round(qty, 6)), "timestamp": ts
+                        "symbol": symbol,
+                        "side": "BUY" if side == "LONG" else "SELL",
+                        "positionSide": side,
+                        "type": "MARKET",
+                        "quantity": str(round(qty, 6)),
+                        "timestamp": ts
                     }
-                    
+
                     r = api_request("POST", "/openApi/swap/v2/trade/order", params=params)
                     if r:
                         print("[DEBUG] DCA Order:", json.dumps(r))
                     else:
                         print("[ERROR] Failed to place DCA order.")
-                    
+
                     with dca_lock:
                         d["executed"] += 1
 
@@ -237,33 +283,44 @@ def execute_trade(symbol, direction, leverage, trade_size):
     if not symbol_exists(symbol):
         print(f"[ERROR] Symbol {symbol} existiert NICHT auf BingX Futures.")
         return
+
     positions = get_positions()
-    if any(p["symbol"] == symbol and p["positionSide"] == direction and float(p["positionAmt"]) != 0 for p in positions):
+    if any(p["symbol"] == symbol and p["positionSide"] == direction and float(p.get("positionAmt", 0)) != 0 for p in positions):
         print(f"[SKIP] {symbol} {direction} bereits offen.")
         return
+
     price = get_price(symbol)
     print("[DEBUG] price:", price)
     if not price:
         print("[ERROR] Kein Preis → Abbruch")
         return
 
+    # Set leverage before placing order
+    if not set_leverage_for_symbol(symbol, leverage):
+        print("[ERROR] Leverage konnte nicht gesetzt werden. Abbruch.")
+        return
+
     qty = round(trade_size / price, 6)
     side = "BUY" if direction == "LONG" else "SELL"
     ts = str(int(time.time() * 1000))
     params = {
-        "symbol": symbol, "side": side, "positionSide": direction, "type": "MARKET", 
-        "quantity": str(qty), "leverage": str(leverage), "timestamp": ts
+        "symbol": symbol,
+        "side": side,
+        "positionSide": direction,
+        "type": "MARKET",
+        "quantity": str(qty),
+        "timestamp": ts
     }
 
     print("[DEBUG] ORDER PARAMS:", params)
 
     r = api_request("POST", "/openApi/swap/v2/trade/order", params=params)
-    
+
     if r:
         print("[DEBUG] Entry Response:", json.dumps(r))
     else:
         print("[ERROR] Failed to place Entry order.")
-        return 
+        return
 
     with dca_lock:
         active_dca[symbol] = {"side": direction, "entry": price, "executed": 0, "trade_size": trade_size}
