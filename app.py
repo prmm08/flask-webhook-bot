@@ -1,12 +1,12 @@
-# -------- V11: DYNAMIC LEVERAGE & TP/SL FIX (HEDGE MODE) --------
-
-import time
 import hmac
 import hashlib
 import requests
 import os
 import urllib.parse
 import threading
+import time  # Hinzugefügt
+import json  # Hilfreich für Debug-Ausgaben
+
 from flask import Flask, request, jsonify
 import logging
 
@@ -30,6 +30,7 @@ DCA_DEVIATION_PERCENT = 5
 DCA_VOLUME_MULTIPLIER = 2
 
 active_dca = {}
+dca_lock = threading.Lock() # Lock hinzugefügt für Thread-Safety
 
 # ---------------- SIGNING ----------------
 
@@ -39,44 +40,46 @@ def sign_bingx(params):
 
 # ---------------- API HELPERS ----------------
 
-def get_price(symbol):
+# Eine verbesserte Helferfunktion für API-Anfragen
+def api_request(method, endpoint, params=None, headers=None, data=None):
+    url = f"{BINGX_BASE}{endpoint}"
     try:
-        r = requests.get(
-            f"{BINGX_BASE}/openApi/swap/v2/quote/price",
-            params={"symbol": symbol},
-            timeout=10
-        ).json()
-        print("[DEBUG] Price Response:", r)
-        return float(r["data"]["price"])
-    except:
+        if method == 'GET':
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+        elif method == 'POST':
+            response = requests.post(url, params=params, headers=headers, data=data, timeout=10)
+        
+        response.raise_for_status() # Löst HTTPError für 4xx/5xx Fehler aus
+        return response.json()
+    
+    except requests.exceptions.RequestException as e:
+        print(f"[API ERROR] Method: {method}, URL: {url}, Error: {e}")
+        if response is not None:
+            print(f"[API ERROR] Response Body: {response.text}")
         return None
+
+def get_price(symbol):
+    r = api_request("GET", "/openApi/swap/v2/quote/price", params={"symbol": symbol})
+    if r and "data" in r and "price" in r["data"]:
+        return float(r["data"]["price"])
+    return None
+
 
 def get_positions():
     ts = str(int(time.time() * 1000))
     params = {"timestamp": ts}
-    url = (
-        f"{BINGX_BASE}/openApi/swap/v2/user/positions?"
-        f"{urllib.parse.urlencode(sorted(params.items()))}"
-        f"&signature={sign_bingx(params)}"
-    )
-    try:
-        r = requests.get(url, headers={"X-BX-APIKEY": API_KEY}, timeout=10)
-        print("[DEBUG] Positions RAW:", r.text)
-        data = r.json()
-        return data.get("data", [])
-    except:
-        return []
+    signature = sign_bingx(params)
+    # Signatur muss oft als eigener Parameter in der URL oder den Params sein, je nach API Doc
+    params["signature"] = signature 
+    
+    r = api_request("GET", "/openApi/swap/v2/user/positions", params=params, headers={"X-BX-APIKEY": API_KEY})
+    if r and "data" in r:
+        return r.get("data", [])
+    return []
 
 def symbol_exists(symbol):
-    try:
-        r = requests.get(
-            f"{BINGX_BASE}/openApi/swap/v2/quote/price",
-            params={"symbol": symbol},
-            timeout=10
-        ).json()
-        return "data" in r and "price" in r["data"]
-    except:
-        return False
+    r = api_request("GET", "/openApi/swap/v2/quote/price", params={"symbol": symbol})
+    return r is not None and "data" in r and "price" in r["data"]
 
 # ---------------- TP/SL ----------------
 
@@ -111,14 +114,24 @@ def reset_tp_sl(symbol):
     except Exception as e:
         print("[TP/SL RESET ERROR]", e)
 
-def set_tp_sl(symbol):
-    positions = get_positions()
-    pos = next(
-        (p for p in positions if p["symbol"] == symbol and float(p["positionAmt"]) != 0),
-        None
-    )
+def set_tp_sl(symbol, max_retries=5):
+    # Polling-Logik: Warte, bis die Position in der API sichtbar ist
+    pos = None
+    retries = 0
+    while retries < max_retries:
+        positions = get_positions()
+        pos = next(
+            (p for p in positions if p["symbol"] == symbol and float(p["positionAmt"]) != 0),
+            None
+        )
+        if pos:
+            break
+        print(f"[DEBUG] Position noch nicht sichtbar, warte 2s... Versuch {retries + 1}/{max_retries}")
+        time.sleep(2) # Wartezeit hinzugefügt
+        retries += 1
+    
     if not pos:
-        print("[DEBUG] No position for TP/SL")
+        print("[ERROR] Konnte Position nach Wartezeit nicht finden, TP/SL nicht gesetzt.")
         return
 
     side = pos["positionSide"]  # LONG oder SHORT
@@ -128,7 +141,7 @@ def set_tp_sl(symbol):
     tp = entry * (1 + TP_PERCENT / 100) if side == "LONG" else entry * (1 - TP_PERCENT / 100)
     sl = entry * (1 - SL_PERCENT / 100) if side == "LONG" else entry * (1 + SL_PERCENT / 100)
 
-    print(f"[DEBUG] Setting TP/SL: entry={entry}, qty={qty}, TP={tp}, SL={sl}")
+    print(f"[DEBUG] Setting TP/SL: entry={entry}, qty={qty}, TP={tp:.6f}, SL={sl:.6f}")
 
     def place(price, otype):
         ts = str(int(time.time() * 1000))
@@ -142,16 +155,16 @@ def set_tp_sl(symbol):
             "closePosition": "true",
             "timestamp": ts
         }
-        url = (
-            f"{BINGX_BASE}/openApi/swap/v2/trade/order?"
-            f"{urllib.parse.urlencode(sorted(params.items()))}"
-            f"&signature={sign_bingx(params)}"
-        )
-        r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
-        print("[DEBUG] TP/SL Response:", r.text)
+        # Verwende den API Helper für besseres Logging
+        r = api_request("POST", "/openApi/swap/v2/trade/order", params=params, headers={"X-BX-APIKEY": API_KEY})
+        if r:
+            print(f"[DEBUG] {otype} Response:", json.dumps(r))
+        else:
+            print(f"[ERROR] Failed to place {otype} order.")
 
     place(tp, "TAKE_PROFIT_MARKET")
     place(sl, "STOP_MARKET")
+
 
 # ---------------- DCA ----------------
 
@@ -172,20 +185,22 @@ def monitor_dca():
                 current = get_price(symbol)
                 if not current:
                     continue
+                
+                # Lock verwenden beim Lesen/Schreiben von active_dca
+                with dca_lock:
+                    if symbol not in active_dca:
+                        active_dca[symbol] = {
+                            "side": side,
+                            "entry": entry,
+                            "executed": 0,
+                            "trade_size": TRADE_SIZE
+                        }
 
-                if symbol not in active_dca:
-                    active_dca[symbol] = {
-                        "side": side,
-                        "entry": entry,
-                        "executed": 0,
-                        "trade_size": TRADE_SIZE
-                    }
-
-                d = active_dca[symbol]
-                executed = d["executed"]
+                    d = active_dca[symbol]
+                    executed = d["executed"]
 
                 deviation = abs((current - entry) / entry * 100)
-                print(f"[DEBUG] DCA deviation={deviation}, executed={executed}")
+                # print(f"[DEBUG] DCA deviation={deviation}, executed={executed}") # Stark reduziert um Logs zu entlasten
 
                 if executed >= DCA_COUNT:
                     continue
@@ -210,8 +225,10 @@ def monitor_dca():
                     )
                     r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
                     print("[DEBUG] DCA Order:", r.text)
-
-                    d["executed"] += 1
+                    
+                    # Lock verwenden beim Schreiben von active_dca
+                    with dca_lock:
+                        d["executed"] += 1
 
                     reset_tp_sl(symbol)
                     set_tp_sl(symbol)
@@ -266,13 +283,16 @@ def execute_trade(symbol, direction, leverage, trade_size):
     r = requests.post(url, headers={"X-BX-APIKEY": API_KEY})
     print("[DEBUG] Entry Response:", r.text)
 
-    active_dca[symbol] = {
-        "side": direction,
-        "entry": price,
-        "executed": 0,
-        "trade_size": trade_size
-    }
+    # Lock verwenden beim Schreiben von active_dca
+    with dca_lock:
+        active_dca[symbol] = {
+            "side": direction,
+            "entry": price,
+            "executed": 0,
+            "trade_size": trade_size
+        }
 
+    # set_tp_sl hat jetzt die interne Warte-Logik
     reset_tp_sl(symbol)
     set_tp_sl(symbol)
 
@@ -296,6 +316,7 @@ def webhook():
     leverage = int(data.get("leverage", LEVERAGE))
     trade_size = float(data.get("trade_size", TRADE_SIZE))
 
+    # Die Ausführung findet in einem separaten Thread statt
     threading.Thread(
         target=execute_trade,
         args=(symbol, direction, leverage, trade_size)
@@ -314,4 +335,8 @@ def webhook():
 threading.Thread(target=monitor_dca, daemon=True).start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # Stelle sicher, dass API Keys gesetzt sind, bevor du startest
+    if not API_KEY or not API_SECRET:
+        print("FEHLER: BINGX_API_KEY oder BINGX_API_SECRET Umgebungsvariablen sind nicht gesetzt.")
+    else:
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
