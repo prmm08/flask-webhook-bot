@@ -66,7 +66,7 @@ def api_request(method, endpoint, params=None):
         try:
             # Signatur hinzufügen
             params_for_sign = dict(params)
-            params_for_sign["timestamp"] = params_for_sign.get("timestamp", params_for_sign.get("timestamp"))
+            # Ensure timestamp present if provided externally; leave as-is otherwise
             signature = sign_bingx(params_for_sign)
             params_with_sig = dict(params_for_sign)
             params_with_sig["signature"] = signature
@@ -133,12 +133,23 @@ def symbol_exists(symbol):
 
 # ---------------- Leverage ----------------
 
-def set_leverage_for_symbol(symbol, leverage):
+def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     """
-    Setzt Hebel für ein Symbol. Manche Accounts erfordern das vor Order.
+    Setzt Hebel für ein Symbol. Für Hedge Mode übergebe position_side ("LONG"/"SHORT")
+    und side ("BUY"/"SELL") wenn möglich.
     """
     ts = str(int(time.time() * 1000))
-    params = {"symbol": symbol, "leverage": str(leverage), "timestamp": ts}
+    params = {
+        "symbol": symbol,
+        "leverage": str(leverage),
+        "timestamp": ts
+    }
+    # Optional: füge positionSide/side hinzu, wenn vorhanden
+    if position_side:
+        params["positionSide"] = position_side
+    if side:
+        params["side"] = side
+
     r = api_request("POST", "/openApi/swap/v2/trade/leverage", params=params)
     if r:
         print("[DEBUG] Set Leverage Response:", json.dumps(r))
@@ -149,14 +160,24 @@ def set_leverage_for_symbol(symbol, leverage):
 
 # ---------------- TP SL ----------------
 
-def reset_tp_sl(symbol):
+def reset_tp_sl(symbol, position_side=None):
+    """
+    Löscht offene TP/SL Orders für ein Symbol.
+    Wenn position_side angegeben ist, lösche nur Orders für diese PositionSide.
+    """
     ts = str(int(time.time() * 1000))
     params = {"symbol": symbol, "timestamp": ts}
     r = api_request("GET", "/openApi/swap/v2/trade/openOrders", params=params)
-    data = r.get("data", {}).get("orders", []) if r else []
+    orders = r.get("data", {}).get("orders", []) if r else []
 
-    for order in data:
-        oid = order.get("orderId") or order.get("order_id") or order.get("orderId")
+    for order in orders:
+        # Einige APIs nutzen unterschiedliche Keys; defensiv prüfen
+        order_pos_side = order.get("positionSide") or order.get("position_side") or order.get("position")
+        if position_side and order_pos_side and order_pos_side != position_side:
+            # überspringen, wenn nicht zur gewünschten PositionSide gehörend
+            continue
+
+        oid = order.get("orderId") or order.get("order_id")
         if not oid:
             continue
         ts2 = str(int(time.time() * 1000))
@@ -195,6 +216,9 @@ def set_tp_sl(symbol, max_retries=5):
 
     print(f"[DEBUG] Setting TP/SL: entry={entry}, TP={tp:.6f}, SL={sl:.6f}")
 
+    # Zuerst nur Orders für diese PositionSide löschen
+    reset_tp_sl(symbol, position_side=side)
+
     def place(price, otype):
         ts = str(int(time.time() * 1000))
         params = {
@@ -209,7 +233,15 @@ def set_tp_sl(symbol, max_retries=5):
         }
         r = api_request("POST", "/openApi/swap/v2/trade/order", params=params)
         if r:
-            print(f"[DEBUG] {otype} Response:", json.dumps(r))
+            # API kann Fehlercodes in JSON zurückgeben; handle das
+            try:
+                code = int(r.get("code", 0))
+            except Exception:
+                code = 0
+            if code == 110407:
+                print(f"[INFO] {otype} already exists for {symbol} {side}: {r.get('msg')}")
+            else:
+                print(f"[DEBUG] {otype} Response:", json.dumps(r))
         else:
             print(f"[ERROR] Failed to place {otype} order.")
 
@@ -268,7 +300,7 @@ def monitor_dca():
                     with dca_lock:
                         d["executed"] += 1
 
-                    reset_tp_sl(symbol)
+                    reset_tp_sl(symbol, position_side=side)
                     set_tp_sl(symbol)
 
         except Exception as e:
@@ -296,7 +328,9 @@ def execute_trade(symbol, direction, leverage, trade_size):
         return
 
     # Set leverage before placing order
-    if not set_leverage_for_symbol(symbol, leverage):
+    # Bestimme side für leverage call: BUY für LONG, SELL für SHORT
+    leverage_side = "BUY" if direction == "LONG" else "SELL"
+    if not set_leverage_for_symbol(symbol, leverage, position_side=direction, side=leverage_side):
         print("[ERROR] Leverage konnte nicht gesetzt werden. Abbruch.")
         return
 
@@ -325,7 +359,7 @@ def execute_trade(symbol, direction, leverage, trade_size):
     with dca_lock:
         active_dca[symbol] = {"side": direction, "entry": price, "executed": 0, "trade_size": trade_size}
 
-    reset_tp_sl(symbol)
+    reset_tp_sl(symbol, position_side=direction)
     set_tp_sl(symbol)
 
     print(f"[ENTRY] {symbol} {direction} ausgeführt.")
