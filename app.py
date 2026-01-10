@@ -64,9 +64,7 @@ def api_request(method, endpoint, params=None):
 
     if method == "GET":
         try:
-            # Signatur hinzufügen
             params_for_sign = dict(params)
-            # Ensure timestamp present if provided externally; leave as-is otherwise
             signature = sign_bingx(params_for_sign)
             params_with_sig = dict(params_for_sign)
             params_with_sig["signature"] = signature
@@ -86,9 +84,7 @@ def api_request(method, endpoint, params=None):
 
     elif method == "POST":
         try:
-            # Build query string from params (may be empty)
             params_for_sign = dict(params)
-            # Ensure timestamp exists for signed endpoints
             if "timestamp" not in params_for_sign:
                 params_for_sign["timestamp"] = str(int(time.time() * 1000))
 
@@ -186,23 +182,33 @@ def reset_tp_sl(symbol, position_side=None):
         if r2:
             print("[DEBUG] Cancel TP/SL:", json.dumps(r2))
 
-def set_tp_sl(symbol, max_retries=5):
+def set_tp_sl(symbol, desired_side=None, max_retries=8):
+    """
+    Setzt TP/SL für die Position mit symbol und desired_side ("LONG"/"SHORT").
+    Wenn desired_side None ist, Verhalten wie vorher (erste gefundene Position).
+    """
     pos = None
     retries = 0
     while retries < max_retries:
         positions = get_positions()
-        pos = next(
-            (p for p in positions if p["symbol"] == symbol and float(p.get("positionAmt", 0)) != 0),
-            None
-        )
+        if desired_side:
+            pos = next(
+                (p for p in positions if p["symbol"] == symbol and p.get("positionSide") == desired_side and float(p.get("positionAmt", 0)) != 0),
+                None
+            )
+        else:
+            pos = next(
+                (p for p in positions if p["symbol"] == symbol and float(p.get("positionAmt", 0)) != 0),
+                None
+            )
         if pos:
             break
-        print(f"[DEBUG] Position noch nicht sichtbar, warte 2s... Versuch {retries + 1}/{max_retries}")
-        time.sleep(2)
+        print(f"[DEBUG] Position ({desired_side}) noch nicht sichtbar, warte 1s... Versuch {retries + 1}/{max_retries}")
+        time.sleep(1)
         retries += 1
 
     if not pos:
-        print("[ERROR] Konnte Position nach Wartezeit nicht finden, TP/SL nicht gesetzt.")
+        print(f"[ERROR] Konnte Position {symbol} {desired_side} nach Wartezeit nicht finden, TP/SL nicht gesetzt.")
         return
 
     side = pos.get("positionSide", "LONG")
@@ -214,9 +220,9 @@ def set_tp_sl(symbol, max_retries=5):
     tp = entry * (1 + TP_PERCENT / 100) if side == "LONG" else entry * (1 - TP_PERCENT / 100)
     sl = entry * (1 - SL_PERCENT / 100) if side == "LONG" else entry * (1 + SL_PERCENT / 100)
 
-    print(f"[DEBUG] Setting TP/SL: entry={entry}, TP={tp:.6f}, SL={sl:.6f}")
+    print(f"[DEBUG] Setting TP/SL for {symbol} {side}: entry={entry}, TP={tp:.6f}, SL={sl:.6f}")
 
-    # Zuerst nur Orders für diese PositionSide löschen
+    # Lösche nur Orders für diese PositionSide
     reset_tp_sl(symbol, position_side=side)
 
     def place(price, otype):
@@ -233,7 +239,6 @@ def set_tp_sl(symbol, max_retries=5):
         }
         r = api_request("POST", "/openApi/swap/v2/trade/order", params=params)
         if r:
-            # API kann Fehlercodes in JSON zurückgeben; handle das
             try:
                 code = int(r.get("code", 0))
             except Exception:
@@ -301,7 +306,7 @@ def monitor_dca():
                         d["executed"] += 1
 
                     reset_tp_sl(symbol, position_side=side)
-                    set_tp_sl(symbol)
+                    set_tp_sl(symbol, desired_side=side)
 
         except Exception as e:
             print("[DCA ERROR]", e)
@@ -317,7 +322,7 @@ def execute_trade(symbol, direction, leverage, trade_size):
         return
 
     positions = get_positions()
-    if any(p["symbol"] == symbol and p["positionSide"] == direction and float(p.get("positionAmt", 0)) != 0 for p in positions):
+    if any(p["symbol"] == symbol and p.get("positionSide") == direction and float(p.get("positionAmt", 0)) != 0 for p in positions):
         print(f"[SKIP] {symbol} {direction} bereits offen.")
         return
 
@@ -359,8 +364,18 @@ def execute_trade(symbol, direction, leverage, trade_size):
     with dca_lock:
         active_dca[symbol] = {"side": direction, "entry": price, "executed": 0, "trade_size": trade_size}
 
+    # Warte kurz, damit die Position in get_positions() sichtbar wird
+    time.sleep(1.5)
+
+    # Debug: log positions after entry to verify which position exists
+    try:
+        post_positions = get_positions()
+        print("[DEBUG] Positions after entry:", json.dumps(post_positions, indent=2))
+    except Exception as e:
+        print("[DEBUG] Could not fetch positions after entry:", e)
+
     reset_tp_sl(symbol, position_side=direction)
-    set_tp_sl(symbol)
+    set_tp_sl(symbol, desired_side=direction)
 
     print(f"[ENTRY] {symbol} {direction} ausgeführt.")
 
