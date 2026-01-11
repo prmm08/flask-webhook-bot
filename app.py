@@ -42,7 +42,6 @@ def sign_bingx(params):
     if not params:
         query_string = ""
     else:
-        # Kopie, damit wir das Original nicht verändern
         items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
         query_string = urllib.parse.urlencode(items)
     return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
@@ -59,7 +58,6 @@ def api_request(method, endpoint, params=None):
     url = f"{BINGX_BASE}{endpoint}"
     headers = {"X-BX-APIKEY": API_KEY}
 
-    # Defensive copy
     params = {} if params is None else dict(params)
 
     if method == "GET":
@@ -92,7 +90,6 @@ def api_request(method, endpoint, params=None):
             signature = sign_bingx(params_for_sign)
             signed_url = f"{url}?{query}&signature={signature}" if query else f"{url}?signature={signature}"
 
-            # POST with empty body; BingX expects params in URL for swap v2
             response = requests.post(signed_url, headers=headers, timeout=10)
             response.raise_for_status()
             return response.json()
@@ -130,17 +127,12 @@ def symbol_exists(symbol):
 # ---------------- Leverage ----------------
 
 def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
-    """
-    Setzt Hebel für ein Symbol. Für Hedge Mode übergebe position_side ("LONG"/"SHORT")
-    und side ("BUY"/"SELL") wenn möglich.
-    """
     ts = str(int(time.time() * 1000))
     params = {
         "symbol": symbol,
         "leverage": str(leverage),
         "timestamp": ts
     }
-    # Optional: füge positionSide/side hinzu, wenn vorhanden
     if position_side:
         params["positionSide"] = position_side
     if side:
@@ -157,20 +149,14 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
 # ---------------- TP SL ----------------
 
 def reset_tp_sl(symbol, position_side=None):
-    """
-    Löscht offene TP/SL Orders für ein Symbol.
-    Wenn position_side angegeben ist, lösche nur Orders für diese PositionSide.
-    """
     ts = str(int(time.time() * 1000))
     params = {"symbol": symbol, "timestamp": ts}
     r = api_request("GET", "/openApi/swap/v2/trade/openOrders", params=params)
     orders = r.get("data", {}).get("orders", []) if r else []
 
     for order in orders:
-        # Einige APIs nutzen unterschiedliche Keys; defensiv prüfen
         order_pos_side = order.get("positionSide") or order.get("position_side") or order.get("position")
         if position_side and order_pos_side and order_pos_side != position_side:
-            # überspringen, wenn nicht zur gewünschten PositionSide gehörend
             continue
 
         oid = order.get("orderId") or order.get("order_id")
@@ -183,10 +169,6 @@ def reset_tp_sl(symbol, position_side=None):
             print("[DEBUG] Cancel TP/SL:", json.dumps(r2))
 
 def set_tp_sl(symbol, desired_side=None, max_retries=8):
-    """
-    Setzt TP/SL für die Position mit symbol und desired_side ("LONG"/"SHORT").
-    Wenn desired_side None ist, Verhalten wie vorher (erste gefundene Position).
-    """
     pos = None
     retries = 0
     while retries < max_retries:
@@ -222,7 +204,6 @@ def set_tp_sl(symbol, desired_side=None, max_retries=8):
 
     print(f"[DEBUG] Setting TP/SL for {symbol} {side}: entry={entry}, TP={tp:.6f}, SL={sl:.6f}")
 
-    # Lösche nur Orders für diese PositionSide
     reset_tp_sl(symbol, position_side=side)
 
     def place(price, otype):
@@ -266,7 +247,7 @@ def monitor_dca():
                 entry = float(pos.get("avgPrice", 0))
                 amt = float(pos.get("positionAmt", 0))
 
-                if not symbol or amt == 0:
+                if not symbol or amt == 0 or entry == 0:
                     continue
 
                 current = get_price(symbol)
@@ -275,7 +256,27 @@ def monitor_dca():
 
                 with dca_lock:
                     if symbol not in active_dca:
-                        active_dca[symbol] = {"side": side, "entry": entry, "executed": 0, "trade_size": TRADE_SIZE}
+                        # Bestimme trade_size basierend auf der vorhandenen Position (erste Order)
+                        try:
+                            base_trade_value = abs(amt) * entry  # positionAmt * avgPrice -> Wert der ersten Order
+                            if base_trade_value <= 0:
+                                raise ValueError("base_trade_value 0")
+                            active_dca[symbol] = {
+                                "side": side,
+                                "entry": entry,
+                                "executed": 0,
+                                "trade_size": base_trade_value
+                            }
+                            print(f"[DEBUG] Initialized DCA for {symbol} from position: trade_size={base_trade_value}")
+                        except Exception:
+                            # Fallback auf globalen TRADE_SIZE, falls Positiondaten nicht ausreichen
+                            active_dca[symbol] = {
+                                "side": side,
+                                "entry": entry,
+                                "executed": 0,
+                                "trade_size": TRADE_SIZE
+                            }
+                            print(f"[WARN] Could not derive trade_size from position for {symbol}, using TRADE_SIZE={TRADE_SIZE}")
                     d = active_dca[symbol]
                     executed = d["executed"]
 
@@ -283,16 +284,20 @@ def monitor_dca():
                 if executed >= DCA_COUNT:
                     continue
 
+                # Wenn Abweichung groß genug, DCA platzieren
                 if deviation >= (executed + 1) * DCA_DEVIATION_PERCENT:
+                    # Basismenge in Kontrakten
                     base_qty = d["trade_size"] / entry
+                    # Multipliziere gemäß Ausführungsstufe: executed=0 -> multiplier^(1) => SO1 = base * multiplier
                     qty = base_qty * (DCA_VOLUME_MULTIPLIER ** (executed + 1))
+                    qty_rounded = round(qty, 6)
                     ts = str(int(time.time() * 1000))
                     params = {
                         "symbol": symbol,
                         "side": "BUY" if side == "LONG" else "SELL",
                         "positionSide": side,
                         "type": "MARKET",
-                        "quantity": str(round(qty, 6)),
+                        "quantity": str(qty_rounded),
                         "timestamp": ts
                     }
 
@@ -305,6 +310,7 @@ def monitor_dca():
                     with dca_lock:
                         d["executed"] += 1
 
+                    # TP/SL für die Position aktualisieren
                     reset_tp_sl(symbol, position_side=side)
                     set_tp_sl(symbol, desired_side=side)
 
@@ -332,8 +338,6 @@ def execute_trade(symbol, direction, leverage, trade_size):
         print("[ERROR] Kein Preis → Abbruch")
         return
 
-    # Set leverage before placing order
-    # Bestimme side für leverage call: BUY für LONG, SELL für SHORT
     leverage_side = "BUY" if direction == "LONG" else "SELL"
     if not set_leverage_for_symbol(symbol, leverage, position_side=direction, side=leverage_side):
         print("[ERROR] Leverage konnte nicht gesetzt werden. Abbruch.")
@@ -362,12 +366,13 @@ def execute_trade(symbol, direction, leverage, trade_size):
         return
 
     with dca_lock:
+        # Speichere trade_size exakt so, wie es per Webhook übergeben wurde (erste Order)
         active_dca[symbol] = {"side": direction, "entry": price, "executed": 0, "trade_size": trade_size}
+        print(f"[DEBUG] active_dca set from execute_trade: {active_dca[symbol]}")
 
     # Warte kurz, damit die Position in get_positions() sichtbar wird
     time.sleep(1.5)
 
-    # Debug: log positions after entry to verify which position exists
     try:
         post_positions = get_positions()
         print("[DEBUG] Positions after entry:", json.dumps(post_positions, indent=2))
