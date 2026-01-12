@@ -194,10 +194,21 @@ def set_tp_sl(symbol, desired_side=None, max_retries=8):
         return
 
     side = pos.get("positionSide", "LONG")
-    entry = float(pos.get("avgPrice", 0))
-    if entry == 0:
-        print("[ERROR] Ungültiger Entry Preis")
-        return
+    # Warte bis BingX avgPrice aktualisiert hat
+    old_entry = float(pos.get("avgPrice", 0))
+    for i in range(10):
+        time.sleep(0.8)
+        new_positions = get_positions()
+        new_pos = next((p for p in new_positions if p["symbol"] == symbol and p.get("positionSide") == side), None)
+        if not new_pos:
+            continue
+        new_entry = float(new_pos.get("avgPrice", 0))
+        if abs(new_entry - old_entry) > 0.0001:  # avgPrice hat sich geändert
+            old_entry = new_entry
+            break
+
+    entry = old_entry
+
 
     tp = entry * (1 + TP_PERCENT / 100) if side == "LONG" else entry * (1 - TP_PERCENT / 100)
     sl = entry * (1 - SL_PERCENT / 100) if side == "LONG" else entry * (1 + SL_PERCENT / 100)
