@@ -35,10 +35,6 @@ dca_lock = threading.Lock()
 # ---------------- SIGNING ----------------
 
 def sign_bingx(params):
-    """
-    Generiert die Signatur basierend auf den URL-kodierten, sortierten Parametern.
-    Erwartet ein Dict oder None. Gibt Hex-HMAC-SHA256 zurück.
-    """
     if not params:
         query_string = ""
     else:
@@ -49,15 +45,8 @@ def sign_bingx(params):
 # ---------------- API HELPERS ----------------
 
 def api_request(method, endpoint, params=None):
-    """
-    Korrigierte API-Helper:
-    - GET: Parameter + signature in URL
-    - POST: Alle Parameter in URL + signature in URL, Body leer
-    Rückgabe: parsed JSON oder None
-    """
     url = f"{BINGX_BASE}{endpoint}"
     headers = {"X-BX-APIKEY": API_KEY}
-
     params = {} if params is None else dict(params)
 
     if method == "GET":
@@ -168,7 +157,7 @@ def reset_tp_sl(symbol, position_side=None):
         if r2:
             print("[DEBUG] Cancel TP/SL:", json.dumps(r2))
 
-def set_tp_sl(symbol, desired_side=None, max_retries=8):
+def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT, max_retries=8):
     pos = None
     retries = 0
     while retries < max_retries:
@@ -190,12 +179,14 @@ def set_tp_sl(symbol, desired_side=None, max_retries=8):
         retries += 1
 
     if not pos:
-        print(f"[ERROR] Konnte Position {symbol} {desired_side} nach Wartezeit nicht finden, TP/SL nicht gesetzt.")
+        print(f"[ERROR] Konnte Position {symbol} {desired_side} nicht finden.")
         return
 
     side = pos.get("positionSide", "LONG")
+    entry = float(pos.get("avgPrice", 0))
+
     # Warte bis BingX avgPrice aktualisiert hat
-    old_entry = float(pos.get("avgPrice", 0))
+    old_entry = entry
     for i in range(10):
         time.sleep(0.8)
         new_positions = get_positions()
@@ -203,15 +194,14 @@ def set_tp_sl(symbol, desired_side=None, max_retries=8):
         if not new_pos:
             continue
         new_entry = float(new_pos.get("avgPrice", 0))
-        if abs(new_entry - old_entry) > 0.0001:  # avgPrice hat sich geändert
+        if abs(new_entry - old_entry) > 0.0001:
             old_entry = new_entry
             break
 
     entry = old_entry
 
-
-    tp = entry * (1 + TP_PERCENT / 100) if side == "LONG" else entry * (1 - TP_PERCENT / 100)
-    sl = entry * (1 - SL_PERCENT / 100) if side == "LONG" else entry * (1 + SL_PERCENT / 100)
+    tp = entry * (1 + tp_percent / 100) if side == "LONG" else entry * (1 - tp_percent / 100)
+    sl = entry * (1 - sl_percent / 100) if side == "LONG" else entry * (1 + sl_percent / 100)
 
     print(f"[DEBUG] Setting TP/SL for {symbol} {side}: entry={entry}, TP={tp:.6f}, SL={sl:.6f}")
 
@@ -231,14 +221,7 @@ def set_tp_sl(symbol, desired_side=None, max_retries=8):
         }
         r = api_request("POST", "/openApi/swap/v2/trade/order", params=params)
         if r:
-            try:
-                code = int(r.get("code", 0))
-            except Exception:
-                code = 0
-            if code == 110407:
-                print(f"[INFO] {otype} already exists for {symbol} {side}: {r.get('msg')}")
-            else:
-                print(f"[DEBUG] {otype} Response:", json.dumps(r))
+            print(f"[DEBUG] {otype} Response:", json.dumps(r))
         else:
             print(f"[ERROR] Failed to place {otype} order.")
 
@@ -267,27 +250,28 @@ def monitor_dca():
 
                 with dca_lock:
                     if symbol not in active_dca:
-                        # Bestimme trade_size basierend auf der vorhandenen Position (erste Order)
                         try:
-                            base_trade_value = abs(amt) * entry  # positionAmt * avgPrice -> Wert der ersten Order
+                            base_trade_value = abs(amt) * entry
                             if base_trade_value <= 0:
                                 raise ValueError("base_trade_value 0")
                             active_dca[symbol] = {
                                 "side": side,
                                 "entry": entry,
                                 "executed": 0,
-                                "trade_size": base_trade_value
+                                "trade_size": base_trade_value,
+                                "tp_percent": TP_PERCENT,
+                                "sl_percent": SL_PERCENT
                             }
-                            print(f"[DEBUG] Initialized DCA for {symbol} from position: trade_size={base_trade_value}")
                         except Exception:
-                            # Fallback auf globalen TRADE_SIZE, falls Positiondaten nicht ausreichen
                             active_dca[symbol] = {
                                 "side": side,
                                 "entry": entry,
                                 "executed": 0,
-                                "trade_size": TRADE_SIZE
+                                "trade_size": TRADE_SIZE,
+                                "tp_percent": TP_PERCENT,
+                                "sl_percent": SL_PERCENT
                             }
-                            print(f"[WARN] Could not derive trade_size from position for {symbol}, using TRADE_SIZE={TRADE_SIZE}")
+
                     d = active_dca[symbol]
                     executed = d["executed"]
 
@@ -295,11 +279,8 @@ def monitor_dca():
                 if executed >= DCA_COUNT:
                     continue
 
-                # Wenn Abweichung groß genug, DCA platzieren
                 if deviation >= (executed + 1) * DCA_DEVIATION_PERCENT:
-                    # Basismenge in Kontrakten
                     base_qty = d["trade_size"] / entry
-                    # Multipliziere gemäß Ausführungsstufe: executed=0 -> multiplier^(1) => SO1 = base * multiplier
                     qty = base_qty * (DCA_VOLUME_MULTIPLIER ** (executed + 1))
                     qty_rounded = round(qty, 6)
                     ts = str(int(time.time() * 1000))
@@ -321,9 +302,13 @@ def monitor_dca():
                     with dca_lock:
                         d["executed"] += 1
 
-                    # TP/SL für die Position aktualisieren
                     reset_tp_sl(symbol, position_side=side)
-                    set_tp_sl(symbol, desired_side=side)
+                    set_tp_sl(
+                        symbol,
+                        desired_side=side,
+                        tp_percent=d["tp_percent"],
+                        sl_percent=d["sl_percent"]
+                    )
 
         except Exception as e:
             print("[DCA ERROR]", e)
@@ -332,8 +317,9 @@ def monitor_dca():
 
 # ---------------- ENTRY ----------------
 
-def execute_trade(symbol, direction, leverage, trade_size):
+def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
     print(f"[DEBUG] ENTRY START {symbol} {direction} {leverage} {trade_size}")
+
     if not symbol_exists(symbol):
         print(f"[ERROR] Symbol {symbol} existiert NICHT auf BingX Futures.")
         return
@@ -344,7 +330,6 @@ def execute_trade(symbol, direction, leverage, trade_size):
         return
 
     price = get_price(symbol)
-    print("[DEBUG] price:", price)
     if not price:
         print("[ERROR] Kein Preis → Abbruch")
         return
@@ -366,32 +351,26 @@ def execute_trade(symbol, direction, leverage, trade_size):
         "timestamp": ts
     }
 
-    print("[DEBUG] ORDER PARAMS:", params)
-
     r = api_request("POST", "/openApi/swap/v2/trade/order", params=params)
 
-    if r:
-        print("[DEBUG] Entry Response:", json.dumps(r))
-    else:
+    if not r:
         print("[ERROR] Failed to place Entry order.")
         return
 
     with dca_lock:
-        # Speichere trade_size exakt so, wie es per Webhook übergeben wurde (erste Order)
-        active_dca[symbol] = {"side": direction, "entry": price, "executed": 0, "trade_size": trade_size}
-        print(f"[DEBUG] active_dca set from execute_trade: {active_dca[symbol]}")
+        active_dca[symbol] = {
+            "side": direction,
+            "entry": price,
+            "executed": 0,
+            "trade_size": trade_size,
+            "tp_percent": tp_percent,
+            "sl_percent": sl_percent
+        }
 
-    # Warte kurz, damit die Position in get_positions() sichtbar wird
     time.sleep(1.5)
 
-    try:
-        post_positions = get_positions()
-        print("[DEBUG] Positions after entry:", json.dumps(post_positions, indent=2))
-    except Exception as e:
-        print("[DEBUG] Could not fetch positions after entry:", e)
-
     reset_tp_sl(symbol, position_side=direction)
-    set_tp_sl(symbol, desired_side=direction)
+    set_tp_sl(symbol, desired_side=direction, tp_percent=tp_percent, sl_percent=sl_percent)
 
     print(f"[ENTRY] {symbol} {direction} ausgeführt.")
 
@@ -401,18 +380,33 @@ def execute_trade(symbol, direction, leverage, trade_size):
 def webhook():
     data = request.get_json(silent=True) or {}
     print("[DEBUG] Incoming:", data)
+
     currency = str(data.get("currency", "")).upper()
     direction = str(data.get("direction", "")).upper()
     if not currency or direction not in ("LONG", "SHORT"):
         return jsonify({"status": "ignored"}), 200
+
     symbol = f"{currency}-USDT"
     leverage = int(data.get("leverage", LEVERAGE))
     trade_size = float(data.get("trade_size", TRADE_SIZE))
+
+    tp_percent = float(data.get("tp_percent", TP_PERCENT))
+    sl_percent = float(data.get("sl_percent", SL_PERCENT))
+
     threading.Thread(
         target=execute_trade,
-        args=(symbol, direction, leverage, trade_size)
+        args=(symbol, direction, leverage, trade_size, tp_percent, sl_percent)
     ).start()
-    return jsonify({"status": "processing", "symbol": symbol, "direction": direction, "leverage": leverage, "trade_size": trade_size}), 200
+
+    return jsonify({
+        "status": "processing",
+        "symbol": symbol,
+        "direction": direction,
+        "leverage": leverage,
+        "trade_size": trade_size,
+        "tp_percent": tp_percent,
+        "sl_percent": sl_percent
+    }), 200
 
 # ---------------- START ----------------
 
@@ -420,6 +414,6 @@ threading.Thread(target=monitor_dca, daemon=True).start()
 
 if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
-        print("FEHLER: BINGX_API_KEY oder BINGX_API_SECRET Umgebungsvariablen sind nicht gesetzt.")
+        print("FEHLER: BINGX_API_KEY oder BINGX_API_SECRET fehlen.")
     else:
         app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
