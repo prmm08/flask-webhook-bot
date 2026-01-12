@@ -49,6 +49,9 @@ def api_request(method, endpoint, params=None):
     headers = {"X-BX-APIKEY": API_KEY}
     params = {} if params is None else dict(params)
 
+    # separate connect/read timeout: (5s connect, 10s read)
+    timeout = (5, 10)
+
     if method == "GET":
         try:
             params_for_sign = dict(params)
@@ -58,7 +61,7 @@ def api_request(method, endpoint, params=None):
             query = urllib.parse.urlencode(params_with_sig)
             signed_url = f"{url}?{query}" if query else url
 
-            response = requests.get(signed_url, headers=headers, timeout=10)
+            response = requests.get(signed_url, headers=headers, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -75,11 +78,13 @@ def api_request(method, endpoint, params=None):
             if "timestamp" not in params_for_sign:
                 params_for_sign["timestamp"] = str(int(time.time() * 1000))
 
-            query = urllib.parse.urlencode(sorted((k, "" if v is None else str(v)) for k, v in params_for_sign.items()))
+            query = urllib.parse.urlencode(
+                sorted((k, "" if v is None else str(v)) for k, v in params_for_sign.items())
+            )
             signature = sign_bingx(params_for_sign)
             signed_url = f"{url}?{query}&signature={signature}" if query else f"{url}?signature={signature}"
 
-            response = requests.post(signed_url, headers=headers, timeout=10)
+            response = requests.post(signed_url, headers=headers, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -144,7 +149,11 @@ def reset_tp_sl(symbol, position_side=None):
     orders = r.get("data", {}).get("orders", []) if r else []
 
     for order in orders:
-        order_pos_side = order.get("positionSide") or order.get("position_side") or order.get("position")
+        order_pos_side = (
+            order.get("positionSide")
+            or order.get("position_side")
+            or order.get("position")
+        )
         if position_side and order_pos_side and order_pos_side != position_side:
             continue
 
@@ -164,17 +173,30 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
         positions = get_positions()
         if desired_side:
             pos = next(
-                (p for p in positions if p["symbol"] == symbol and p.get("positionSide") == desired_side and float(p.get("positionAmt", 0)) != 0),
+                (
+                    p
+                    for p in positions
+                    if p["symbol"] == symbol
+                    and p.get("positionSide") == desired_side
+                    and float(p.get("positionAmt", 0)) != 0
+                ),
                 None
             )
         else:
             pos = next(
-                (p for p in positions if p["symbol"] == symbol and float(p.get("positionAmt", 0)) != 0),
+                (
+                    p
+                    for p in positions
+                    if p["symbol"] == symbol and float(p.get("positionAmt", 0)) != 0
+                ),
                 None
             )
         if pos:
             break
-        print(f"[DEBUG] Position ({desired_side}) noch nicht sichtbar, warte 1s... Versuch {retries + 1}/{max_retries}")
+        print(
+            f"[DEBUG] Position ({desired_side}) noch nicht sichtbar, "
+            f"warte 1s... Versuch {retries + 1}/{max_retries}"
+        )
         time.sleep(1)
         retries += 1
 
@@ -187,10 +209,13 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
 
     # Warte bis BingX avgPrice aktualisiert hat
     old_entry = entry
-    for i in range(10):
+    for _ in range(10):
         time.sleep(0.8)
         new_positions = get_positions()
-        new_pos = next((p for p in new_positions if p["symbol"] == symbol and p.get("positionSide") == side), None)
+        new_pos = next(
+            (p for p in new_positions if p["symbol"] == symbol and p.get("positionSide") == side),
+            None
+        )
         if not new_pos:
             continue
         new_entry = float(new_pos.get("avgPrice", 0))
@@ -262,6 +287,10 @@ def monitor_dca():
                                 "tp_percent": TP_PERCENT,
                                 "sl_percent": SL_PERCENT
                             }
+                            print(
+                                f"[DEBUG] Initialized DCA for {symbol} from position: "
+                                f"trade_size={base_trade_value}"
+                            )
                         except Exception:
                             active_dca[symbol] = {
                                 "side": side,
@@ -271,6 +300,10 @@ def monitor_dca():
                                 "tp_percent": TP_PERCENT,
                                 "sl_percent": SL_PERCENT
                             }
+                            print(
+                                f"[WARN] Could not derive trade_size from position for {symbol}, "
+                                f"using TRADE_SIZE={TRADE_SIZE}"
+                            )
 
                     d = active_dca[symbol]
                     executed = d["executed"]
@@ -315,6 +348,16 @@ def monitor_dca():
 
         time.sleep(10)
 
+# Watchdog für DCA-Thread
+def start_dca_thread():
+    while True:
+        try:
+            print("[DCA] Thread started")
+            monitor_dca()
+        except Exception as e:
+            print("[DCA FATAL] Thread crashed, restarting in 3s:", e)
+            time.sleep(3)
+
 # ---------------- ENTRY ----------------
 
 def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
@@ -325,7 +368,12 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
         return
 
     positions = get_positions()
-    if any(p["symbol"] == symbol and p.get("positionSide") == direction and float(p.get("positionAmt", 0)) != 0 for p in positions):
+    if any(
+        p["symbol"] == symbol
+        and p.get("positionSide") == direction
+        and float(p.get("positionAmt", 0)) != 0
+        for p in positions
+    ):
         print(f"[SKIP] {symbol} {direction} bereits offen.")
         return
 
@@ -366,11 +414,17 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
             "tp_percent": tp_percent,
             "sl_percent": sl_percent
         }
+        print(f"[DEBUG] active_dca set from execute_trade: {active_dca[symbol]}")
 
     time.sleep(1.5)
 
     reset_tp_sl(symbol, position_side=direction)
-    set_tp_sl(symbol, desired_side=direction, tp_percent=tp_percent, sl_percent=sl_percent)
+    set_tp_sl(
+        symbol,
+        desired_side=direction,
+        tp_percent=tp_percent,
+        sl_percent=sl_percent
+    )
 
     print(f"[ENTRY] {symbol} {direction} ausgeführt.")
 
@@ -408,12 +462,41 @@ def webhook():
         "sl_percent": sl_percent
     }), 200
 
-# ---------------- START ----------------
+# ---------------- HEALTH / KEEP-ALIVE ----------------
 
-threading.Thread(target=monitor_dca, daemon=True).start()
+@app.route("/ping", methods=["GET"])
+def ping():
+    return "pong", 200
+
+def keep_alive():
+    """
+    Pingt regelmäßig die eigene öffentliche Render-URL,
+    damit der Service nicht einschläft.
+    Setze ENV: SELF_PING_URL=https://flask-webhook-bot-1.onrender.com/ping
+    """
+    url = os.getenv("SELF_PING_URL")
+    if not url:
+        print("[KEEPALIVE] SELF_PING_URL nicht gesetzt – Keep-Alive deaktiviert.")
+        return
+
+    print(f"[KEEPALIVE] Aktiv – ping auf {url}")
+    while True:
+        try:
+            r = requests.get(url, timeout=5)
+            print(f"[KEEPALIVE] {r.status_code}")
+        except Exception as e:
+            print(f"[KEEPALIVE ERROR] {e}")
+        time.sleep(240)  # alle 4 Minuten
+
+# ---------------- START ----------------
 
 if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
         print("FEHLER: BINGX_API_KEY oder BINGX_API_SECRET fehlen.")
     else:
+        # DCA-Watchdog-Thread
+        threading.Thread(target=start_dca_thread, daemon=True).start()
+        # Keep-Alive-Thread
+        threading.Thread(target=keep_alive, daemon=True).start()
+
         app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
