@@ -146,7 +146,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     side = pos["positionSide"]
     entry = float(pos["avgPrice"])
 
-    # avgPrice Update abwarten
+    # avgPrice-Update abwarten
     for _ in range(10):
         time.sleep(0.8)
         new_pos = next((p for p in get_positions()
@@ -166,13 +166,15 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
             "side": "SELL" if side == "LONG" else "BUY",
             "positionSide": side,
             "type": otype,
-            "stopPrice": f"{price:.4f}",
+            "stopPrice": f"{price:.6f}",
             "workingType": "MARK_PRICE",
+            "closePosition": "true",
             "timestamp": str(int(time.time() * 1000))
         })
 
     place(tp, "TAKE_PROFIT_MARKET")
     place(sl, "STOP_MARKET")
+
 
 
 # ============================================================
