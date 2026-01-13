@@ -32,7 +32,8 @@ DCA_VOLUME_MULTIPLIER = 2
 active_dca = {}
 dca_lock = threading.Lock()
 
-# ---------------- SIGNING ----------------
+# --- HEARTBEAT ---
+last_dca_heartbeat = time.time()
 
 def sign_bingx(params):
     if not params:
@@ -42,199 +43,113 @@ def sign_bingx(params):
         query_string = urllib.parse.urlencode(items)
     return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
-# ---------------- API HELPERS ----------------
-
 def api_request(method, endpoint, params=None):
     url = f"{BINGX_BASE}{endpoint}"
     headers = {"X-BX-APIKEY": API_KEY}
     params = {} if params is None else dict(params)
-
-    # separate connect/read timeout: (5s connect, 10s read)
     timeout = (5, 10)
 
     if method == "GET":
         try:
             params_for_sign = dict(params)
             signature = sign_bingx(params_for_sign)
-            params_with_sig = dict(params_for_sign)
-            params_with_sig["signature"] = signature
-            query = urllib.parse.urlencode(params_with_sig)
-            signed_url = f"{url}?{query}" if query else url
-
-            response = requests.get(signed_url, headers=headers, timeout=timeout)
+            params_for_sign["signature"] = signature
+            query = urllib.parse.urlencode(params_for_sign)
+            response = requests.get(f"{url}?{query}", headers=headers, timeout=timeout)
             response.raise_for_status()
             return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"[API ERROR] GET {url} → {e}")
-            try:
-                print("[BODY]", response.text)
-            except Exception:
-                pass
+        except Exception as e:
+            print("[API ERROR GET]", e)
             return None
 
-    elif method == "POST":
+    if method == "POST":
         try:
             params_for_sign = dict(params)
             if "timestamp" not in params_for_sign:
                 params_for_sign["timestamp"] = str(int(time.time() * 1000))
-
-            query = urllib.parse.urlencode(
-                sorted((k, "" if v is None else str(v)) for k, v in params_for_sign.items())
-            )
+            query = urllib.parse.urlencode(sorted((k, str(v)) for k, v in params_for_sign.items()))
             signature = sign_bingx(params_for_sign)
-            signed_url = f"{url}?{query}&signature={signature}" if query else f"{url}?signature={signature}"
-
-            response = requests.post(signed_url, headers=headers, timeout=timeout)
+            response = requests.post(f"{url}?{query}&signature={signature}", headers=headers, timeout=timeout)
             response.raise_for_status()
             return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"[API ERROR] POST {url} → {e}")
-            try:
-                print("[BODY]", response.text)
-            except Exception:
-                pass
+        except Exception as e:
+            print("[API ERROR POST]", e)
             return None
-    else:
-        raise ValueError("Unsupported HTTP method")
 
 def get_price(symbol):
-    r = api_request("GET", "/openApi/swap/v2/quote/price", params={"symbol": symbol})
-    if r and "data" in r and "price" in r["data"]:
-        try:
-            return float(r["data"]["price"])
-        except Exception:
-            return None
-    return None
+    r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
+    try:
+        return float(r["data"]["price"])
+    except:
+        return None
 
 def get_positions():
     ts = str(int(time.time() * 1000))
-    params = {"timestamp": ts}
-    r = api_request("GET", "/openApi/swap/v2/user/positions", params=params)
-    if r and "data" in r:
-        return r.get("data", [])
-    return []
+    r = api_request("GET", "/openApi/swap/v2/user/positions", {"timestamp": ts})
+    return r.get("data", []) if r else []
 
 def symbol_exists(symbol):
-    r = api_request("GET", "/openApi/swap/v2/quote/price", params={"symbol": symbol})
-    return r is not None and "data" in r and "price" in r["data"]
-
-# ---------------- Leverage ----------------
+    r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
+    return r and "data" in r and "price" in r["data"]
 
 def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     ts = str(int(time.time() * 1000))
-    params = {
-        "symbol": symbol,
-        "leverage": str(leverage),
-        "timestamp": ts
-    }
-    if position_side:
-        params["positionSide"] = position_side
-    if side:
-        params["side"] = side
-
-    r = api_request("POST", "/openApi/swap/v2/trade/leverage", params=params)
-    if r:
-        print("[DEBUG] Set Leverage Response:", json.dumps(r))
-        return True
-    else:
-        print("[ERROR] Failed to set leverage for", symbol)
-        return False
-
-# ---------------- TP SL ----------------
+    params = {"symbol": symbol, "leverage": str(leverage), "timestamp": ts}
+    if position_side: params["positionSide"] = position_side
+    if side: params["side"] = side
+    r = api_request("POST", "/openApi/swap/v2/trade/leverage", params)
+    return bool(r)
 
 def reset_tp_sl(symbol, position_side=None):
     ts = str(int(time.time() * 1000))
-    params = {"symbol": symbol, "timestamp": ts}
-    r = api_request("GET", "/openApi/swap/v2/trade/openOrders", params=params)
+    r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "timestamp": ts})
     orders = r.get("data", {}).get("orders", []) if r else []
 
     for order in orders:
-        order_pos_side = (
-            order.get("positionSide")
-            or order.get("position_side")
-            or order.get("position")
-        )
-        if position_side and order_pos_side and order_pos_side != position_side:
+        pos_side = order.get("positionSide") or order.get("position")
+        if position_side and pos_side != position_side:
             continue
-
-        oid = order.get("orderId") or order.get("order_id")
+        oid = order.get("orderId")
         if not oid:
             continue
-        ts2 = str(int(time.time() * 1000))
-        params2 = {"orderId": oid, "symbol": symbol, "timestamp": ts2}
-        r2 = api_request("POST", "/openApi/swap/v2/trade/cancelOrder", params=params2)
-        if r2:
-            print("[DEBUG] Cancel TP/SL:", json.dumps(r2))
+        api_request("POST", "/openApi/swap/v2/trade/cancelOrder",
+                    {"orderId": oid, "symbol": symbol, "timestamp": str(int(time.time() * 1000))})
 
-def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT, max_retries=8):
+def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT):
     pos = None
-    retries = 0
-    while retries < max_retries:
+    for _ in range(8):
         positions = get_positions()
-        if desired_side:
-            pos = next(
-                (
-                    p
-                    for p in positions
+        pos = next((p for p in positions
                     if p["symbol"] == symbol
-                    and p.get("positionSide") == desired_side
                     and float(p.get("positionAmt", 0)) != 0
-                ),
-                None
-            )
-        else:
-            pos = next(
-                (
-                    p
-                    for p in positions
-                    if p["symbol"] == symbol and float(p.get("positionAmt", 0)) != 0
-                ),
-                None
-            )
+                    and (desired_side is None or p.get("positionSide") == desired_side)), None)
         if pos:
             break
-        print(
-            f"[DEBUG] Position ({desired_side}) noch nicht sichtbar, "
-            f"warte 1s... Versuch {retries + 1}/{max_retries}"
-        )
         time.sleep(1)
-        retries += 1
 
     if not pos:
-        print(f"[ERROR] Konnte Position {symbol} {desired_side} nicht finden.")
+        print("[ERROR] Position nicht gefunden für TP/SL")
         return
 
-    side = pos.get("positionSide", "LONG")
-    entry = float(pos.get("avgPrice", 0))
+    side = pos["positionSide"]
+    entry = float(pos["avgPrice"])
 
-    # Warte bis BingX avgPrice aktualisiert hat
-    old_entry = entry
+    # avgPrice-Update abwarten
     for _ in range(10):
         time.sleep(0.8)
-        new_positions = get_positions()
-        new_pos = next(
-            (p for p in new_positions if p["symbol"] == symbol and p.get("positionSide") == side),
-            None
-        )
-        if not new_pos:
-            continue
-        new_entry = float(new_pos.get("avgPrice", 0))
-        if abs(new_entry - old_entry) > 0.0001:
-            old_entry = new_entry
+        new_pos = next((p for p in get_positions()
+                        if p["symbol"] == symbol and p.get("positionSide") == side), None)
+        if new_pos and abs(float(new_pos["avgPrice"]) - entry) > 0.0001:
+            entry = float(new_pos["avgPrice"])
             break
-
-    entry = old_entry
 
     tp = entry * (1 + tp_percent / 100) if side == "LONG" else entry * (1 - tp_percent / 100)
     sl = entry * (1 - sl_percent / 100) if side == "LONG" else entry * (1 + sl_percent / 100)
 
-    print(f"[DEBUG] Setting TP/SL for {symbol} {side}: entry={entry}, TP={tp:.6f}, SL={sl:.6f}")
-
-    reset_tp_sl(symbol, position_side=side)
+    reset_tp_sl(symbol, side)
 
     def place(price, otype):
-        ts = str(int(time.time() * 1000))
-        params = {
+        api_request("POST", "/openApi/swap/v2/trade/order", {
             "symbol": symbol,
             "side": "SELL" if side == "LONG" else "BUY",
             "positionSide": side,
@@ -242,31 +157,26 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
             "stopPrice": f"{price:.6f}",
             "workingType": "MARK_PRICE",
             "closePosition": "true",
-            "timestamp": ts
-        }
-        r = api_request("POST", "/openApi/swap/v2/trade/order", params=params)
-        if r:
-            print(f"[DEBUG] {otype} Response:", json.dumps(r))
-        else:
-            print(f"[ERROR] Failed to place {otype} order.")
+            "timestamp": str(int(time.time() * 1000))
+        })
 
     place(tp, "TAKE_PROFIT_MARKET")
     place(sl, "STOP_MARKET")
 
-# ---------------- DCA ----------------
-
 def monitor_dca():
+    global last_dca_heartbeat
     while True:
+        last_dca_heartbeat = time.time()  # HEARTBEAT
+
         try:
             positions = get_positions()
-
             for pos in positions:
-                symbol = pos.get("symbol")
-                side = pos.get("positionSide")
-                entry = float(pos.get("avgPrice", 0))
-                amt = float(pos.get("positionAmt", 0))
+                symbol = pos["symbol"]
+                side = pos["positionSide"]
+                entry = float(pos["avgPrice"])
+                amt = float(pos["positionAmt"])
 
-                if not symbol or amt == 0 or entry == 0:
+                if amt == 0 or entry == 0:
                     continue
 
                 current = get_price(symbol)
@@ -275,135 +185,75 @@ def monitor_dca():
 
                 with dca_lock:
                     if symbol not in active_dca:
-                        try:
-                            base_trade_value = abs(amt) * entry
-                            if base_trade_value <= 0:
-                                raise ValueError("base_trade_value 0")
-                            active_dca[symbol] = {
-                                "side": side,
-                                "entry": entry,
-                                "executed": 0,
-                                "trade_size": base_trade_value,
-                                "tp_percent": TP_PERCENT,
-                                "sl_percent": SL_PERCENT
-                            }
-                            print(
-                                f"[DEBUG] Initialized DCA for {symbol} from position: "
-                                f"trade_size={base_trade_value}"
-                            )
-                        except Exception:
-                            active_dca[symbol] = {
-                                "side": side,
-                                "entry": entry,
-                                "executed": 0,
-                                "trade_size": TRADE_SIZE,
-                                "tp_percent": TP_PERCENT,
-                                "sl_percent": SL_PERCENT
-                            }
-                            print(
-                                f"[WARN] Could not derive trade_size from position for {symbol}, "
-                                f"using TRADE_SIZE={TRADE_SIZE}"
-                            )
+                        base_value = abs(amt) * entry
+                        active_dca[symbol] = {
+                            "side": side,
+                            "entry": entry,
+                            "executed": 0,
+                            "trade_size": base_value,
+                            "tp_percent": TP_PERCENT,
+                            "sl_percent": SL_PERCENT
+                        }
 
                     d = active_dca[symbol]
-                    executed = d["executed"]
 
-                deviation = abs((current - entry) / entry * 100) if entry != 0 else 0
-                if executed >= DCA_COUNT:
+                deviation = abs((current - entry) / entry * 100)
+                if d["executed"] >= DCA_COUNT:
                     continue
 
-                if deviation >= (executed + 1) * DCA_DEVIATION_PERCENT:
-                    base_qty = d["trade_size"] / entry
-                    qty = base_qty * (DCA_VOLUME_MULTIPLIER ** (executed + 1))
-                    qty_rounded = round(qty, 6)
-                    ts = str(int(time.time() * 1000))
-                    params = {
+                if deviation >= (d["executed"] + 1) * DCA_DEVIATION_PERCENT:
+                    qty = (d["trade_size"] / entry) * (DCA_VOLUME_MULTIPLIER ** (d["executed"] + 1))
+                    qty = round(qty, 6)
+
+                    api_request("POST", "/openApi/swap/v2/trade/order", {
                         "symbol": symbol,
                         "side": "BUY" if side == "LONG" else "SELL",
                         "positionSide": side,
                         "type": "MARKET",
-                        "quantity": str(qty_rounded),
-                        "timestamp": ts
-                    }
-
-                    r = api_request("POST", "/openApi/swap/v2/trade/order", params=params)
-                    if r:
-                        print("[DEBUG] DCA Order:", json.dumps(r))
-                    else:
-                        print("[ERROR] Failed to place DCA order.")
+                        "quantity": str(qty),
+                        "timestamp": str(int(time.time() * 1000))
+                    })
 
                     with dca_lock:
                         d["executed"] += 1
 
-                    reset_tp_sl(symbol, position_side=side)
-                    set_tp_sl(
-                        symbol,
-                        desired_side=side,
-                        tp_percent=d["tp_percent"],
-                        sl_percent=d["sl_percent"]
-                    )
+                    reset_tp_sl(symbol, side)
+                    set_tp_sl(symbol, side, d["tp_percent"], d["sl_percent"])
 
         except Exception as e:
             print("[DCA ERROR]", e)
 
-        time.sleep(10)
-
-# Watchdog für DCA-Thread
-def start_dca_thread():
-    while True:
-        try:
-            print("[DCA] Thread started")
-            monitor_dca()
-        except Exception as e:
-            print("[DCA FATAL] Thread crashed, restarting in 3s:", e)
-            time.sleep(3)
-
-# ---------------- ENTRY ----------------
+        time.sleep(5)  # schnelleres Intervall
 
 def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
-    print(f"[DEBUG] ENTRY START {symbol} {direction} {leverage} {trade_size}")
-
     if not symbol_exists(symbol):
-        print(f"[ERROR] Symbol {symbol} existiert NICHT auf BingX Futures.")
+        print("[ERROR] Symbol existiert nicht:", symbol)
         return
 
     positions = get_positions()
-    if any(
-        p["symbol"] == symbol
-        and p.get("positionSide") == direction
-        and float(p.get("positionAmt", 0)) != 0
-        for p in positions
-    ):
-        print(f"[SKIP] {symbol} {direction} bereits offen.")
+    if any(p["symbol"] == symbol and p.get("positionSide") == direction and float(p["positionAmt"]) != 0 for p in positions):
+        print("[SKIP] Position bereits offen:", symbol, direction)
         return
 
     price = get_price(symbol)
     if not price:
-        print("[ERROR] Kein Preis → Abbruch")
+        print("[ERROR] Kein Preis")
         return
 
-    leverage_side = "BUY" if direction == "LONG" else "SELL"
-    if not set_leverage_for_symbol(symbol, leverage, position_side=direction, side=leverage_side):
-        print("[ERROR] Leverage konnte nicht gesetzt werden. Abbruch.")
+    if not set_leverage_for_symbol(symbol, leverage, direction, "BUY" if direction == "LONG" else "SELL"):
+        print("[ERROR] Leverage Fehler")
         return
 
     qty = round(trade_size / price, 6)
-    side = "BUY" if direction == "LONG" else "SELL"
-    ts = str(int(time.time() * 1000))
-    params = {
+
+    api_request("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
-        "side": side,
+        "side": "BUY" if direction == "LONG" else "SELL",
         "positionSide": direction,
         "type": "MARKET",
         "quantity": str(qty),
-        "timestamp": ts
-    }
-
-    r = api_request("POST", "/openApi/swap/v2/trade/order", params=params)
-
-    if not r:
-        print("[ERROR] Failed to place Entry order.")
-        return
+        "timestamp": str(int(time.time() * 1000))
+    })
 
     with dca_lock:
         active_dca[symbol] = {
@@ -414,26 +264,14 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
             "tp_percent": tp_percent,
             "sl_percent": sl_percent
         }
-        print(f"[DEBUG] active_dca set from execute_trade: {active_dca[symbol]}")
 
     time.sleep(1.5)
-
-    reset_tp_sl(symbol, position_side=direction)
-    set_tp_sl(
-        symbol,
-        desired_side=direction,
-        tp_percent=tp_percent,
-        sl_percent=sl_percent
-    )
-
-    print(f"[ENTRY] {symbol} {direction} ausgeführt.")
-
-# ---------------- WEBHOOK ----------------
+    reset_tp_sl(symbol, direction)
+    set_tp_sl(symbol, direction, tp_percent, sl_percent)
 
 @app.route("/testorder", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
-    print("[DEBUG] Incoming:", data)
 
     currency = str(data.get("currency", "")).upper()
     direction = str(data.get("direction", "")).upper()
@@ -443,7 +281,6 @@ def webhook():
     symbol = f"{currency}-USDT"
     leverage = int(data.get("leverage", LEVERAGE))
     trade_size = float(data.get("trade_size", TRADE_SIZE))
-
     tp_percent = float(data.get("tp_percent", TP_PERCENT))
     sl_percent = float(data.get("sl_percent", SL_PERCENT))
 
@@ -452,51 +289,47 @@ def webhook():
         args=(symbol, direction, leverage, trade_size, tp_percent, sl_percent)
     ).start()
 
-    return jsonify({
-        "status": "processing",
-        "symbol": symbol,
-        "direction": direction,
-        "leverage": leverage,
-        "trade_size": trade_size,
-        "tp_percent": tp_percent,
-        "sl_percent": sl_percent
-    }), 200
+    return jsonify({"status": "processing"}), 200
 
-# ---------------- HEALTH / KEEP-ALIVE ----------------
-
-@app.route("/ping", methods=["GET"])
+@app.route("/ping")
 def ping():
     return "pong", 200
 
 def keep_alive():
-    """
-    Pingt regelmäßig die eigene öffentliche Render-URL,
-    damit der Service nicht einschläft.
-    Setze ENV: SELF_PING_URL=https://flask-webhook-bot-1.onrender.com/ping
-    """
     url = os.getenv("SELF_PING_URL")
     if not url:
-        print("[KEEPALIVE] SELF_PING_URL nicht gesetzt – Keep-Alive deaktiviert.")
+        print("[KEEPALIVE] Kein SELF_PING_URL gesetzt")
         return
-
-    print(f"[KEEPALIVE] Aktiv – ping auf {url}")
     while True:
         try:
-            r = requests.get(url, timeout=5)
-            print(f"[KEEPALIVE] {r.status_code}")
-        except Exception as e:
-            print(f"[KEEPALIVE ERROR] {e}")
-        time.sleep(240)  # alle 4 Minuten
+            requests.get(url, timeout=5)
+        except:
+            pass
+        time.sleep(240)
 
-# ---------------- START ----------------
+def start_dca_thread():
+    while True:
+        try:
+            monitor_dca()
+        except Exception as e:
+            print("[DCA CRASH]", e)
+            time.sleep(3)
+
+def dca_watchdog():
+    global last_dca_heartbeat
+    while True:
+        if time.time() - last_dca_heartbeat > 15:
+            print("[WATCHDOG] DCA Thread hängt → Neustart")
+            threading.Thread(target=start_dca_thread, daemon=True).start()
+            last_dca_heartbeat = time.time()
+        time.sleep(5)
 
 if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
-        print("FEHLER: BINGX_API_KEY oder BINGX_API_SECRET fehlen.")
+        print("FEHLER: API Keys fehlen")
     else:
-        # DCA-Watchdog-Thread
         threading.Thread(target=start_dca_thread, daemon=True).start()
-        # Keep-Alive-Thread
+        threading.Thread(target=dca_watchdog, daemon=True).start()
         threading.Thread(target=keep_alive, daemon=True).start()
 
         app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
