@@ -176,9 +176,8 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     place(sl, "STOP_MARKET")
 
 
-
 # ============================================================
-#   NEUER DCA ENGINE BLOCK (Option A)
+#   DCA ENGINE — STABILE VERSION
 # ============================================================
 
 def update_entry(symbol, side):
@@ -195,11 +194,11 @@ def calculate_dca_qty(base_trade_size, executed, current_price):
     return round((base_trade_size * multiplier) / current_price, 6)
 
 
-def should_trigger_dca(side, current, entry, deviation_percent):
+def should_trigger_dca(side, current, entry_static, deviation_percent):
     if side == "LONG":
-        return current <= entry * (1 - deviation_percent / 100)
+        return current <= entry_static * (1 - deviation_percent / 100)
     else:
-        return current >= entry * (1 + deviation_percent / 100)
+        return current >= entry_static * (1 + deviation_percent / 100)
 
 
 def monitor_dca():
@@ -227,7 +226,8 @@ def monitor_dca():
                         base_value = abs(amt) * float(pos["avgPrice"])
                         active_dca[symbol] = {
                             "side": side,
-                            "entry": float(pos["avgPrice"]),
+                            "entry_static": float(pos["avgPrice"]),
+                            "entry_dynamic": float(pos["avgPrice"]),
                             "executed": 0,
                             "base_trade_size": base_value,
                             "tp_percent": TP_PERCENT,
@@ -239,7 +239,7 @@ def monitor_dca():
                 if d["executed"] >= DCA_COUNT:
                     continue
 
-                if not should_trigger_dca(side, current_price, d["entry"], DCA_DEVIATION_PERCENT):
+                if not should_trigger_dca(side, current_price, d["entry_static"], DCA_DEVIATION_PERCENT):
                     continue
 
                 qty = calculate_dca_qty(
@@ -261,7 +261,7 @@ def monitor_dca():
                     d["executed"] += 1
                     new_entry = update_entry(symbol, side)
                     if new_entry:
-                        d["entry"] = new_entry
+                        d["entry_dynamic"] = new_entry
 
                 reset_tp_sl(symbol, side)
                 set_tp_sl(symbol, side, d["tp_percent"], d["sl_percent"])
@@ -309,7 +309,8 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
     with dca_lock:
         active_dca[symbol] = {
             "side": direction,
-            "entry": price,
+            "entry_static": price,
+            "entry_dynamic": price,
             "executed": 0,
             "base_trade_size": trade_size,
             "tp_percent": tp_percent,
