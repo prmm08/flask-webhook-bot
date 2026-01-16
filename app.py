@@ -104,8 +104,10 @@ def symbol_exists(symbol):
 def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     ts = str(int(time.time() * 1000))
     params = {"symbol": symbol, "leverage": str(leverage), "timestamp": ts}
-    if position_side: params["positionSide"] = position_side
-    if side: params["side"] = side
+    if position_side:
+        params["positionSide"] = position_side
+    if side:
+        params["side"] = side
     r = api_request("POST", "/openApi/swap/v2/trade/leverage", params)
     return bool(r)
 
@@ -273,6 +275,42 @@ def monitor_dca():
 
 
 # ============================================================
+#   TP/SL WATCHER — setzt fehlende TP/SL neu
+# ============================================================
+
+def tp_sl_watcher():
+    while True:
+        try:
+            positions = get_positions()
+
+            for pos in positions:
+                symbol = pos["symbol"]
+                side = pos["positionSide"]
+                amt = float(pos["positionAmt"])
+
+                if amt == 0:
+                    continue
+
+                ts = str(int(time.time() * 1000))
+                r = api_request("GET", "/openApi/swap/v2/trade/openOrders",
+                                {"symbol": symbol, "timestamp": ts})
+                orders = r.get("data", {}).get("orders", []) if r else []
+
+                has_tp = any(o.get("type") == "TAKE_PROFIT_MARKET" and o.get("positionSide") == side for o in orders)
+                has_sl = any(o.get("type") == "STOP_MARKET" and o.get("positionSide") == side for o in orders)
+
+                if not has_tp or not has_sl:
+                    print(f"[TP/SL WATCHER] Setze TP/SL neu für {symbol} ({side})")
+                    reset_tp_sl(symbol, side)
+                    set_tp_sl(symbol, side)
+
+        except Exception as e:
+            print("[TP/SL WATCHER ERROR]", e)
+
+        time.sleep(10)
+
+
+# ============================================================
 #   execute_trade() MIT DCA-INTEGRATION
 # ============================================================
 
@@ -393,5 +431,6 @@ if __name__ == "__main__":
         threading.Thread(target=start_dca_thread, daemon=True).start()
         threading.Thread(target=dca_watchdog, daemon=True).start()
         threading.Thread(target=keep_alive, daemon=True).start()
+        threading.Thread(target=tp_sl_watcher, daemon=True).start()
 
         app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
