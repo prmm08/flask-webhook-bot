@@ -95,7 +95,7 @@ def mark_job_done(job_id):
     conn.close()
 
 # -----------------------
-# BINGX API HELPERS (improved logging)
+# BINGX API HELPERS
 # -----------------------
 def sign_bingx(params):
     items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
@@ -172,7 +172,7 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     return bool(r)
 
 # -----------------------
-# POSITION DETECTION + DUST FILTER
+# POSITION DETECTION
 # -----------------------
 def detect_side(pos):
     raw = pos.get("positionSide")
@@ -184,7 +184,7 @@ def detect_side(pos):
     return raw
 
 # -----------------------
-# TP/SL LOGIC (set returns success)
+# TP/SL LOGIC
 # -----------------------
 def correct_tp_sl_for_leverage(entry, tp_percent, sl_percent, leverage, side):
     tp_corrected = tp_percent / max(1, leverage)
@@ -386,7 +386,6 @@ def orders_have_tp_sl(orders, side, qty, qty_tolerance=0.002):
     has_sl = False
 
     for o in orders:
-        # Normalize fields
         o_side = (o.get("positionSide") or "").upper()
         o_type = (o.get("type") or "").upper()
         o_reduce = str(o.get("reduceOnly", "")).lower() in ("true", "1")
@@ -398,30 +397,26 @@ def orders_have_tp_sl(orders, side, qty, qty_tolerance=0.002):
             o.get("size")
         )
 
-        # Only reduce-only orders count
         if not o_reduce:
             continue
-
-        # Only exact side counts
         if o_side != side:
             continue
 
-        # TP detection
         if o_type in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT"):
-            if qty_matches(o_qty):
+            if o_qty and qty_matches(o_qty):
                 has_tp = True
 
-        # SL detection
         if o_type in ("STOP", "STOP_MARKET", "STOP_LIMIT", "STOP_LOSS"):
-            if qty_matches(o_qty):
+            if o_qty and qty_matches(o_qty):
                 has_sl = True
+
+        if has_tp and has_sl:
+            break
 
     return has_tp, has_sl
 
-
-
 # -----------------------
-# TP/SL WATCHER (robust with backoff)
+# TP/SL WATCHER
 # -----------------------
 def tp_sl_watcher():
     log.info("[TP/SL WATCHER] gestartet")
@@ -450,7 +445,6 @@ def tp_sl_watcher():
                     except Exception as e:
                         log.exception("[TP/SL WATCHER] Fehler beim canceln: %s", e)
 
-                    # Exponential backoff retries
                     max_attempts = 5
                     base_sleep = 1.0
                     success = False
@@ -471,7 +465,7 @@ def tp_sl_watcher():
         time.sleep(10)
 
 # -----------------------
-# EXECUTE TRADE (Webhook only currency + direction)
+# EXECUTE TRADE
 # -----------------------
 def execute_trade(symbol, direction):
     if not symbol_exists(symbol):
@@ -513,7 +507,7 @@ def execute_trade(symbol, direction):
     log.info("[EXECUTE] Trade ausgeführt %s %s qty=%s", symbol, direction, qty)
 
 # -----------------------
-# JOB PROCESSOR (polls sqlite queue)
+# JOB PROCESSOR
 # -----------------------
 def job_processor_loop(poll_interval=2):
     log.info("[WORKER] Job Processor gestartet")
@@ -533,7 +527,7 @@ def job_processor_loop(poll_interval=2):
             time.sleep(poll_interval)
 
 # -----------------------
-# THREAD STARTUP (safe guard)
+# THREAD STARTUP
 # -----------------------
 _threads_started = False
 _threads_lock = threading.Lock()
@@ -549,7 +543,6 @@ def start_background_threads():
         threading.Thread(target=job_processor_loop, daemon=True).start()
         _threads_started = True
 
-# Use before_request with guard for environments where before_first_request isn't available
 @app.before_request
 def _before_request_start_threads():
     init_db()
@@ -558,7 +551,7 @@ def _before_request_start_threads():
 # -----------------------
 # FLASK ENDPOINTS
 # -----------------------
-@app.route("/testorder", methods=["POST"])
+@app.route("/trade", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
@@ -575,7 +568,7 @@ def ping():
     return "pong", 200
 
 # -----------------------
-# ENTRYPOINT (for python app.py)
+# ENTRYPOINT
 # -----------------------
 if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
