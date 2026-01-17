@@ -258,6 +258,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
         "timestamp": str(int(time.time() * 1000))
     }
     r_tp = api_request("POST", "/openApi/swap/v2/trade/order", tp_params)
+    log.info("[TP/SL DEBUG] TP response: %s", r_tp)
     if not r_tp or (isinstance(r_tp, dict) and r_tp.get("code") not in (0, None) and r_tp.get("success") not in (True, None)):
         log.warning("[TP/SL] TAKE_PROFIT_MARKET failed for %s: %s", symbol, r_tp)
         tp_ok = False
@@ -285,6 +286,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
         "timestamp": str(int(time.time() * 1000))
     }
     r_sl = api_request("POST", "/openApi/swap/v2/trade/order", sl_params)
+    log.info("[TP/SL DEBUG] SL response: %s", r_sl)
     if not r_sl or (isinstance(r_sl, dict) and r_sl.get("code") not in (0, None) and r_sl.get("success") not in (True, None)):
         log.warning("[TP/SL] STOP (limit) failed for %s: %s", symbol, r_sl)
         sl_ok = False
