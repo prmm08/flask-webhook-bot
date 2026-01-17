@@ -1,4 +1,4 @@
-#----------------- Working Skript WATCHER TP, SL, DCA Working 17.01.26 19.40 -------------------#
+#----------------- Working Skript WATCHER TP, SL, DCA Working 17.01.26 19.40 (angepasst) -------------------#
 
 import hmac
 import hashlib
@@ -30,7 +30,7 @@ SL_PERCENT = 40
 # --- DCA SETTINGS ---
 DCA_INTERVAL = 5
 DCA_COUNT = 5
-DCA_DEVIATION_PERCENT = 5
+DCA_DEVIATION_PERCENT = 5  # angepasst auf 5% Trigger
 DCA_VOLUME_MULTIPLIER = 2
 
 active_dca = {}
@@ -65,7 +65,10 @@ def api_request(method, endpoint, params=None):
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            print("[API ERROR GET]", e)
+            try:
+                print("[API ERROR GET]", e, "response_text=", response.text)
+            except:
+                print("[API ERROR GET]", e)
             return None
 
     if method == "POST":
@@ -79,7 +82,10 @@ def api_request(method, endpoint, params=None):
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            print("[API ERROR POST]", e)
+            try:
+                print("[API ERROR POST]", e, "response_text=", response.text)
+            except:
+                print("[API ERROR POST]", e)
             return None
 
 
@@ -88,7 +94,8 @@ def get_price(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     try:
         return float(r["data"]["price"])
-    except:
+    except Exception:
+        print(f"[PRICE ERROR] Konnte Preis für {symbol} nicht lesen, response={r}")
         return None
 
 
@@ -100,7 +107,7 @@ def get_positions():
 
 def symbol_exists(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-    return r and "data" in r and "price" in r["data"]
+    return bool(r and "data" in r and "price" in r["data"])
 
 
 def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
@@ -111,6 +118,8 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     if side:
         params["side"] = side
     r = api_request("POST", "/openApi/swap/v2/trade/leverage", params)
+    if not r:
+        print(f"[LEVERAGE ERROR] set_leverage_for_symbol failed for {symbol} resp={r}")
     return bool(r)
 
 
@@ -181,7 +190,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
 
 
 # ============================================================
-#   DCA ENGINE — STABILE VERSION
+#   DCA ENGINE — STABILE VERSION (mit Fixes)
 # ============================================================
 
 def update_entry(symbol, side):
@@ -189,13 +198,18 @@ def update_entry(symbol, side):
     pos = next((p for p in positions
                 if p["symbol"] == symbol and p["positionSide"] == side), None)
     if pos:
-        return float(pos["avgPrice"])
+        try:
+            return float(pos["avgPrice"])
+        except:
+            return None
     return None
 
 
 def calculate_dca_qty(base_trade_size, executed, current_price):
     multiplier = DCA_VOLUME_MULTIPLIER ** (executed + 1)
-    return round((base_trade_size * multiplier) / current_price, 6)
+    qty = (base_trade_size * multiplier) / current_price if current_price and current_price > 0 else 0
+    qty = round(qty, 6)
+    return qty
 
 
 def should_trigger_dca(side, current, entry_static, deviation_percent):
@@ -235,12 +249,20 @@ def monitor_dca():
                             "executed": 0,
                             "base_trade_size": base_value,
                             "tp_percent": TP_PERCENT,
-                            "sl_percent": SL_PERCENT
+                            "sl_percent": SL_PERCENT,
+                            "last_order_ts": 0
                         }
 
                     d = active_dca[symbol]
 
+                # Logging der aktuellen Werte
+                print(f"[DCA] {symbol} side={side} current={current_price} entry_static={d['entry_static']} executed={d['executed']} base_trade_size={d['base_trade_size']}")
+
                 if d["executed"] >= DCA_COUNT:
+                    continue
+
+                # Verhindere zu schnelle Wiederholung: minimaler Abstand zwischen Orders (z.B. 1 Sekunde)
+                if time.time() - d.get("last_order_ts", 0) < 1.0:
                     continue
 
                 if not should_trigger_dca(side, current_price, d["entry_static"], DCA_DEVIATION_PERCENT):
@@ -252,7 +274,13 @@ def monitor_dca():
                     current_price
                 )
 
-                api_request("POST", "/openApi/swap/v2/trade/order", {
+                if qty <= 0:
+                    print(f"[DCA] Berechnete qty ist 0 für {symbol}, überspringe")
+                    continue
+
+                print(f"[DCA] Platziere DCA-Order für {symbol} qty={qty} side={'BUY' if side == 'LONG' else 'SELL'}")
+
+                resp = api_request("POST", "/openApi/swap/v2/trade/order", {
                     "symbol": symbol,
                     "side": "BUY" if side == "LONG" else "SELL",
                     "positionSide": side,
@@ -261,14 +289,27 @@ def monitor_dca():
                     "timestamp": str(int(time.time() * 1000))
                 })
 
+                print("[DCA] order response:", resp)
+
                 with dca_lock:
                     d["executed"] += 1
-                    new_entry = update_entry(symbol, side)
-                    if new_entry:
+                    d["last_order_ts"] = time.time()
+
+                # Kurze Wartezeit, damit avgPrice/Positionen sich aktualisieren können
+                time.sleep(1.5)
+                new_entry = update_entry(symbol, side)
+                if new_entry:
+                    with dca_lock:
                         d["entry_dynamic"] = new_entry
+                        # WICHTIG: Basis anpassen, damit nicht sofort erneut ausgelöst wird
+                        d["entry_static"] = new_entry
+                        print(f"[DCA] entry updated for {symbol} -> entry_static={d['entry_static']} entry_dynamic={d['entry_dynamic']}")
 
                 reset_tp_sl(symbol, side)
                 set_tp_sl(symbol, side, d["tp_percent"], d["sl_percent"])
+
+                # Verhindere weitere Orders für dieses Symbol in derselben Iteration
+                continue
 
         except Exception as e:
             print("[DCA ERROR]", e)
@@ -344,8 +385,11 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
         return
 
     qty = round(trade_size / price, 6)
+    if qty <= 0:
+        print("[ERROR] Berechnete qty ist 0")
+        return
 
-    api_request("POST", "/openApi/swap/v2/trade/order", {
+    resp = api_request("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "side": "BUY" if direction == "LONG" else "SELL",
         "positionSide": direction,
@@ -353,6 +397,7 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
         "quantity": str(qty),
         "timestamp": str(int(time.time() * 1000))
     })
+    print("[EXECUTE TRADE] order response:", resp)
 
     with dca_lock:
         active_dca[symbol] = {
@@ -362,7 +407,8 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
             "executed": 0,
             "base_trade_size": trade_size,
             "tp_percent": tp_percent,
-            "sl_percent": sl_percent
+            "sl_percent": sl_percent,
+            "last_order_ts": time.time()
         }
 
     time.sleep(2)
