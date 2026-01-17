@@ -17,11 +17,10 @@ API_KEY = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
 BINGX_BASE = "https://open-api.bingx.com"
 
-# Defaults (hard-coded as requested)
 LEVERAGE = int(os.getenv("LEVERAGE", 20))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", 20.0))
-TP_PERCENT = float(os.getenv("TP_PERCENT", 2.0))
-SL_PERCENT = float(os.getenv("SL_PERCENT", 40.0))
+TP_PERCENT = float(os.getenv("TP_PERCENT", 1.0))
+SL_PERCENT = float(os.getenv("SL_PERCENT", 20.0))
 
 DCA_DEVIATION_PERCENT = float(os.getenv("DCA_DEVIATION_PERCENT", 5.0))
 DCA_COUNT = int(os.getenv("DCA_COUNT", 5))
@@ -33,10 +32,7 @@ DB_PATH = os.getenv("JOB_DB_PATH", "jobs.db")
 # -----------------------
 # LOGGING
 # -----------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot")
 
 # -----------------------
@@ -231,7 +227,6 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     tp_price, sl_price = correct_tp_sl_for_leverage(entry, tp_percent, sl_percent, leverage, side)
     reset_tp_sl(symbol, side)
 
-    # TAKE PROFIT MARKET (kompensiert)
     api_request("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "side": "SELL" if side == "LONG" else "BUY",
@@ -244,7 +239,6 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
         "timestamp": str(int(time.time() * 1000))
     })
 
-    # STOP-LIMIT (robuster als STOP_MARKET)
     if side == "LONG":
         trigger = sl_price
         limit = trigger * 0.999
@@ -318,7 +312,6 @@ def monitor_dca():
                     d = active_dca[symbol]
                 if d["executed"] >= DCA_COUNT:
                     continue
-                # use dynamic entry for trigger
                 if not should_trigger_dca(side, current_price, d["entry_dynamic"], DCA_DEVIATION_PERCENT):
                     continue
                 qty = calculate_dca_qty(d["base_trade_size"], d["executed"], current_price)
@@ -342,7 +335,51 @@ def monitor_dca():
         time.sleep(DCA_INTERVAL)
 
 # -----------------------
-# TP/SL WATCHER
+# ROBUST ORDER RECOGNITION FOR WATCHER
+# -----------------------
+def orders_have_tp_sl(orders, side, qty, qty_tolerance=0.0005):
+    def qty_matches(o_qty):
+        try:
+            return abs(float(o_qty) - qty) <= max(qty * qty_tolerance, 1e-8)
+        except:
+            return False
+
+    has_tp = False
+    has_sl = False
+
+    for o in orders:
+        o_side = o.get("positionSide") or o.get("position") or o.get("position_side")
+        o_type = (o.get("type") or "").upper()
+        o_reduce = str(o.get("reduceOnly", "")).lower() in ("true", "1", "yes")
+        o_qty = o.get("quantity") or o.get("origQty") or o.get("executedQty") or o.get("qty")
+
+        if not o_reduce:
+            continue
+        if o_side and o_side != side:
+            continue
+
+        if o_type in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT"):
+            if o_qty and qty_matches(o_qty):
+                has_tp = True
+
+        if o_type in ("STOP", "STOP_MARKET", "STOP_LIMIT", "STOP_LOSS"):
+            if o_qty and qty_matches(o_qty):
+                has_sl = True
+
+        if not has_tp and o.get("workingType", "").upper() == "MARK_PRICE" and "TAKE_PROFIT" in o_type:
+            if o_qty and qty_matches(o_qty):
+                has_tp = True
+        if not has_sl and o.get("workingType", "").upper() in ("CONTRACT_PRICE", "MARK_PRICE") and "STOP" in o_type:
+            if o_qty and qty_matches(o_qty):
+                has_sl = True
+
+        if has_tp and has_sl:
+            break
+
+    return has_tp, has_sl
+
+# -----------------------
+# TP/SL WATCHER (robust)
 # -----------------------
 def tp_sl_watcher():
     log.info("[TP/SL WATCHER] gestartet")
@@ -354,18 +391,41 @@ def tp_sl_watcher():
                 if not side:
                     continue
                 symbol = pos["symbol"]
-                amt = float(pos["positionAmt"])
-                if abs(amt) < 0.0001:
+                amt = abs(float(pos.get("positionAmt", 0)))
+                if amt < 0.0001:
                     continue
+
                 ts = str(int(time.time() * 1000))
                 r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "timestamp": ts})
                 orders = r.get("data", {}).get("orders", []) if r else []
-                has_tp = any(o.get("type") in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT") and o.get("positionSide") == side for o in orders)
-                has_sl = any(o.get("type") in ("STOP", "STOP_MARKET") and o.get("positionSide") == side for o in orders)
+
+                has_tp, has_sl = orders_have_tp_sl(orders, side, amt)
+
                 if not has_tp or not has_sl:
-                    log.info("[TP/SL WATCHER] Setze TP/SL neu für %s (%s)", symbol, side)
-                    reset_tp_sl(symbol, side)
-                    set_tp_sl(symbol, side, TP_PERCENT, SL_PERCENT)
+                    log.info("[TP/SL WATCHER] TP/SL fehlen für %s (%s) has_tp=%s has_sl=%s", symbol, side, has_tp, has_sl)
+                    try:
+                        reset_tp_sl(symbol, side)
+                    except Exception as e:
+                        log.exception("[TP/SL WATCHER] Fehler beim canceln: %s", e)
+
+                    success = False
+                    for attempt in range(3):
+                        try:
+                            set_tp_sl(symbol, side, TP_PERCENT, SL_PERCENT)
+                            time.sleep(1.2)
+                            ts2 = str(int(time.time() * 1000))
+                            r2 = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "timestamp": ts2})
+                            orders2 = r2.get("data", {}).get("orders", []) if r2 else []
+                            has_tp2, has_sl2 = orders_have_tp_sl(orders2, side, amt)
+                            if has_tp2 and has_sl2:
+                                success = True
+                                break
+                        except Exception as e:
+                            log.exception("[TP/SL WATCHER] Fehler beim Setzen TP/SL Versuch %s: %s", attempt+1, e)
+                        time.sleep(0.8)
+                    if not success:
+                        log.warning("[TP/SL WATCHER] Konnte TP/SL nicht zuverlässig setzen für %s (%s)", symbol, side)
+
         except Exception as e:
             log.exception("[TP/SL WATCHER ERROR] %s", e)
         time.sleep(10)
@@ -433,7 +493,7 @@ def job_processor_loop(poll_interval=2):
             time.sleep(poll_interval)
 
 # -----------------------
-# THREAD STARTUP (safe for Gunicorn single-worker)
+# THREAD STARTUP (safe guard)
 # -----------------------
 _threads_started = False
 _threads_lock = threading.Lock()
@@ -449,13 +509,11 @@ def start_background_threads():
         threading.Thread(target=job_processor_loop, daemon=True).start()
         _threads_started = True
 
-# Start threads when the first request arrives (works with Gunicorn single worker)
+# Use before_request with guard for environments where before_first_request isn't available
 @app.before_request
 def _before_request_start_threads():
-    # init_db kann idempotent sein, also sicher hier aufzurufen
     init_db()
     start_background_threads()
-
 
 # -----------------------
 # FLASK ENDPOINTS
@@ -483,6 +541,5 @@ if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
         log.error("FEHLER: API Keys fehlen (BINGX_API_KEY / BINGX_API_SECRET)")
     init_db()
-    # start threads immediately when running with python app.py
     start_background_threads()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
