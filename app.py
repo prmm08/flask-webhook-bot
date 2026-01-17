@@ -236,90 +236,56 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
                 break
         if pos:
             break
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     if not pos:
         log.info("[TP/SL] Position nicht gefunden für %s", symbol)
         return False
 
     side = detect_side(pos)
-    if not side:
-        return False
-
     entry = float(pos["avgPrice"])
-    qty = abs(float(pos["positionAmt"]))
-    leverage = int(pos.get("leverage", LEVERAGE))
 
     # -----------------------
-    # 2. TP/SL Preise berechnen
-    # -----------------------
-    tp_price, sl_price = correct_tp_sl_for_leverage(
-        entry, tp_percent, sl_percent, leverage, side
-    )
-
-    # -----------------------
-    # 3. Alte TP/SL Orders löschen
-    # -----------------------
-    try:
-        reset_tp_sl(symbol, side)
-    except Exception as e:
-        log.exception("[TP/SL] Fehler beim Cancel vor Set: %s", e)
-
-    # -----------------------
-    # 4. TAKE PROFIT MARKET Order
-    # -----------------------
-    tp_params = {
-        "symbol": symbol,
-        "side": "SELL" if side == "LONG" else "BUY",
-        "positionSide": side,
-        "type": "TAKE_PROFIT_MARKET",
-        "stopPrice": f"{tp_price:.6f}",
-        "quantity": f"{qty:.6f}",
-        "workingType": "MARK_PRICE",
-        "timestamp": str(int(time.time() * 1000))
-    }
-
-    r_tp = api_request("POST", "/openApi/swap/v2/trade/order", tp_params)
-    log.info("[TP/SL DEBUG] TP response: %s", r_tp)
-
-    tp_ok = bool(r_tp and r_tp.get("code") in (0, None))
-
-    # -----------------------
-    # 5. STOP Order (Trigger + Limit)
+    # 2. TP/SL Preise berechnen (direkt auf Entry)
     # -----------------------
     if side == "LONG":
-        trigger = sl_price
-        limit = trigger * 0.999
+        tp_price = entry * (1 + tp_percent / 100.0)
+        sl_price = entry * (1 - sl_percent / 100.0)
     else:
-        trigger = sl_price
-        limit = trigger * 1.001
+        tp_price = entry * (1 - tp_percent / 100.0)
+        sl_price = entry * (1 + sl_percent / 100.0)
 
-    sl_params = {
+    # -----------------------
+    # 3. SL auf richtige Seite des aktuellen Preises ziehen
+    # -----------------------
+    current = get_price(symbol)
+    if current:
+        if side == "LONG" and sl_price >= current:
+            sl_price = current * 0.99
+        if side == "SHORT" and sl_price <= current:
+            sl_price = current * 1.01
+
+    # -----------------------
+    # 4. Positions‑TP/SL setzen
+    # -----------------------
+    params = {
         "symbol": symbol,
-        "side": "SELL" if side == "LONG" else "BUY",
         "positionSide": side,
-        "type": "STOP",
-        "stopPrice": f"{trigger:.6f}",
-        "price": f"{limit:.6f}",
-        "quantity": f"{qty:.6f}",
-        "workingType": "CONTRACT_PRICE",
+        "takeProfit": f"{tp_price:.6f}",
+        "stopLoss": f"{sl_price:.6f}",
         "timestamp": str(int(time.time() * 1000))
     }
 
-    r_sl = api_request("POST", "/openApi/swap/v2/trade/order", sl_params)
-    log.info("[TP/SL DEBUG] SL response: %s", r_sl)
+    r = api_request("POST", "/openApi/swap/v2/trade/setPositionTpSl", params)
+    log.info("[TP/SL DEBUG] Position TP/SL response: %s", r)
 
-    sl_ok = bool(r_sl and r_sl.get("code") in (0, None))
+    ok = bool(r and r.get("code") in (0, None))
 
-    # -----------------------
-    # 6. Ergebnis loggen
-    # -----------------------
-    log.info(
-        "[TP/SL] Set result for %s side=%s tp_ok=%s sl_ok=%s",
-        symbol, side, tp_ok, sl_ok
-    )
+    log.info("[TP/SL] Position-TP/SL gesetzt für %s (%s) tp=%.6f sl=%.6f ok=%s",
+             symbol, side, tp_price, sl_price, ok)
 
-    return tp_ok and sl_ok
+    return ok
+
 
 # -----------------------
 # DCA / SECURITY ORDERS
