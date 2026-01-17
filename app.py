@@ -50,7 +50,7 @@ dca_lock = threading.Lock()
 last_dca_heartbeat = time.time()
 
 # --- RSI / WATCHLIST SETTINGS ---
-WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "APRUSDT,CUSDT,COLLECTUSDT,DUSKUSDT,GRIFFAINUSDT,MEUSDT,PIPPINUSDT,SANDUSDT,USELESSUSDT,XPLUSDT").split(",") if s.strip()]
+WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "APR-USDT,C-USDT,COLLECT-USDT,DUSK-USDT,GRIFFAIN-USDT,ME-USDT,PIPPIN-USDT,SAND-USDT,USELESS-USDT,XPL-USDT").split(",") if s.strip()]
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", 14))
 RSI_INTERVAL = os.getenv("RSI_INTERVAL", "1m")   # Kline-Intervall
 RSI_CHECK_INTERVAL = int(os.getenv("RSI_CHECK_INTERVAL", 60))  # Sekunden
@@ -86,7 +86,7 @@ def api_request(method, endpoint, params=None):
             full_url = f"{url}?{query}"
             logger.debug("API GET url=%s", full_url)
             response = requests.get(full_url, headers=headers, timeout=timeout)
-            logger.debug("API GET status=%s url=%s", response.status_code, full_url)
+            logger.debug("HTTP GET %s -> status=%s body=%s", full_url, response.status_code, response.text[:4000])
             response.raise_for_status()
             j = response.json()
             logger.debug("API GET response keys=%s", list(j.keys()) if isinstance(j, dict) else type(j))
@@ -105,7 +105,7 @@ def api_request(method, endpoint, params=None):
             full_url = f"{url}?{query}&signature={signature}"
             logger.debug("API POST url=%s", full_url)
             response = requests.post(full_url, headers=headers, timeout=timeout)
-            logger.debug("API POST status=%s url=%s", response.status_code, full_url)
+            logger.debug("HTTP POST %s -> status=%s body=%s", full_url, response.status_code, response.text[:4000])
             response.raise_for_status()
             j = response.json()
             logger.debug("API POST response keys=%s", list(j.keys()) if isinstance(j, dict) else type(j))
@@ -406,17 +406,28 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
 # ============================================================
 #   KLINES / RSI BERECHNUNG UND MONITOR
 # ============================================================
-def get_klines(symbol, interval="1m", limit=100):
+def get_klines_raw(symbol, interval="1m", limit=100):
+    """
+    Rohfunktion, die genau einen API-Aufruf macht und die Parsing-Logik ausführt.
+    Diese Funktion gibt entweder eine Liste von Close-Preisen oder None zurück.
+    """
     params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
     r = api_request("GET", "/openApi/swap/v2/quote/kline", params)
+    logger.debug("get_klines raw response for %s: %s", symbol, json.dumps(r, default=str)[:4000])
     if not r:
         logger.warning("get_klines no response for %s", symbol)
         return None
+    # Log code/msg falls vorhanden
+    try:
+        logger.debug("get_klines response code=%s msg=%s", r.get("code"), r.get("msg"))
+    except Exception:
+        pass
+
     data = r.get("data")
     if not data:
         logger.warning("get_klines empty data for %s", symbol)
         return None
-    logger.debug("get_klines raw data type=%s", type(data))
+    logger.debug("get_klines data field for %s: %s", symbol, type(data))
 
     closes = None
     # Mögliche Formate abfangen
@@ -451,6 +462,47 @@ def get_klines(symbol, interval="1m", limit=100):
         logger.warning("get_klines could not parse closes for %s", symbol)
     return closes
 
+def get_klines_with_fallback(symbol, interval="1m", limit=100):
+    """
+    Versucht mehrere Symbol-Varianten, falls die Standard-Variante keine Daten liefert.
+    """
+    tried = []
+    def try_symbol(s):
+        tried.append(s)
+        logger.debug("get_klines try %s", s)
+        closes = get_klines_raw(s, interval, limit)
+        if closes:
+            logger.info("get_klines fallback success for %s (tried: %s)", s, tried)
+            return closes
+        return None
+
+    # 1) original
+    res = try_symbol(symbol)
+    if res:
+        return res
+
+    # 2) ohne Bindestrich
+    if "-" in symbol:
+        res = try_symbol(symbol.replace("-", ""))
+        if res:
+            return res
+
+    # 3) mit Slash
+    if "-" in symbol:
+        res = try_symbol(symbol.replace("-", "/"))
+        if res:
+            return res
+
+    # 4) Symbol + USDT (zusammengefügt)
+    base = symbol.replace("-", "").replace("/", "")
+    if not base.endswith("USDT"):
+        res = try_symbol(base + "USDT")
+        if res:
+            return res
+
+    logger.warning("get_klines_with_fallback: keine Variante lieferte Kerzen für %s (tried: %s)", symbol, tried)
+    return None
+
 def compute_rsi(closes, period=RSI_PERIOD):
     if not closes or len(closes) < period + 1:
         logger.debug("compute_rsi not enough closes len=%s period=%s", len(closes) if closes else 0, period)
@@ -477,7 +529,7 @@ def compute_rsi(closes, period=RSI_PERIOD):
     return rsi
 
 def get_latest_two_rsi(symbol, interval=RSI_INTERVAL, period=RSI_PERIOD):
-    closes = get_klines(symbol, interval=interval, limit=period + 5)
+    closes = get_klines_with_fallback(symbol, interval=interval, limit=period + 5)
     if not closes or len(closes) < period + 2:
         logger.debug("get_latest_two_rsi not enough closes for %s len=%s", symbol, len(closes) if closes else 0)
         return None, None
@@ -552,6 +604,24 @@ def rsi_monitor_loop():
             logger.error("RSI MONITOR ERROR %s", e, exc_info=True)
         time.sleep(RSI_CHECK_INTERVAL)
 
+# --- DEBUG: Symbol-Variantentest ---
+def debug_test_symbol_variants(symbol_base):
+    variants = [
+        symbol_base,
+        symbol_base.replace("-", ""),
+        symbol_base.replace("-", "/"),
+        (symbol_base.split("-")[0] + "USDT") if "-" in symbol_base else (symbol_base + "USDT"),
+        (symbol_base.replace("USDT", "-USDT") if "USDT" in symbol_base and "-" not in symbol_base else None)
+    ]
+    seen = set()
+    for v in variants:
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        logger.info("DEBUG TEST trying variant: %s", v)
+        closes = get_klines_with_fallback(v, interval="1m", limit=20)
+        logger.info("DEBUG TEST %s -> closes_count=%s", v, len(closes) if closes else None)
+
 # --- KEEPALIVE (optional) ---
 def keep_alive():
     url = os.getenv("SELF_PING_URL")
@@ -594,6 +664,13 @@ if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
         logger.error("FEHLER: API Keys fehlen")
     else:
+        # Optional: beim Start kurz Symbol-Varianten testen (deaktiviere in Produktion)
+        try:
+            for s in WATCHLIST:
+                debug_test_symbol_variants(s)
+        except Exception:
+            logger.debug("debug_test_symbol_variants failed", exc_info=True)
+
         # Threads starten (daemon)
         threading.Thread(target=start_dca_thread, daemon=True).start()
         threading.Thread(target=dca_watchdog, daemon=True).start()
