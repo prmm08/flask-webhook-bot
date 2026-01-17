@@ -95,7 +95,7 @@ def mark_job_done(job_id):
     conn.close()
 
 # -----------------------
-# BINGX API HELPERS
+# BINGX API HELPERS (improved logging)
 # -----------------------
 def sign_bingx(params):
     items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
@@ -116,7 +116,11 @@ def api_request(method, endpoint, params=None):
             params_for_sign["signature"] = signature
             query = urllib.parse.urlencode(params_for_sign)
             r = requests.get(f"{url}?{query}", headers=headers, timeout=timeout)
-            r.raise_for_status()
+            try:
+                r.raise_for_status()
+            except Exception:
+                log.warning("[API] GET %s returned %s: %s", endpoint, r.status_code, r.text)
+                r.raise_for_status()
             return r.json()
         if method == "POST":
             params_for_sign = dict(params)
@@ -125,10 +129,17 @@ def api_request(method, endpoint, params=None):
             signature = sign_bingx(params_for_sign)
             query = urllib.parse.urlencode(sorted((k, str(v)) for k, v in params_for_sign.items()))
             r = requests.post(f"{url}?{query}&signature={signature}", headers=headers, timeout=timeout)
-            r.raise_for_status()
+            try:
+                r.raise_for_status()
+            except Exception:
+                log.warning("[API] POST %s returned %s: %s", endpoint, r.status_code, r.text)
+                r.raise_for_status()
             return r.json()
+    except requests.exceptions.HTTPError as he:
+        log.exception("[API ERROR HTTP] %s %s %s", method, endpoint, he)
+        return None
     except Exception as e:
-        log.error("[API ERROR] %s %s %s", method, endpoint, e)
+        log.exception("[API ERROR] %s %s %s", method, endpoint, e)
         return None
 
 # -----------------------
@@ -173,7 +184,7 @@ def detect_side(pos):
     return raw
 
 # -----------------------
-# TP/SL LOGIC
+# TP/SL LOGIC (set returns success)
 # -----------------------
 def correct_tp_sl_for_leverage(entry, tp_percent, sl_percent, leverage, side):
     tp_corrected = tp_percent / max(1, leverage)
@@ -217,17 +228,25 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
         time.sleep(0.5)
     if not pos:
         log.info("[TP/SL] Position nicht gefunden für %s", symbol)
-        return
+        return False
+
     side = detect_side(pos)
     if not side:
-        return
+        return False
+
     entry = float(pos["avgPrice"])
     qty = abs(float(pos["positionAmt"]))
     leverage = int(pos.get("leverage", LEVERAGE))
     tp_price, sl_price = correct_tp_sl_for_leverage(entry, tp_percent, sl_percent, leverage, side)
-    reset_tp_sl(symbol, side)
 
-    api_request("POST", "/openApi/swap/v2/trade/order", {
+    # cancel existing reduceOnly orders for this side
+    try:
+        reset_tp_sl(symbol, side)
+    except Exception as e:
+        log.exception("[TP/SL] Fehler beim Cancel vor Set: %s", e)
+
+    # TAKE PROFIT MARKET
+    tp_params = {
         "symbol": symbol,
         "side": "SELL" if side == "LONG" else "BUY",
         "positionSide": side,
@@ -237,8 +256,15 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
         "reduceOnly": "true",
         "workingType": "MARK_PRICE",
         "timestamp": str(int(time.time() * 1000))
-    })
+    }
+    r_tp = api_request("POST", "/openApi/swap/v2/trade/order", tp_params)
+    if not r_tp or (isinstance(r_tp, dict) and r_tp.get("code") not in (0, None) and r_tp.get("success") not in (True, None)):
+        log.warning("[TP/SL] TAKE_PROFIT_MARKET failed for %s: %s", symbol, r_tp)
+        tp_ok = False
+    else:
+        tp_ok = True
 
+    # STOP-LIMIT
     if side == "LONG":
         trigger = sl_price
         limit = trigger * 0.999
@@ -246,7 +272,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
         trigger = sl_price
         limit = trigger * 1.001
 
-    api_request("POST", "/openApi/swap/v2/trade/order", {
+    sl_params = {
         "symbol": symbol,
         "side": "SELL" if side == "LONG" else "BUY",
         "positionSide": side,
@@ -257,7 +283,16 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
         "reduceOnly": "true",
         "workingType": "CONTRACT_PRICE",
         "timestamp": str(int(time.time() * 1000))
-    })
+    }
+    r_sl = api_request("POST", "/openApi/swap/v2/trade/order", sl_params)
+    if not r_sl or (isinstance(r_sl, dict) and r_sl.get("code") not in (0, None) and r_sl.get("success") not in (True, None)):
+        log.warning("[TP/SL] STOP (limit) failed for %s: %s", symbol, r_sl)
+        sl_ok = False
+    else:
+        sl_ok = True
+
+    log.info("[TP/SL] Set result for %s side=%s tp_ok=%s sl_ok=%s", symbol, side, tp_ok, sl_ok)
+    return tp_ok and sl_ok
 
 # -----------------------
 # DCA / SECURITY ORDERS
@@ -337,7 +372,7 @@ def monitor_dca():
 # -----------------------
 # ROBUST ORDER RECOGNITION FOR WATCHER
 # -----------------------
-def orders_have_tp_sl(orders, side, qty, qty_tolerance=0.0005):
+def orders_have_tp_sl(orders, side, qty, qty_tolerance=0.002):
     def qty_matches(o_qty):
         try:
             return abs(float(o_qty) - qty) <= max(qty * qty_tolerance, 1e-8)
@@ -351,7 +386,7 @@ def orders_have_tp_sl(orders, side, qty, qty_tolerance=0.0005):
         o_side = o.get("positionSide") or o.get("position") or o.get("position_side")
         o_type = (o.get("type") or "").upper()
         o_reduce = str(o.get("reduceOnly", "")).lower() in ("true", "1", "yes")
-        o_qty = o.get("quantity") or o.get("origQty") or o.get("executedQty") or o.get("qty")
+        o_qty = o.get("quantity") or o.get("origQty") or o.get("executedQty") or o.get("qty") or o.get("size")
 
         if not o_reduce:
             continue
@@ -366,10 +401,10 @@ def orders_have_tp_sl(orders, side, qty, qty_tolerance=0.0005):
             if o_qty and qty_matches(o_qty):
                 has_sl = True
 
-        if not has_tp and o.get("workingType", "").upper() == "MARK_PRICE" and "TAKE_PROFIT" in o_type:
+        if not has_tp and "TAKE_PROFIT" in o_type:
             if o_qty and qty_matches(o_qty):
                 has_tp = True
-        if not has_sl and o.get("workingType", "").upper() in ("CONTRACT_PRICE", "MARK_PRICE") and "STOP" in o_type:
+        if not has_sl and "STOP" in o_type:
             if o_qty and qty_matches(o_qty):
                 has_sl = True
 
@@ -379,7 +414,7 @@ def orders_have_tp_sl(orders, side, qty, qty_tolerance=0.0005):
     return has_tp, has_sl
 
 # -----------------------
-# TP/SL WATCHER (robust)
+# TP/SL WATCHER (robust with backoff)
 # -----------------------
 def tp_sl_watcher():
     log.info("[TP/SL WATCHER] gestartet")
@@ -408,24 +443,22 @@ def tp_sl_watcher():
                     except Exception as e:
                         log.exception("[TP/SL WATCHER] Fehler beim canceln: %s", e)
 
+                    # Exponential backoff retries
+                    max_attempts = 5
+                    base_sleep = 1.0
                     success = False
-                    for attempt in range(3):
-                        try:
-                            set_tp_sl(symbol, side, TP_PERCENT, SL_PERCENT)
-                            time.sleep(1.2)
-                            ts2 = str(int(time.time() * 1000))
-                            r2 = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "timestamp": ts2})
-                            orders2 = r2.get("data", {}).get("orders", []) if r2 else []
-                            has_tp2, has_sl2 = orders_have_tp_sl(orders2, side, amt)
-                            if has_tp2 and has_sl2:
-                                success = True
-                                break
-                        except Exception as e:
-                            log.exception("[TP/SL WATCHER] Fehler beim Setzen TP/SL Versuch %s: %s", attempt+1, e)
-                        time.sleep(0.8)
+                    for attempt in range(1, max_attempts + 1):
+                        ok = set_tp_sl(symbol, side, TP_PERCENT, SL_PERCENT)
+                        if ok:
+                            success = True
+                            log.info("[TP/SL WATCHER] TP/SL erfolgreich gesetzt für %s (%s) nach %s Versuchen", symbol, side, attempt)
+                            break
+                        else:
+                            sleep_time = base_sleep * (2 ** (attempt - 1))
+                            log.warning("[TP/SL WATCHER] Versuch %s für %s fehlgeschlagen, warte %.1fs und retry", attempt, symbol, sleep_time)
+                            time.sleep(sleep_time)
                     if not success:
-                        log.warning("[TP/SL WATCHER] Konnte TP/SL nicht zuverlässig setzen für %s (%s)", symbol, side)
-
+                        log.warning("[TP/SL WATCHER] Konnte TP/SL nicht zuverlässig setzen für %s (%s) nach %s Versuchen", symbol, side, max_attempts)
         except Exception as e:
             log.exception("[TP/SL WATCHER ERROR] %s", e)
         time.sleep(10)
