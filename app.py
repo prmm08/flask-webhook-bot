@@ -135,7 +135,25 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     return bool(r)
     
 # ============================================================
-#   TP/SL HANDLING (LIMIT + reduceOnly, leverage-unabhängig)
+#   TP/SL KORREKTUR (Option A — kompensiert BingX-Leverage)
+# ============================================================
+
+def correct_tp_sl_for_leverage(entry, tp_percent, sl_percent, leverage, side):
+    tp_corrected = tp_percent / leverage
+    sl_corrected = sl_percent / leverage
+
+    if side == "LONG":
+        tp_price = entry * (1 + tp_corrected / 100)
+        sl_price = entry * (1 - sl_corrected / 100)
+    else:
+        tp_price = entry * (1 - tp_corrected / 100)
+        sl_price = entry * (1 + sl_corrected / 100)
+
+    return tp_price, sl_price
+
+
+# ============================================================
+#   TP/SL HANDLING (MARKET + kompensiert)
 # ============================================================
 
 def reset_tp_sl(symbol, position_side=None):
@@ -161,7 +179,6 @@ def reset_tp_sl(symbol, position_side=None):
 
 
 def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT):
-    # Position suchen
     pos = None
     for _ in range(8):
         positions = get_positions()
@@ -183,54 +200,38 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     side = pos["positionSide"]
     entry = float(pos["avgPrice"])
     qty = abs(float(pos["positionAmt"]))
+    leverage = int(pos.get("leverage", 1))
 
-    # Sicherstellen, dass avgPrice nach DCA aktualisiert ist
-    for _ in range(10):
-        time.sleep(0.8)
-        new_pos = next(
-            (p for p in get_positions()
-             if p["symbol"] == symbol and p.get("positionSide") == side),
-            None
-        )
-        if new_pos and abs(float(new_pos["avgPrice"]) - entry) > 0.0001:
-            entry = float(new_pos["avgPrice"])
-            qty = abs(float(new_pos["positionAmt"]))
-            break
-
-    # Absolute TP/SL-Preise (unabhängig vom Leverage)
-    if side == "LONG":
-        tp_price = entry * (1 + tp_percent / 100)
-        sl_price = entry * (1 - sl_percent / 100)
-        tp_side = "SELL"
-        sl_side = "SELL"
-    else:
-        tp_price = entry * (1 - tp_percent / 100)
-        sl_price = entry * (1 + sl_percent / 100)
-        tp_side = "BUY"
-        sl_side = "BUY"
+    # Korrigierte Preise berechnen
+    tp_price, sl_price = correct_tp_sl_for_leverage(
+        entry,
+        tp_percent,
+        sl_percent,
+        leverage,
+        side
+    )
 
     reset_tp_sl(symbol, side)
 
-    def place(price, otype, order_side):
+    def place(price, otype):
         api_request("POST", "/openApi/swap/v2/trade/order", {
             "symbol": symbol,
-            "side": order_side,           # SELL bei LONG, BUY bei SHORT
+            "side": "SELL" if side == "LONG" else "BUY",
             "positionSide": side,
-            "type": otype,                # TAKE_PROFIT oder STOP
-            "price": f"{price:.6f}",      # LIMIT-Preis
-            "stopPrice": f"{price:.6f}",  # Trigger-Preis
-            "quantity": f"{qty:.6f}",     # Menge der offenen Position
+            "type": otype,                # TAKE_PROFIT_MARKET / STOP_MARKET
+            "stopPrice": f"{price:.6f}",
+            "quantity": f"{qty:.6f}",
             "reduceOnly": "true",
             "workingType": "MARK_PRICE",
             "timestamp": str(int(time.time() * 1000))
         })
 
-    place(tp_price, "TAKE_PROFIT", tp_side)
-    place(sl_price, "STOP",        sl_side)
+    place(tp_price, "TAKE_PROFIT_MARKET")
+    place(sl_price, "STOP_MARKET")
 
 
 # ============================================================
-#   DCA ENGINE — static entry + dynamic avgPrice
+#   DCA ENGINE (unverändert, aber nutzt neue TP/SL)
 # ============================================================
 
 def update_entry(symbol, side):
@@ -278,7 +279,6 @@ def monitor_dca():
                 if not current_price:
                     continue
 
-                # DCA-State initialisieren oder holen
                 with dca_lock:
                     if symbol not in active_dca:
                         base_value = abs(amt) * float(pos["avgPrice"])
@@ -294,22 +294,18 @@ def monitor_dca():
 
                     d = active_dca[symbol]
 
-                # Max DCA erreicht?
                 if d["executed"] >= DCA_COUNT:
                     continue
 
-                # Trigger-Bedingung
                 if not should_trigger_dca(side, current_price, d["entry_static"], DCA_DEVIATION_PERCENT):
                     continue
 
-                # DCA-Menge berechnen
                 qty = calculate_dca_qty(
                     d["base_trade_size"],
                     d["executed"],
                     current_price
                 )
 
-                # DCA-Order
                 api_request("POST", "/openApi/swap/v2/trade/order", {
                     "symbol": symbol,
                     "side": "BUY" if side == "LONG" else "SELL",
@@ -319,14 +315,12 @@ def monitor_dca():
                     "timestamp": str(int(time.time() * 1000))
                 })
 
-                # State aktualisieren
                 with dca_lock:
                     d["executed"] += 1
                     new_entry = update_entry(symbol, side)
                     if new_entry:
                         d["entry_dynamic"] = new_entry
 
-                # TP/SL nach DCA neu setzen (immer 20/80, leverage-unabhängig)
                 reset_tp_sl(symbol, side)
                 set_tp_sl(symbol, side, TP_PERCENT, SL_PERCENT)
 
