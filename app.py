@@ -375,7 +375,8 @@ def monitor_dca():
 def orders_have_tp_sl(orders, side, qty, qty_tolerance=0.002):
     def qty_matches(o_qty):
         try:
-            return abs(float(o_qty) - qty) <= max(qty * qty_tolerance, 1e-8)
+            o_qty = float(o_qty)
+            return abs(o_qty - qty) <= max(qty * qty_tolerance, 1e-8)
         except:
             return False
 
@@ -383,35 +384,39 @@ def orders_have_tp_sl(orders, side, qty, qty_tolerance=0.002):
     has_sl = False
 
     for o in orders:
-        o_side = o.get("positionSide") or o.get("position") or o.get("position_side")
+        # Normalize fields
+        o_side = (o.get("positionSide") or "").upper()
         o_type = (o.get("type") or "").upper()
-        o_reduce = str(o.get("reduceOnly", "")).lower() in ("true", "1", "yes")
-        o_qty = o.get("quantity") or o.get("origQty") or o.get("executedQty") or o.get("qty") or o.get("size")
+        o_reduce = str(o.get("reduceOnly", "")).lower() in ("true", "1")
+        o_qty = (
+            o.get("quantity") or
+            o.get("origQty") or
+            o.get("executedQty") or
+            o.get("qty") or
+            o.get("size")
+        )
 
+        # Only reduce-only orders count
         if not o_reduce:
             continue
-        if o_side and o_side != side:
+
+        # Only exact side counts
+        if o_side != side:
             continue
 
+        # TP detection
         if o_type in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT"):
-            if o_qty and qty_matches(o_qty):
+            if qty_matches(o_qty):
                 has_tp = True
 
+        # SL detection
         if o_type in ("STOP", "STOP_MARKET", "STOP_LIMIT", "STOP_LOSS"):
-            if o_qty and qty_matches(o_qty):
+            if qty_matches(o_qty):
                 has_sl = True
-
-        if not has_tp and "TAKE_PROFIT" in o_type:
-            if o_qty and qty_matches(o_qty):
-                has_tp = True
-        if not has_sl and "STOP" in o_type:
-            if o_qty and qty_matches(o_qty):
-                has_sl = True
-
-        if has_tp and has_sl:
-            break
 
     return has_tp, has_sl
+
+
 
 # -----------------------
 # TP/SL WATCHER (robust with backoff)
@@ -551,7 +556,7 @@ def _before_request_start_threads():
 # -----------------------
 # FLASK ENDPOINTS
 # -----------------------
-@app.route("/trade", methods=["POST"])
+@app.route("/testorder", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
