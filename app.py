@@ -285,6 +285,8 @@ def tp_sl_watcher():
 
             print("[TP/SL WATCHER] Prüfe Positionen...")
             print(f"[WATCHER THREAD] ID={threading.get_ident()}")
+            print("[TP/SL WATCHER]", time.strftime("%H:%M:%S"))
+
 
             for pos in positions:
                 symbol = pos["symbol"]
