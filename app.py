@@ -450,10 +450,12 @@ def start_background_threads():
         _threads_started = True
 
 # Start threads when the first request arrives (works with Gunicorn single worker)
-@app.before_first_request
-def _before_first_request():
+@app.before_request
+def _before_request_start_threads():
+    # init_db kann idempotent sein, also sicher hier aufzurufen
     init_db()
     start_background_threads()
+
 
 # -----------------------
 # FLASK ENDPOINTS
