@@ -275,15 +275,18 @@ def monitor_dca():
 
 
 # ============================================================
-#   TP/SL WATCHER — setzt fehlende TP/SL neu
+#   TP/SL WATCHER — DEBUG VERSION
 # ============================================================
 
 def tp_sl_watcher():
+    print("[TP/SL WATCHER] Thread gestartet")
+
     while True:
         try:
-            positions = get_positions()
-
             print("[TP/SL WATCHER] Prüfe Positionen...")
+
+            positions = get_positions()
+            print(f"[TP/SL WATCHER] Gefundene Positionen: {len(positions)}")
 
             for pos in positions:
                 symbol = pos["symbol"]
@@ -291,12 +294,17 @@ def tp_sl_watcher():
                 amt = float(pos["positionAmt"])
 
                 if amt == 0:
+                    print(f"[TP/SL WATCHER] {symbol} {side} übersprungen (Amt=0)")
                     continue
+
+                print(f"[TP/SL WATCHER] Prüfe {symbol} {side} (Amt={amt})")
 
                 ts = str(int(time.time() * 1000))
                 r = api_request("GET", "/openApi/swap/v2/trade/openOrders",
                                 {"symbol": symbol, "timestamp": ts})
                 orders = r.get("data", {}).get("orders", []) if r else []
+
+                print(f"[TP/SL WATCHER] Offene Orders: {len(orders)}")
 
                 has_tp = any(o.get("type") == "TAKE_PROFIT_MARKET" and o.get("positionSide") == side for o in orders)
                 has_sl = any(o.get("type") == "STOP_MARKET" and o.get("positionSide") == side for o in orders)
@@ -312,7 +320,6 @@ def tp_sl_watcher():
             print("[TP/SL WATCHER ERROR]", e)
 
         time.sleep(10)
-
 
 
 # ============================================================
@@ -429,13 +436,21 @@ def dca_watchdog():
         time.sleep(5)
 
 
+# ============================================================
+#   MAIN START
+# ============================================================
+
 if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
         print("FEHLER: API Keys fehlen")
     else:
+        print("[MAIN] Starte Threads...")
+
         threading.Thread(target=start_dca_thread, daemon=True).start()
         threading.Thread(target=dca_watchdog, daemon=True).start()
         threading.Thread(target=keep_alive, daemon=True).start()
         threading.Thread(target=tp_sl_watcher, daemon=True).start()
+
+        print("[MAIN] Alle Threads gestartet")
 
         app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
