@@ -1,28 +1,43 @@
+# app.py
 import os
 import time
 import hmac
 import hashlib
 import urllib.parse
 import threading
-import requests
+import sqlite3
+import logging
 from flask import Flask, request, jsonify
+import requests
 
 # -----------------------
 # CONFIG / DEFAULTS
 # -----------------------
-API_KEY = os.getenv("BINGX_API_KEY")
-API_SECRET = os.getenv("BINGX_API_SECRET")
+API_KEY = os.getenv("BINGX_API_KEY", "")
+API_SECRET = os.getenv("BINGX_API_SECRET", "")
 BINGX_BASE = "https://open-api.bingx.com"
 
-LEVERAGE = 20
-TRADE_SIZE = 20
-TP_PERCENT = 1
-SL_PERCENT = 20.0
+# Defaults (hard-coded as requested)
+LEVERAGE = int(os.getenv("LEVERAGE", 20))
+TRADE_SIZE = float(os.getenv("TRADE_SIZE", 20.0))
+TP_PERCENT = float(os.getenv("TP_PERCENT", 2.0))
+SL_PERCENT = float(os.getenv("SL_PERCENT", 40.0))
 
-DCA_DEVIATION_PERCENT = 5.0
-DCA_COUNT = 5
-DCA_VOLUME_MULTIPLIER = 2
-DCA_INTERVAL = 5
+DCA_DEVIATION_PERCENT = float(os.getenv("DCA_DEVIATION_PERCENT", 5.0))
+DCA_COUNT = int(os.getenv("DCA_COUNT", 5))
+DCA_VOLUME_MULTIPLIER = float(os.getenv("DCA_VOLUME_MULTIPLIER", 2.0))
+DCA_INTERVAL = int(os.getenv("DCA_INTERVAL", 5))
+
+DB_PATH = os.getenv("JOB_DB_PATH", "jobs.db")
+
+# -----------------------
+# LOGGING
+# -----------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger("bot")
 
 # -----------------------
 # STATE
@@ -30,17 +45,65 @@ DCA_INTERVAL = 5
 active_dca = {}
 dca_lock = threading.Lock()
 
+# -----------------------
+# FLASK APP
+# -----------------------
 app = Flask(__name__)
 
 # -----------------------
-# UTIL: SIGN + REQUEST
+# SQLITE JOB QUEUE (simple)
+# -----------------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'new',
+        created_at INTEGER NOT NULL
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def enqueue_job(symbol, direction):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO jobs (symbol, direction, status, created_at) VALUES (?, ?, 'new', ?)",
+              (symbol, direction, int(time.time())))
+    conn.commit()
+    conn.close()
+
+def fetch_new_job():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, symbol, direction FROM jobs WHERE status='new' ORDER BY id LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def mark_job_processing(job_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE jobs SET status='processing' WHERE id=?", (job_id,))
+    conn.commit()
+    conn.close()
+
+def mark_job_done(job_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE jobs SET status='done' WHERE id=?", (job_id,))
+    conn.commit()
+    conn.close()
+
+# -----------------------
+# BINGX API HELPERS
 # -----------------------
 def sign_bingx(params):
-    if not params:
-        query_string = ""
-    else:
-        items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
-        query_string = urllib.parse.urlencode(items)
+    items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
+    query_string = urllib.parse.urlencode(items)
     return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
 def api_request(method, endpoint, params=None):
@@ -48,32 +111,32 @@ def api_request(method, endpoint, params=None):
     headers = {"X-BX-APIKEY": API_KEY}
     params = {} if params is None else dict(params)
     timeout = (5, 12)
-
     try:
         if method == "GET":
             params_for_sign = dict(params)
+            if "timestamp" not in params_for_sign:
+                params_for_sign["timestamp"] = str(int(time.time() * 1000))
             signature = sign_bingx(params_for_sign)
             params_for_sign["signature"] = signature
             query = urllib.parse.urlencode(params_for_sign)
             r = requests.get(f"{url}?{query}", headers=headers, timeout=timeout)
             r.raise_for_status()
             return r.json()
-
         if method == "POST":
             params_for_sign = dict(params)
             if "timestamp" not in params_for_sign:
                 params_for_sign["timestamp"] = str(int(time.time() * 1000))
-            query = urllib.parse.urlencode(sorted((k, str(v)) for k, v in params_for_sign.items()))
             signature = sign_bingx(params_for_sign)
+            query = urllib.parse.urlencode(sorted((k, str(v)) for k, v in params_for_sign.items()))
             r = requests.post(f"{url}?{query}&signature={signature}", headers=headers, timeout=timeout)
             r.raise_for_status()
             return r.json()
     except Exception as e:
-        print("[API ERROR]", e)
+        log.error("[API ERROR] %s %s %s", method, endpoint, e)
         return None
 
 # -----------------------
-# HELPERS
+# MARKET HELPERS
 # -----------------------
 def get_price(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
@@ -102,7 +165,7 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     return bool(r)
 
 # -----------------------
-# POSITION SIDE DETECTION + DUST FILTER
+# POSITION DETECTION + DUST FILTER
 # -----------------------
 def detect_side(pos):
     raw = pos.get("positionSide")
@@ -114,7 +177,7 @@ def detect_side(pos):
     return raw
 
 # -----------------------
-# TP/SL: Leverage-Kompensation + Setzen
+# TP/SL LOGIC
 # -----------------------
 def correct_tp_sl_for_leverage(entry, tp_percent, sl_percent, leverage, side):
     tp_corrected = tp_percent / max(1, leverage)
@@ -157,7 +220,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
             break
         time.sleep(0.5)
     if not pos:
-        print("[TP/SL] Position nicht gefunden für", symbol)
+        log.info("[TP/SL] Position nicht gefunden für %s", symbol)
         return
     side = detect_side(pos)
     if not side:
@@ -168,7 +231,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     tp_price, sl_price = correct_tp_sl_for_leverage(entry, tp_percent, sl_percent, leverage, side)
     reset_tp_sl(symbol, side)
 
-    # TAKE PROFIT als MARKET (kompensiert)
+    # TAKE PROFIT MARKET (kompensiert)
     api_request("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "side": "SELL" if side == "LONG" else "BUY",
@@ -203,7 +266,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     })
 
 # -----------------------
-# DCA / Security Orders
+# DCA / SECURITY ORDERS
 # -----------------------
 def update_entry(symbol, side):
     positions = get_positions()
@@ -226,6 +289,7 @@ def should_trigger_dca(side, current, entry_ref, deviation_percent):
     return False
 
 def monitor_dca():
+    log.info("[DCA] Monitor gestartet")
     while True:
         try:
             positions = get_positions()
@@ -252,9 +316,9 @@ def monitor_dca():
                             "sl_percent": SL_PERCENT
                         }
                     d = active_dca[symbol]
-                # use dynamic entry for trigger
                 if d["executed"] >= DCA_COUNT:
                     continue
+                # use dynamic entry for trigger
                 if not should_trigger_dca(side, current_price, d["entry_dynamic"], DCA_DEVIATION_PERCENT):
                     continue
                 qty = calculate_dca_qty(d["base_trade_size"], d["executed"], current_price)
@@ -274,14 +338,14 @@ def monitor_dca():
                 reset_tp_sl(symbol, side)
                 set_tp_sl(symbol, side, TP_PERCENT, SL_PERCENT)
         except Exception as e:
-            print("[DCA ERROR]", e)
+            log.exception("[DCA ERROR] %s", e)
         time.sleep(DCA_INTERVAL)
 
 # -----------------------
 # TP/SL WATCHER
 # -----------------------
 def tp_sl_watcher():
-    print("[TP/SL WATCHER] gestartet")
+    log.info("[TP/SL WATCHER] gestartet")
     while True:
         try:
             positions = get_positions()
@@ -299,10 +363,11 @@ def tp_sl_watcher():
                 has_tp = any(o.get("type") in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT") and o.get("positionSide") == side for o in orders)
                 has_sl = any(o.get("type") in ("STOP", "STOP_MARKET") and o.get("positionSide") == side for o in orders)
                 if not has_tp or not has_sl:
+                    log.info("[TP/SL WATCHER] Setze TP/SL neu für %s (%s)", symbol, side)
                     reset_tp_sl(symbol, side)
                     set_tp_sl(symbol, side, TP_PERCENT, SL_PERCENT)
         except Exception as e:
-            print("[TP/SL WATCHER ERROR]", e)
+            log.exception("[TP/SL WATCHER ERROR] %s", e)
         time.sleep(10)
 
 # -----------------------
@@ -310,17 +375,17 @@ def tp_sl_watcher():
 # -----------------------
 def execute_trade(symbol, direction):
     if not symbol_exists(symbol):
-        print("[EXECUTE] Symbol existiert nicht:", symbol)
+        log.info("[EXECUTE] Symbol existiert nicht: %s", symbol)
         return
     positions = get_positions()
     for p in positions:
         side = detect_side(p)
         if side == direction and p["symbol"] == symbol and abs(float(p["positionAmt"])) > 0.0001:
-            print("[EXECUTE] Position bereits offen:", symbol, direction)
+            log.info("[EXECUTE] Position bereits offen: %s %s", symbol, direction)
             return
     price = get_price(symbol)
     if not price:
-        print("[EXECUTE] Kein Preis für", symbol)
+        log.info("[EXECUTE] Kein Preis für %s", symbol)
         return
     set_leverage_for_symbol(symbol, LEVERAGE, direction, "BUY" if direction == "LONG" else "SELL")
     qty = round(TRADE_SIZE / price, 6)
@@ -345,9 +410,53 @@ def execute_trade(symbol, direction):
     time.sleep(2)
     reset_tp_sl(symbol, direction)
     set_tp_sl(symbol, direction, TP_PERCENT, SL_PERCENT)
+    log.info("[EXECUTE] Trade ausgeführt %s %s qty=%s", symbol, direction, qty)
 
 # -----------------------
-# FLASK WEBHOOK
+# JOB PROCESSOR (polls sqlite queue)
+# -----------------------
+def job_processor_loop(poll_interval=2):
+    log.info("[WORKER] Job Processor gestartet")
+    while True:
+        row = fetch_new_job()
+        if row:
+            job_id, symbol, direction = row
+            try:
+                mark_job_processing(job_id)
+                log.info("[WORKER] Verarbeite Job %s: %s %s", job_id, symbol, direction)
+                execute_trade(symbol, direction)
+                mark_job_done(job_id)
+                log.info("[WORKER] Job %s erledigt", job_id)
+            except Exception as e:
+                log.exception("[WORKER ERROR] %s", e)
+        else:
+            time.sleep(poll_interval)
+
+# -----------------------
+# THREAD STARTUP (safe for Gunicorn single-worker)
+# -----------------------
+_threads_started = False
+_threads_lock = threading.Lock()
+
+def start_background_threads():
+    global _threads_started
+    with _threads_lock:
+        if _threads_started:
+            return
+        log.info("[MAIN] Starte Hintergrund-Threads")
+        threading.Thread(target=monitor_dca, daemon=True).start()
+        threading.Thread(target=tp_sl_watcher, daemon=True).start()
+        threading.Thread(target=job_processor_loop, daemon=True).start()
+        _threads_started = True
+
+# Start threads when the first request arrives (works with Gunicorn single worker)
+@app.before_first_request
+def _before_first_request():
+    init_db()
+    start_background_threads()
+
+# -----------------------
+# FLASK ENDPOINTS
 # -----------------------
 @app.route("/trade", methods=["POST"])
 def webhook():
@@ -357,20 +466,21 @@ def webhook():
     if not currency or direction not in ("LONG", "SHORT"):
         return jsonify({"status": "ignored"}), 200
     symbol = f"{currency}-USDT"
-    threading.Thread(target=execute_trade, args=(symbol, direction), daemon=True).start()
-    return jsonify({"status": "processing"}), 200
+    enqueue_job(symbol, direction)
+    log.info("[WEBHOOK] Job enqueued %s %s", symbol, direction)
+    return jsonify({"status": "accepted"}), 200
 
 @app.route("/ping")
 def ping():
     return "pong", 200
 
 # -----------------------
-# MAIN
+# ENTRYPOINT (for python app.py)
 # -----------------------
 if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
-        print("FEHLER: API Keys fehlen")
-    else:
-        threading.Thread(target=monitor_dca, daemon=True).start()
-        threading.Thread(target=tp_sl_watcher, daemon=True).start()
-        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+        log.error("FEHLER: API Keys fehlen (BINGX_API_KEY / BINGX_API_SECRET)")
+    init_db()
+    # start threads immediately when running with python app.py
+    start_background_threads()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
