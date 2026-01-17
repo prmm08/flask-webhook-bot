@@ -135,7 +135,7 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     return bool(r)
     
 # ============================================================
-#   TP/SL KORREKTUR (Option A — kompensiert BingX-Leverage)
+#   TP/SL KORREKTUR (kompensiert BingX-Leverage)
 # ============================================================
 
 def correct_tp_sl_for_leverage(entry, tp_percent, sl_percent, leverage, side):
@@ -153,7 +153,7 @@ def correct_tp_sl_for_leverage(entry, tp_percent, sl_percent, leverage, side):
 
 
 # ============================================================
-#   TP/SL HANDLING (MARKET + kompensiert)
+#   TP/SL HANDLING (MARKET + kompensiert + APR-Fix)
 # ============================================================
 
 def reset_tp_sl(symbol, position_side=None):
@@ -178,17 +178,34 @@ def reset_tp_sl(symbol, position_side=None):
         })
 
 
+def detect_side(pos):
+    raw = pos.get("positionSide")
+    amt = float(pos.get("positionAmt", 0))
+
+    if abs(amt) < 0.0001:
+        return None
+
+    if raw in (None, "", "BOTH"):
+        if amt > 0:
+            return "LONG"
+        if amt < 0:
+            return "SHORT"
+        return None
+
+    return raw
+
+
 def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT):
     pos = None
     for _ in range(8):
         positions = get_positions()
-        pos = next(
-            (p for p in positions
-             if p["symbol"] == symbol
-             and float(p.get("positionAmt", 0)) != 0
-             and (desired_side is None or p.get("positionSide") == desired_side)),
-            None
-        )
+        for p in positions:
+            side = detect_side(p)
+            if not side:
+                continue
+            if p["symbol"] == symbol and (desired_side is None or side == desired_side):
+                pos = p
+                break
         if pos:
             break
         time.sleep(1)
@@ -197,18 +214,16 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
         print("[TP/SL] Position nicht gefunden für", symbol)
         return
 
-    side = pos["positionSide"]
+    side = detect_side(pos)
+    if not side:
+        return
+
     entry = float(pos["avgPrice"])
     qty = abs(float(pos["positionAmt"]))
     leverage = int(pos.get("leverage", 1))
 
-    # Korrigierte Preise berechnen
     tp_price, sl_price = correct_tp_sl_for_leverage(
-        entry,
-        tp_percent,
-        sl_percent,
-        leverage,
-        side
+        entry, tp_percent, sl_percent, leverage, side
     )
 
     reset_tp_sl(symbol, side)
@@ -218,7 +233,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
             "symbol": symbol,
             "side": "SELL" if side == "LONG" else "BUY",
             "positionSide": side,
-            "type": otype,                # TAKE_PROFIT_MARKET / STOP_MARKET
+            "type": otype,
             "stopPrice": f"{price:.6f}",
             "quantity": f"{qty:.6f}",
             "reduceOnly": "true",
@@ -231,18 +246,15 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
 
 
 # ============================================================
-#   DCA ENGINE (unverändert, aber nutzt neue TP/SL)
+#   DCA ENGINE (mit APR-Fix)
 # ============================================================
 
 def update_entry(symbol, side):
     positions = get_positions()
-    pos = next(
-        (p for p in positions
-         if p["symbol"] == symbol and p["positionSide"] == side),
-        None
-    )
-    if pos:
-        return float(pos["avgPrice"])
+    for p in positions:
+        ps = detect_side(p)
+        if ps == side and p["symbol"] == symbol:
+            return float(p["avgPrice"])
     return None
 
 
@@ -268,11 +280,13 @@ def monitor_dca():
             positions = get_positions()
 
             for pos in positions:
-                symbol = pos["symbol"]
-                side = pos["positionSide"]
-                amt = float(pos["positionAmt"])
+                side = detect_side(pos)
+                if not side:
+                    continue
 
-                if amt == 0:
+                symbol = pos["symbol"]
+                amt = float(pos["positionAmt"])
+                if abs(amt) < 0.0001:
                     continue
 
                 current_price = get_price(symbol)
@@ -346,6 +360,9 @@ def tp_sl_watcher():
                 symbol = pos["symbol"]
                 side = pos["positionSide"]
                 amt = float(pos["positionAmt"])
+                if abs(amt) < 0.0001:
+                    continue  # Geisterposition ignorieren
+
 
                 if amt == 0:
                     continue
