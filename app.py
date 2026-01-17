@@ -406,41 +406,34 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
 # ============================================================
 #   KLINES / RSI BERECHNUNG UND MONITOR
 # ============================================================
-def get_klines_raw(symbol, interval="1m", limit=100):
-    """
-    Rohfunktion, die genau einen API-Aufruf macht und die Parsing-Logik ausführt.
-    Diese Funktion gibt entweder eine Liste von Close-Preisen oder None zurück.
-    """
+def get_klines_raw_try_endpoint(symbol, endpoint, interval="1m", limit=100):
     params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
-    r = api_request("GET", "/openApi/swap/v2/quote/kline", params)
-    logger.debug("get_klines raw response for %s: %s", symbol, json.dumps(r, default=str)[:4000])
+    logger.debug("get_klines try endpoint=%s symbol=%s", endpoint, symbol)
+    r = api_request("GET", endpoint, params)
+    logger.debug("get_klines raw response for %s @ %s: %s", symbol, endpoint, json.dumps(r, default=str)[:4000])
+    # return parsed closes or None
     if not r:
-        logger.warning("get_klines no response for %s", symbol)
         return None
-    # Log code/msg falls vorhanden
-    try:
-        logger.debug("get_klines response code=%s msg=%s", r.get("code"), r.get("msg"))
-    except Exception:
-        pass
-
+    # If API explicitly says endpoint not exist, bubble up code for fallback logic
+    code = r.get("code")
+    if code == 100400:
+        logger.info("Endpoint %s not available for %s (code=100400). Will try alternatives.", endpoint, symbol)
+        return {"error_code": 100400, "response": r}
     data = r.get("data")
     if not data:
-        logger.warning("get_klines empty data for %s", symbol)
         return None
-    logger.debug("get_klines data field for %s: %s", symbol, type(data))
-
+    # parsing same as before
     closes = None
-    # Mögliche Formate abfangen
     if isinstance(data, list) and len(data) and isinstance(data[0], dict) and "close" in data[0]:
         try:
             closes = [float(item["close"]) for item in data]
         except Exception as e:
-            logger.error("get_klines parse dict-list error %s", e, exc_info=True)
+            logger.error("parse dict-list error %s", e, exc_info=True)
     elif isinstance(data, list) and len(data) and isinstance(data[0], list):
         try:
             closes = [float(item[4]) for item in data]
         except Exception as e:
-            logger.error("get_klines parse list-of-lists error %s", e, exc_info=True)
+            logger.error("parse list-of-lists error %s", e, exc_info=True)
     elif isinstance(data, dict):
         for key in ("klines", "candles", "items"):
             if key in data and isinstance(data[key], list):
@@ -449,59 +442,61 @@ def get_klines_raw(symbol, interval="1m", limit=100):
                     try:
                         closes = [float(x["close"]) for x in data[key]]
                     except Exception as e:
-                        logger.error("get_klines parse dict inside data error %s", e, exc_info=True)
+                        logger.error("parse dict inside data error %s", e, exc_info=True)
                 elif isinstance(first, list):
                     try:
                         closes = [float(x[4]) for x in data[key]]
                     except Exception as e:
-                        logger.error("get_klines parse list inside data error %s", e, exc_info=True)
-
+                        logger.error("parse list inside data error %s", e, exc_info=True)
     if closes:
-        logger.debug("get_klines %s closes_count=%d last_close=%s", symbol, len(closes), closes[-1])
-    else:
-        logger.warning("get_klines could not parse closes for %s", symbol)
-    return closes
+        logger.debug("get_klines parsed %s closes_count=%d last_close=%s", symbol, len(closes), closes[-1])
+        return closes
+    logger.warning("get_klines could not parse closes for %s", symbol)
+    return None
 
 def get_klines_with_fallback(symbol, interval="1m", limit=100):
     """
-    Versucht mehrere Symbol-Varianten, falls die Standard-Variante keine Daten liefert.
+    Versucht mehrere Endpoints und Symbol-Varianten, falls Standard-Aufruf fehlschlägt.
+    Reihenfolge:
+      1) swap kline (bestehend)
+      2) spot kline
+      3) symbol-varianten (ohne '-', mit '/', zusammengefügt)
     """
     tried = []
-    def try_symbol(s):
-        tried.append(s)
-        logger.debug("get_klines try %s", s)
-        closes = get_klines_raw(s, interval, limit)
-        if closes:
-            logger.info("get_klines fallback success for %s (tried: %s)", s, tried)
-            return closes
-        return None
+    # candidate endpoints to try (swap first, then spot)
+    endpoints = [
+        "/openApi/swap/v2/quote/kline",   # original
+        "/openApi/spot/v1/market/kline",  # alternative spot endpoint (häufig)
+        "/openApi/spot/v1/market/kline"   # duplicate placeholder if needed to add others
+    ]
 
-    # 1) original
-    res = try_symbol(symbol)
-    if res:
-        return res
-
-    # 2) ohne Bindestrich
+    # candidate symbol variants
+    variants = [symbol]
     if "-" in symbol:
-        res = try_symbol(symbol.replace("-", ""))
-        if res:
-            return res
+        variants.append(symbol.replace("-", ""))
+        variants.append(symbol.replace("-", "/"))
+        variants.append(symbol.split("-")[0] + "USDT")
+    else:
+        if symbol.endswith("USDT"):
+            variants.append(symbol.replace("USDT", "-USDT"))
 
-    # 3) mit Slash
-    if "-" in symbol:
-        res = try_symbol(symbol.replace("-", "/"))
-        if res:
-            return res
-
-    # 4) Symbol + USDT (zusammengefügt)
-    base = symbol.replace("-", "").replace("/", "")
-    if not base.endswith("USDT"):
-        res = try_symbol(base + "USDT")
-        if res:
-            return res
-
+    # try endpoints x variants
+    for ep in endpoints:
+        for v in variants:
+            if not v:
+                continue
+            tried.append((ep, v))
+            res = get_klines_raw_try_endpoint(v, ep, interval, limit)
+            # if API explicitly returned code 100400 for this endpoint, skip to next endpoint
+            if isinstance(res, dict) and res.get("error_code") == 100400:
+                logger.info("Endpoint %s not supported for symbol %s, trying next endpoint/variant", ep, v)
+                continue
+            if res:
+                logger.info("get_klines_with_fallback success endpoint=%s symbol=%s", ep, v)
+                return res
     logger.warning("get_klines_with_fallback: keine Variante lieferte Kerzen für %s (tried: %s)", symbol, tried)
     return None
+
 
 def compute_rsi(closes, period=RSI_PERIOD):
     if not closes or len(closes) < period + 1:
