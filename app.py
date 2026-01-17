@@ -537,51 +537,89 @@ def check_and_trigger_rsi():
     for symbol in WATCHLIST:
         symbol = symbol.strip()
         try:
-            rsi_prev, rsi_now = get_latest_two_rsi(symbol, interval=RSI_INTERVAL, period=RSI_PERIOD)
-            logger.debug("RSI check %s rsi_prev=%s rsi_now=%s", symbol, rsi_prev, rsi_now)
+            # Resolve symbol used for API calls (falls du resolve_symbol implementiert hast)
+            resolved = None
+            try:
+                resolved = resolve_symbol(symbol) if 'resolve_symbol' in globals() else symbol
+            except Exception:
+                resolved = symbol
+
+            rsi_prev, rsi_now = get_latest_two_rsi(resolved or symbol, interval=RSI_INTERVAL, period=RSI_PERIOD)
+            logger.debug("RSI check %s resolved=%s rsi_prev=%s rsi_now=%s", symbol, resolved, rsi_prev, rsi_now)
+
             if rsi_prev is None or rsi_now is None:
                 logger.info("RSI skip %s not enough data rsi_prev=%s rsi_now=%s", symbol, rsi_prev, rsi_now)
                 continue
 
+            # compute cross booleans explicitly
             cross_up_30 = (rsi_prev < 30 and rsi_now >= 30)
             cross_down_70 = (rsi_prev > 70 and rsi_now <= 70)
 
+            # extra safety: require rsi_now to actually be >=30 for long, <=70 for short
+            safe_long = cross_up_30 and (rsi_now >= 30)
+            safe_short = cross_down_70 and (rsi_now <= 70)
+
+            # optional: require a minimum change to avoid tiny oscillations
+            MIN_RSI_DELTA = float(os.getenv("MIN_RSI_DELTA", "0.0"))
+            if MIN_RSI_DELTA > 0:
+                safe_long = safe_long and ((rsi_now - rsi_prev) >= MIN_RSI_DELTA)
+                safe_short = safe_short and ((rsi_prev - rsi_now) >= MIN_RSI_DELTA)
+
+            # get positions using the same resolved symbol to avoid mismatch
             positions = get_positions()
-            has_long = any(p["symbol"] == symbol and p.get("positionSide") == "LONG" and float(p.get("positionAmt", 0)) != 0 for p in positions)
-            has_short = any(p["symbol"] == symbol and p.get("positionSide") == "SHORT" and float(p.get("positionAmt", 0)) != 0 for p in positions)
+            has_long = any(p["symbol"] == (resolved or symbol) and p.get("positionSide") == "LONG" and float(p.get("positionAmt", 0)) != 0 for p in positions)
+            has_short = any(p["symbol"] == (resolved or symbol) and p.get("positionSide") == "SHORT" and float(p.get("positionAmt", 0)) != 0 for p in positions)
 
-            logger.debug("RSI state %s has_long=%s has_short=%s", symbol, has_long, has_short)
+            logger.debug("RSI decision %s resolved=%s cross_up_30=%s cross_down_70=%s safe_long=%s safe_short=%s has_long=%s has_short=%s last_signal=%s",
+                         symbol, resolved, cross_up_30, cross_down_70, safe_long, safe_short, has_long, has_short, rsi_state.get(symbol, {}).get("last_signal"))
 
-            if cross_up_30:
-                logger.info("RSI cross_up_30 detected for %s rsi_prev=%.2f rsi_now=%.2f", symbol, rsi_prev, rsi_now)
-                if has_long:
-                    logger.info("RSI not opening LONG for %s because long already open", symbol)
-                else:
-                    with rsi_lock:
-                        last_signal = rsi_state.get(symbol, {}).get("last_signal")
-                        if last_signal == "LONG":
-                            logger.info("RSI not opening LONG for %s because last_signal already LONG", symbol)
+            # LONG
+            if safe_long and not has_long:
+                with rsi_lock:
+                    last_signal = rsi_state.get(symbol, {}).get("last_signal")
+                    if last_signal == "LONG":
+                        logger.info("RSI skip LONG %s because last_signal already LONG", symbol)
+                    else:
+                        logger.info("RSI trigger LONG %s rsi_prev=%.4f rsi_now=%.4f", symbol, rsi_prev, rsi_now)
+                        order_payload = {
+                            "symbol": resolved or symbol,
+                            "side": "BUY",
+                            "positionSide": "LONG",
+                            "type": "MARKET",
+                            "quantity": "DRYRUN" if os.getenv("DRY_RUN", "false").lower() == "true" else "CALCULATED"
+                        }
+                        logger.debug("Order payload (preview) for %s: %s", symbol, order_payload)
+                        if os.getenv("DRY_RUN", "false").lower() == "true":
+                            logger.info("DRY_RUN enabled — not placing real order for %s", symbol)
                         else:
-                            logger.info("Triggering LONG for %s", symbol)
-                            threading.Thread(target=execute_trade, args=(symbol, "LONG", LEVERAGE, TRADE_SIZE, TP_PERCENT, SL_PERCENT)).start()
-                            rsi_state[symbol] = {"last_rsi": rsi_now, "last_signal": "LONG"}
-                            continue
+                            threading.Thread(target=execute_trade, args=(resolved or symbol, "LONG", LEVERAGE, TRADE_SIZE, TP_PERCENT, SL_PERCENT)).start()
+                        rsi_state[symbol] = {"last_rsi": rsi_now, "last_signal": "LONG"}
+                        continue
 
-            if cross_down_70:
-                logger.info("RSI cross_down_70 detected for %s rsi_prev=%.2f rsi_now=%.2f", symbol, rsi_prev, rsi_now)
-                if has_short:
-                    logger.info("RSI not opening SHORT for %s because short already open", symbol)
-                else:
-                    with rsi_lock:
-                        last_signal = rsi_state.get(symbol, {}).get("last_signal")
-                        if last_signal == "SHORT":
-                            logger.info("RSI not opening SHORT for %s because last_signal already SHORT", symbol)
+            # SHORT
+            if safe_short and not has_short:
+                with rsi_lock:
+                    last_signal = rsi_state.get(symbol, {}).get("last_signal")
+                    if last_signal == "SHORT":
+                        logger.info("RSI skip SHORT %s because last_signal already SHORT", symbol)
+                    else:
+                        logger.info("RSI trigger SHORT %s rsi_prev=%.4f rsi_now=%.4f", symbol, rsi_prev, rsi_now)
+                        order_payload = {
+                            "symbol": resolved or symbol,
+                            "side": "SELL",
+                            "positionSide": "SHORT",
+                            "type": "MARKET",
+                            "quantity": "DRYRUN" if os.getenv("DRY_RUN", "false").lower() == "true" else "CALCULATED"
+                        }
+                        logger.debug("Order payload (preview) for %s: %s", symbol, order_payload)
+                        if os.getenv("DRY_RUN", "false").lower() == "true":
+                            logger.info("DRY_RUN enabled — not placing real order for %s", symbol)
                         else:
-                            logger.info("Triggering SHORT for %s", symbol)
-                            threading.Thread(target=execute_trade, args=(symbol, "SHORT", LEVERAGE, TRADE_SIZE, TP_PERCENT, SL_PERCENT)).start()
-                            rsi_state[symbol] = {"last_rsi": rsi_now, "last_signal": "SHORT"}
-                            continue
+                            threading.Thread(target=execute_trade, args=(resolved or symbol, "SHORT", LEVERAGE, TRADE_SIZE, TP_PERCENT, SL_PERCENT)).start()
+                        rsi_state[symbol] = {"last_rsi": rsi_now, "last_signal": "SHORT"}
+                        continue
 
+            # update last_rsi if no trigger
             with rsi_lock:
                 if symbol not in rsi_state:
                     rsi_state[symbol] = {"last_rsi": rsi_now, "last_signal": None}
@@ -590,6 +628,7 @@ def check_and_trigger_rsi():
 
         except Exception as e:
             logger.exception("RSI ERROR for %s", symbol)
+
 
 def rsi_monitor_loop():
     while True:
