@@ -267,7 +267,7 @@ def monitor_dca():
                         d["entry_dynamic"] = new_entry
 
                 reset_tp_sl(symbol, side)
-                set_tp_sl(symbol, side, d["tp_percent"], d["sl_percent"])
+                set_tp_sl(symbol, side, TP_PERCENT, SL_PERCENT)
 
         except Exception as e:
             print("[DCA ERROR]", e)
@@ -364,13 +364,14 @@ def execute_trade(symbol, direction, leverage, trade_size, TP_PERCENT, SL_PERCEN
             "entry_dynamic": price,
             "executed": 0,
             "base_trade_size": trade_size,
-            "tp_percent": tp_percent,
-            "sl_percent": sl_percent
+            "tp_percent": TP_PERCENT,
+            "sl_percent": SL_PERCENT
+
         }
 
     time.sleep(2)
     reset_tp_sl(symbol, direction)
-    set_tp_sl(symbol, direction, tp_percent, sl_percent)
+    set_tp_sl(symbol, direction, TP_PERCENT, SL_PERCENT)
 
 
 # ============================================================
@@ -389,8 +390,8 @@ def webhook():
     symbol = f"{currency}-USDT"
     leverage = int(data.get("leverage", LEVERAGE))
     trade_size = float(data.get("trade_size", TRADE_SIZE))
-    tp_percent = float(data.get("tp_percent", TP_PERCENT))
-    sl_percent = float(data.get("sl_percent", SL_PERCENT))
+    tp_percent = TP_PERCENT 
+    sl_percent = SL_PERCENT
 
     threading.Thread(
         target=execute_trade,
