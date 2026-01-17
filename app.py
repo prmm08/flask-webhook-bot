@@ -135,7 +135,7 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     return bool(r)
     
 # ============================================================
-#   TP/SL HANDLING (mit LIMIT-Orders, leverage-unabhängig)
+#   TP/SL HANDLING (LIMIT + reduceOnly, leverage-unabhängig)
 # ============================================================
 
 def reset_tp_sl(symbol, position_side=None):
@@ -182,6 +182,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
 
     side = pos["positionSide"]
     entry = float(pos["avgPrice"])
+    qty = abs(float(pos["positionAmt"]))
 
     # Sicherstellen, dass avgPrice nach DCA aktualisiert ist
     for _ in range(10):
@@ -193,33 +194,39 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
         )
         if new_pos and abs(float(new_pos["avgPrice"]) - entry) > 0.0001:
             entry = float(new_pos["avgPrice"])
+            qty = abs(float(new_pos["positionAmt"]))
             break
 
     # Absolute TP/SL-Preise (unabhängig vom Leverage)
     if side == "LONG":
         tp_price = entry * (1 + tp_percent / 100)
         sl_price = entry * (1 - sl_percent / 100)
+        tp_side = "SELL"
+        sl_side = "SELL"
     else:
         tp_price = entry * (1 - tp_percent / 100)
         sl_price = entry * (1 + sl_percent / 100)
+        tp_side = "BUY"
+        sl_side = "BUY"
 
     reset_tp_sl(symbol, side)
 
-    def place(price, otype):
+    def place(price, otype, order_side):
         api_request("POST", "/openApi/swap/v2/trade/order", {
             "symbol": symbol,
-            "side": "SELL" if side == "LONG" else "BUY",
+            "side": order_side,           # SELL bei LONG, BUY bei SHORT
             "positionSide": side,
-            "type": otype,                 # TAKE_PROFIT oder STOP
-            "price": f"{price:.6f}",       # LIMIT-Preis
-            "stopPrice": f"{price:.6f}",   # Trigger-Preis
+            "type": otype,                # TAKE_PROFIT oder STOP
+            "price": f"{price:.6f}",      # LIMIT-Preis
+            "stopPrice": f"{price:.6f}",  # Trigger-Preis
+            "quantity": f"{qty:.6f}",     # Menge der offenen Position
+            "reduceOnly": "true",
             "workingType": "MARK_PRICE",
-            "closePosition": "true",
             "timestamp": str(int(time.time() * 1000))
         })
 
-    place(tp_price, "TAKE_PROFIT")
-    place(sl_price, "STOP")
+    place(tp_price, "TAKE_PROFIT", tp_side)
+    place(sl_price, "STOP",        sl_side)
 
 
 # ============================================================
@@ -327,6 +334,7 @@ def monitor_dca():
             print("[DCA ERROR]", e)
 
         time.sleep(DCA_INTERVAL)
+
 
 # ============================================================
 #   TP/SL WATCHER — setzt fehlende TP/SL IMMER neu (20/80)
