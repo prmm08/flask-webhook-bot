@@ -8,8 +8,7 @@ import urllib.parse
 import threading
 import time
 import json
-import pandas as pd
-import numpy as np
+import numpy as np # Nur noch numpy für array-Operationen benötigt
 
 from flask import Flask, request, jsonify
 import logging
@@ -373,47 +372,64 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
 #   RSI WATCHER LOGIC (NEU)
 # ============================================================
 
-def get_klines(symbol, interval="1m", limit=15):
+def get_klines(symbol, interval="1m", limit=16):
     """Holt Kerzendaten (OHLCV) von BingX für RSI-Berechnung."""
-    # Wir brauchen mindestens 14 Kerzen für den RSI(14)
+    # Wir brauchen 14 Perioden, 16 Klines geben uns genug Puffer für 2 RSI Werte
     r = api_request("GET", "/openApi/swap/v2/market/kline", {
         "symbol": symbol,
         "intervalTime": interval,
-        "limit": limit
+        "limit": limit 
     })
     if r and "data" in r:
-        # Datenformat: [timestamp, open, high, low, close, volume, ...]
-        # Wir extrahieren die Close-Preise
-        closes = [float(kline[4]) for kline in r["data"]]
+        closes = [float(kline) for kline in r["data"]]
         return closes
     return None
 
-def calculate_rsi(closes):
-    """Berechnet den RSI (Relative Strength Index) aus einer Liste von Close-Preisen."""
-    if len(closes) < 14:
-        return None
-    df = pd.Series(closes)
-    delta = df.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
+def calculate_rsi_light(closes):
+    """Berechnet den RSI (Relative Strength Index) aus einer Liste von Close-Preisen ohne Pandas."""
+    # Source: Angepasste, effiziente Python/Numpy Implementierung
+    if len(closes) < 15: return None
+    closes = np.array(closes)
+    deltas = np.diff(closes)
+    seed = deltas[:14]
+    up = seed[seed > 0].sum() / 14
+    down = -seed[seed < 0].sum() / 14
+    rs = up / down
+
+    # Initialisiere RSI Array
+    rsi = np.zeros_like(closes)
+    rsi[:15] = 100. - 100. / (1. + rs)
+
+    # Berechne den Rest iterativ
+    for i in range(15, len(closes)):
+        delta = deltas[i - 1] # deltas hat N-1 Elemente
+        if delta > 0:
+            up_val, down_val = delta, 0.
+        else:
+            up_val, down_val = 0., -delta
+        up = (up * 13 + up_val) / 14
+        down = (down * 13 + down_val) / 14
+        rs = up / down
+        rsi[i] = 100. - 100. / (1. + rs)
+    
     # Gibt den letzten (aktuellsten) RSI-Wert zurück
-    return rsi.iloc[-1]
+    return rsi[-1]
 
 def rsi_watcher_thread():
     print("[RSI WATCHER] Thread gestartet.")
     while True:
         try:
             for symbol in WATCHED_COINS:
-                closes = get_klines(symbol, limit=15)
-                if closes is None or len(closes) < 14:
-                    print(f"[RSI WATCHER ERROR] Nicht genug Daten für {symbol}")
+                # Wir holen 16 Kerzen, um sicher 15 für die Berechnung zu haben
+                closes = get_klines(symbol, limit=16) 
+                if closes is None or len(closes) < 15:
+                    print(f"[RSI WATCHER ERROR] Nicht genug Daten für {symbol}. Habe {len(closes) if closes is not None else 0} Kerzen.")
                     continue
                 
                 # Den RSI der VORLETZTEN Kerze (Index -2) und der LETZTEN Kerze (Index -1) berechnen
-                rsi_prev = calculate_rsi(closes[:-1])
-                rsi_current = calculate_rsi(closes)
+                # Nutzt die neue, leichte Funktion
+                rsi_prev = calculate_rsi_light(closes[:-1])
+                rsi_current = calculate_rsi_light(closes)
                 
                 if rsi_prev is None or rsi_current is None:
                     continue
@@ -423,7 +439,6 @@ def rsi_watcher_thread():
                 # --- RSI crossing up 30 LONG ---
                 if rsi_prev <= 30 < rsi_current:
                     print(f"[SIGNAL] LONG für {symbol} (RSI crossing up 30)")
-                    # Führt den Trade in einem neuen Thread aus, um den Watcher nicht zu blockieren
                     threading.Thread(
                         target=execute_trade,
                         args=(symbol, "LONG", LEVERAGE, TRADE_SIZE, TP_PERCENT, SL_PERCENT)
@@ -432,13 +447,13 @@ def rsi_watcher_thread():
                 # --- RSI crossing down 70 SHORT ---
                 elif rsi_prev >= 70 > rsi_current:
                     print(f"[SIGNAL] SHORT für {symbol} (RSI crossing down 70)")
-                    # Führt den Trade in einem neuen Thread aus, um den Watcher nicht zu blockieren
                     threading.Thread(
                         target=execute_trade,
                         args=(symbol, "SHORT", LEVERAGE, TRADE_SIZE, TP_PERCENT, SL_PERCENT)
                     ).start()
 
         except Exception as e:
+            # Hier kann man das Logging verbessern, um den spezifischen Fehler zu sehen
             print(f"[RSI WATCHER CRASH]", e)
             
         # Prüfe jede Minute (60 Sekunden)
@@ -523,4 +538,3 @@ if __name__ == "__main__":
 
 
         app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
