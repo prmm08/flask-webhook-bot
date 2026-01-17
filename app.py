@@ -159,6 +159,19 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     if side:
         params["side"] = side
     r = api_request("POST", "/openApi/swap/v2/trade/leverage", params)
+    
+    def get_symbol_precision(symbol):
+    # Diese Info sollte man idealerweise cachen, um API-Calls zu sparen
+    r = api_request("GET", "/openApi/swap/v2/quote/contracts", {"symbol": symbol})
+    if r and "data" in r:
+        # BingX liefert hier die tickSize (z.B. "0.1" oder "0.0001")
+        tick_size = r["data"].get("pricePrecision", 2) # Fallback auf 2
+        return int(tick_size)
+    return 2
+
+def round_price(price, precision):
+    return f"{round(price, precision)}"
+
     return bool(r)
 
 # -----------------------
@@ -221,33 +234,25 @@ def reset_tp_sl(symbol, position_side=None):
         })
 
 def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT):
-    # -----------------------
-    # 1. Position finden
-    # -----------------------
+    # 1. Position suchen (wie gehabt)
     pos = None
-    for _ in range(8):
+    for _ in range(5):
         positions = get_positions()
-        for p in positions:
-            side = detect_side(p)
-            if not side:
-                continue
-            if p["symbol"] == symbol and (desired_side is None or side == desired_side):
-                pos = p
-                break
-        if pos:
-            break
-        time.sleep(0.3)
+        pos = next((p for p in positions if p["symbol"] == symbol and (desired_side is None or detect_side(p) == desired_side)), None)
+        if pos: break
+        time.sleep(0.5)
 
     if not pos:
-        log.info("[TP/SL] Position nicht gefunden für %s", symbol)
+        log.warning(f"[TP/SL] Keine Position für {symbol} gefunden.")
         return False
 
     side = detect_side(pos)
     entry = float(pos["avgPrice"])
+    
+    # Präzision von BingX holen
+    precision = get_symbol_precision(symbol)
 
-    # -----------------------
-    # 2. TP/SL Preise berechnen (direkt auf Entry)
-    # -----------------------
+    # 2. Preise berechnen
     if side == "LONG":
         tp_price = entry * (1 + tp_percent / 100.0)
         sl_price = entry * (1 - sl_percent / 100.0)
@@ -255,36 +260,27 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
         tp_price = entry * (1 - tp_percent / 100.0)
         sl_price = entry * (1 + sl_percent / 100.0)
 
-    # -----------------------
-    # 3. SL auf richtige Seite des aktuellen Preises ziehen
-    # -----------------------
-    current = get_price(symbol)
-    if current:
-        if side == "LONG" and sl_price >= current:
-            sl_price = current * 0.99
-        if side == "SHORT" and sl_price <= current:
-            sl_price = current * 1.01
+    # 3. Formatierung nach Tick Size
+    tp_str = format(round(tp_price, precision), 'f')
+    sl_str = format(round(sl_price, precision), 'f')
 
-    # -----------------------
-    # 4. Positions‑TP/SL setzen
-    # -----------------------
     params = {
         "symbol": symbol,
         "positionSide": side,
-        "takeProfit": f"{tp_price:.6f}",
-        "stopLoss": f"{sl_price:.6f}",
+        "takeProfit": tp_str,
+        "stopLoss": sl_str,
         "timestamp": str(int(time.time() * 1000))
     }
 
     r = api_request("POST", "/openApi/swap/v2/trade/setPositionTpSl", params)
-    log.info("[TP/SL DEBUG] Position TP/SL response: %s", r)
+    
+    if r and r.get("code") == 0:
+        log.info(f"[TP/SL] Erfolgreich für {symbol} ({side}): TP {tp_str}, SL {sl_str}")
+        return True
+    else:
+        log.error(f"[TP/SL] FEHLER für {symbol}: {r}")
+        return False
 
-    ok = bool(r and r.get("code") in (0, None))
-
-    log.info("[TP/SL] Position-TP/SL gesetzt für %s (%s) tp=%.6f sl=%.6f ok=%s",
-             symbol, side, tp_price, sl_price, ok)
-
-    return ok
 
 
 # -----------------------
