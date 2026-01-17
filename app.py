@@ -175,8 +175,8 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
             "timestamp": str(int(time.time() * 1000))
         })
 
-    place(tp, "TAKE_PROFIT_MARKET")
-    place(sl, "STOP_MARKET")
+    place(tp, "TAKE_PROFIT")
+    place(sl, "STOP")
 
 
 # ============================================================
