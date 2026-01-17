@@ -24,6 +24,8 @@ LEVERAGE = 20
 TRADE_SIZE = 1250
 TP_PERCENT = 1
 SL_PERCENT = 80
+TP_PERCENT_DEFAULT = 20
+SL_PERCENT_DEFAULT = 80
 
 # --- DCA SETTINGS ---
 DCA_INTERVAL = 5
@@ -314,7 +316,7 @@ def tp_sl_watcher():
                 if not has_tp or not has_sl:
                     print(f"[TP/SL WATCHER] Setze TP/SL neu für {symbol} ({side})")
                     reset_tp_sl(symbol, side)
-                    set_tp_sl(symbol, side)
+                    set_tp_sl(symbol, side, TP_PERCENT_DEFAULT, SL_PERCENT_DEFAULT)
 
         except Exception as e:
             print("[TP/SL WATCHER ERROR]", e)
