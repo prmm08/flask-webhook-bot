@@ -1,3 +1,5 @@
+#----------------- Working Skript WATCHER TP, SL, DCA Working 17.01.26 19.40 -------------------#
+
 import hmac
 import hashlib
 import requests
@@ -6,85 +8,41 @@ import urllib.parse
 import threading
 import time
 import json
-import sys
-import logging
-from pathlib import Path
-from flask import Flask, jsonify
+import pandas as pd
+import numpy as np
 
-# --- CONFIG / ENV ---
+from flask import Flask, request, jsonify
+import logging
+
+# --- API ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
-# --- LOGGING SETUP ---
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logger = logging.getLogger("tradingbot")
-logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-handler = logging.StreamHandler(sys.stdout)
-formatter = logging.Formatter("%(asctime)s %(levelname)s [TID=%(thread)d] %(name)s: %(message)s")
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-if os.getenv("LOG_FILE"):
-    fh = logging.FileHandler(os.getenv("LOG_FILE"))
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
-app = Flask(__name__)
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
+app = Flask(__name__)
 
 # --- DEFAULT SETTINGS ---
-LEVERAGE = int(os.getenv("LEVERAGE", 20))
-TRADE_SIZE = float(os.getenv("TRADE_SIZE", 20))
-TP_PERCENT = float(os.getenv("TP_PERCENT", 1))
-SL_PERCENT = float(os.getenv("SL_PERCENT", 40))
+LEVERAGE = 20
+TRADE_SIZE = 20
+TP_PERCENT = 1
+SL_PERCENT = 40
 
 # --- DCA SETTINGS ---
-DCA_INTERVAL = int(os.getenv("DCA_INTERVAL", 5))
-DCA_COUNT = int(os.getenv("DCA_COUNT", 5))
-DCA_DEVIATION_PERCENT = float(os.getenv("DCA_DEVIATION_PERCENT", 100))
-DCA_VOLUME_MULTIPLIER = float(os.getenv("DCA_VOLUME_MULTIPLIER", 2))
+DCA_INTERVAL = 5
+DCA_COUNT = 5
+DCA_DEVIATION_PERCENT = 100
+DCA_VOLUME_MULTIPLIER = 2
 
 active_dca = {}
 dca_lock = threading.Lock()
 last_dca_heartbeat = time.time()
 
-# --- RSI / WATCHLIST SETTINGS ---
-WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "BTC-USDT,ETH-USDT").split(",") if s.strip()]
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", 14))
-RSI_INTERVAL = os.getenv("RSI_INTERVAL", "1m")   # Kline-Intervall
-RSI_CHECK_INTERVAL = int(os.getenv("RSI_CHECK_INTERVAL", 60))  # Sekunden
+# --- WATCHER SETTINGS ---
+# Füge hier die Coins hinzu, die du beobachten möchtest, z.B. ["BTC-USDT", "ETH-USDT"]
+WATCHED_COINS = ["APR-USDT","C-USDT","COLLECT-USDT","DUSK-USDT","GRIFFAIN-USDT","ME-USDT","PIPPIN-USDT","SAND-USDT","USELESS-USDT","XPL-USDT"]
 
-rsi_state = {}
-rsi_lock = threading.Lock()
-
-# --- Safety / runtime flags ---
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
-MIN_RSI_DELTA = float(os.getenv("MIN_RSI_DELTA", "0.0"))
-
-# --- Resolved symbol persistence ---
-RESOLVED_MAP_FILE = os.getenv("RESOLVED_MAP_FILE", "resolved_symbols.json")
-_resolved_map_lock = threading.Lock()
-
-def load_resolved_map():
-    p = Path(RESOLVED_MAP_FILE)
-    if not p.exists():
-        return {}
-    try:
-        with p.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.warning("load_resolved_map failed: %s", e)
-        return {}
-
-def save_resolved_map(m):
-    try:
-        with open(RESOLVED_MAP_FILE, "w", encoding="utf-8") as f:
-            json.dump(m, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error("save_resolved_map failed: %s", e, exc_info=True)
-
-resolved_map = load_resolved_map()
 
 # --- SIGNATURE ---
 def sign_bingx(params):
@@ -93,9 +51,8 @@ def sign_bingx(params):
     else:
         items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
         query_string = urllib.parse.urlencode(items)
-    sig = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
-    logger.debug("sign_bingx query=%s signature=%s", query_string, sig)
-    return sig
+    return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+
 
 # --- API REQUEST ---
 def api_request(method, endpoint, params=None):
@@ -104,23 +61,17 @@ def api_request(method, endpoint, params=None):
     params = {} if params is None else dict(params)
     timeout = (5, 10)
 
-    logger.debug("API request start method=%s endpoint=%s params=%s", method, endpoint, params)
     if method == "GET":
         try:
             params_for_sign = dict(params)
             signature = sign_bingx(params_for_sign)
             params_for_sign["signature"] = signature
             query = urllib.parse.urlencode(params_for_sign)
-            full_url = f"{url}?{query}"
-            logger.debug("API GET url=%s", full_url)
-            response = requests.get(full_url, headers=headers, timeout=timeout)
-            logger.debug("HTTP GET %s -> status=%s body=%s", full_url, response.status_code, response.text[:4000])
+            response = requests.get(f"{url}?{query}", headers=headers, timeout=timeout)
             response.raise_for_status()
-            j = response.json()
-            logger.debug("API GET response keys=%s", list(j.keys()) if isinstance(j, dict) else type(j))
-            return j
+            return response.json()
         except Exception as e:
-            logger.error("API ERROR GET %s %s", endpoint, e, exc_info=True)
+            print("[API ERROR GET]", e)
             return None
 
     if method == "POST":
@@ -130,47 +81,30 @@ def api_request(method, endpoint, params=None):
                 params_for_sign["timestamp"] = str(int(time.time() * 1000))
             query = urllib.parse.urlencode(sorted((k, str(v)) for k, v in params_for_sign.items()))
             signature = sign_bingx(params_for_sign)
-            full_url = f"{url}?{query}&signature={signature}"
-            logger.debug("API POST url=%s", full_url)
-            response = requests.post(full_url, headers=headers, timeout=timeout)
-            logger.debug("HTTP POST %s -> status=%s body=%s", full_url, response.status_code, response.text[:4000])
+            response = requests.post(f"{url}?{query}&signature={signature}", headers=headers, timeout=timeout)
             response.raise_for_status()
-            j = response.json()
-            logger.debug("API POST response keys=%s", list(j.keys()) if isinstance(j, dict) else type(j))
-            return j
+            return response.json()
         except Exception as e:
-            logger.error("API ERROR POST %s %s", endpoint, e, exc_info=True)
+            print("[API ERROR POST]", e)
             return None
+
 
 # --- HELPERS ---
 def get_price(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-    if not r:
-        logger.debug("get_price no response for %s", symbol)
-        return None
     try:
-        price = float(r["data"]["price"])
-        logger.debug("get_price %s = %s", symbol, price)
-        return price
-    except Exception as e:
-        logger.error("get_price parse error for %s: %s", symbol, e, exc_info=True)
+        return float(r["data"]["price"])
+    except:
         return None
 
 def get_positions():
     ts = str(int(time.time() * 1000))
     r = api_request("GET", "/openApi/swap/v2/user/positions", {"timestamp": ts})
-    if not r:
-        logger.debug("get_positions no response")
-        return []
-    data = r.get("data", [])
-    logger.debug("get_positions count=%d", len(data) if isinstance(data, list) else 0)
-    return data
+    return r.get("data", []) if r else []
 
 def symbol_exists(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-    exists = bool(r and "data" in r and "price" in r["data"])
-    logger.debug("symbol_exists %s -> %s", symbol, exists)
-    return exists
+    return r and "data" in r and "price" in r["data"]
 
 def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     ts = str(int(time.time() * 1000))
@@ -180,16 +114,15 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     if side:
         params["side"] = side
     r = api_request("POST", "/openApi/swap/v2/trade/leverage", params)
-    ok = bool(r)
-    logger.debug("set_leverage_for_symbol %s leverage=%s ok=%s", symbol, leverage, ok)
-    return ok
+    return bool(r)
+
 
 # --- TP/SL ---
 def reset_tp_sl(symbol, position_side=None):
     ts = str(int(time.time() * 1000))
     r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "timestamp": ts})
     orders = r.get("data", {}).get("orders", []) if r else []
-    logger.debug("reset_tp_sl %s found_orders=%d", symbol, len(orders))
+
     for order in orders:
         pos_side = order.get("positionSide") or order.get("position")
         if position_side and pos_side != position_side:
@@ -199,7 +132,7 @@ def reset_tp_sl(symbol, position_side=None):
             continue
         api_request("POST", "/openApi/swap/v2/trade/cancelOrder",
                     {"orderId": oid, "symbol": symbol, "timestamp": str(int(time.time() * 1000))})
-        logger.info("reset_tp_sl cancelled order %s for %s", oid, symbol)
+
 
 def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT):
     pos = None
@@ -214,20 +147,19 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
         time.sleep(1)
 
     if not pos:
-        logger.warning("set_tp_sl position not found for %s", symbol)
+        print("[ERROR] Position nicht gefunden für TP/SL")
         return
 
     side = pos["positionSide"]
     entry = float(pos["avgPrice"])
-    logger.debug("set_tp_sl %s side=%s entry=%s", symbol, side, entry)
 
+    # avgPrice-Update abwarten
     for _ in range(10):
         time.sleep(0.8)
         new_pos = next((p for p in get_positions()
                         if p["symbol"] == symbol and p.get("positionSide") == side), None)
         if new_pos and abs(float(new_pos["avgPrice"]) - entry) > 0.0001:
             entry = float(new_pos["avgPrice"])
-            logger.debug("set_tp_sl updated entry to %s", entry)
             break
 
     tp = entry * (1 + tp_percent / 100) if side == "LONG" else entry * (1 - tp_percent / 100)
@@ -246,14 +178,14 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
             "closePosition": "true",
             "timestamp": str(int(time.time() * 1000))
         })
-        logger.info("set_tp_sl placed %s for %s at %s", otype, symbol, price)
 
     place(tp, "TAKE_PROFIT_MARKET")
     place(sl, "STOP_MARKET")
 
 # ============================================================
-#   DCA ENGINE
+#   DCA ENGINE — STABILE VERSION
 # ============================================================
+
 def update_entry(symbol, side):
     positions = get_positions()
     pos = next((p for p in positions
@@ -264,9 +196,7 @@ def update_entry(symbol, side):
 
 def calculate_dca_qty(base_trade_size, executed, current_price):
     multiplier = DCA_VOLUME_MULTIPLIER ** (executed + 1)
-    qty = round((base_trade_size * multiplier) / current_price, 6)
-    logger.debug("calculate_dca_qty base=%s executed=%s price=%s qty=%s", base_trade_size, executed, current_price, qty)
-    return qty
+    return round((base_trade_size * multiplier) / current_price, 6)
 
 def should_trigger_dca(side, current, entry_static, deviation_percent):
     if side == "LONG":
@@ -276,10 +206,13 @@ def should_trigger_dca(side, current, entry_static, deviation_percent):
 
 def monitor_dca():
     global last_dca_heartbeat
+
     while True:
         last_dca_heartbeat = time.time()
+
         try:
             positions = get_positions()
+
             for pos in positions:
                 symbol = pos["symbol"]
                 side = pos["positionSide"]
@@ -303,7 +236,6 @@ def monitor_dca():
                             "tp_percent": TP_PERCENT,
                             "sl_percent": SL_PERCENT
                         }
-                        logger.debug("monitor_dca initialized active_dca for %s: %s", symbol, active_dca[symbol])
 
                     d = active_dca[symbol]
 
@@ -327,7 +259,6 @@ def monitor_dca():
                     "quantity": str(qty),
                     "timestamp": str(int(time.time() * 1000))
                 })
-                logger.info("monitor_dca placed DCA order %s qty=%s", symbol, qty)
 
                 with dca_lock:
                     d["executed"] += 1
@@ -339,22 +270,29 @@ def monitor_dca():
                 set_tp_sl(symbol, side, d["tp_percent"], d["sl_percent"])
 
         except Exception as e:
-            logger.error("DCA ERROR %s", e, exc_info=True)
+            print("[DCA ERROR]", e)
 
         time.sleep(DCA_INTERVAL)
 
+
 # ============================================================
-#   TP/SL WATCHER
+#   TP/SL WATCHER — setzt fehlende TP/SL neu
 # ============================================================
+
 def tp_sl_watcher():
     while True:
         try:
             positions = get_positions()
-            logger.debug("[TP/SL WATCHER] Prüfe Positionen... ID=%s", threading.get_ident())
+
+            print("[TP/SL WATCHER] Prüfe Positionen...")
+            print(f"[WATCHER THREAD] ID={threading.get_ident()}")
+            print("[TP/SL WATCHER]", time.strftime("%H:%M:%S"))
+
             for pos in positions:
                 symbol = pos["symbol"]
                 side = pos["positionSide"]
                 amt = float(pos["positionAmt"])
+
                 if amt == 0:
                     continue
 
@@ -366,56 +304,55 @@ def tp_sl_watcher():
                 has_tp = any(o.get("type") == "TAKE_PROFIT_MARKET" and o.get("positionSide") == side for o in orders)
                 has_sl = any(o.get("type") == "STOP_MARKET" and o.get("positionSide") == side for o in orders)
 
-                logger.debug("TP/SL WATCHER %s %s TP=%s SL=%s", symbol, side, has_tp, has_sl)
+                print(f"[TP/SL WATCHER] {symbol} {side} TP={has_tp} SL={has_sl}")
 
                 if not has_tp or not has_sl:
-                    logger.info("TP/SL WATCHER Setze TP/SL neu für %s (%s)", symbol, side)
+                    print(f"[TP/SL WATCHER] Setze TP/SL neu für {symbol} ({side})")
                     reset_tp_sl(symbol, side)
+                    set_tp_sl(symbol, side)
 
         except Exception as e:
-            logger.error("TP/SL WATCHER ERROR %s", e, exc_info=True)
+            print("[TP/SL WATCHER ERROR]", e)
 
         time.sleep(10)
 
 # ============================================================
-#   execute_trade
+#   execute_trade() MIT DCA-INTEGRATION
 # ============================================================
+
 def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
-    logger.info("execute_trade called symbol=%s direction=%s leverage=%s trade_size=%s", symbol, direction, leverage, trade_size)
     if not symbol_exists(symbol):
-        logger.warning("execute_trade abort symbol does not exist %s", symbol)
+        print("[ERROR] Symbol existiert nicht:", symbol)
         return
 
     positions = get_positions()
-    if any(p["symbol"] == symbol and p.get("positionSide") == direction and float(p.get("positionAmt", 0)) != 0 for p in positions):
-        logger.info("execute_trade skip position already open %s %s", symbol, direction)
+    if any(p["symbol"] == symbol and p.get("positionSide") == direction and float(p["positionAmt"]) != 0 for p in positions):
+        print(f"[SKIP] Position {direction} für {symbol} bereits offen. Kein neuer Trade durch RSI Watcher.")
         return
 
     price = get_price(symbol)
     if not price:
-        logger.warning("execute_trade abort no price for %s", symbol)
+        print("[ERROR] Kein Preis")
         return
 
-    logger.debug("execute_trade price=%s", price)
     if not set_leverage_for_symbol(symbol, leverage, direction, "BUY" if direction == "LONG" else "SELL"):
-        logger.error("execute_trade leverage error for %s", symbol)
+        print("[ERROR] Leverage Fehler")
         return
 
     qty = round(trade_size / price, 6)
-    logger.info("Placing market order %s qty=%s", symbol, qty)
 
-    if DRY_RUN:
-        logger.info("DRY_RUN enabled — skipping real order placement for %s", symbol)
-    else:
-        api_request("POST", "/openApi/swap/v2/trade/order", {
-            "symbol": symbol,
-            "side": "BUY" if direction == "LONG" else "SELL",
-            "positionSide": direction,
-            "type": "MARKET",
-            "quantity": str(qty),
-            "timestamp": str(int(time.time() * 1000))
-        })
+    # Hier wird die Order ausgeführt
+    api_request("POST", "/openApi/swap/v2/trade/order", {
+        "symbol": symbol,
+        "side": "BUY" if direction == "LONG" else "SELL",
+        "positionSide": direction,
+        "type": "MARKET",
+        "quantity": str(qty),
+        "timestamp": str(int(time.time() * 1000))
+    })
+    print(f"[TRADE EXECUTED] {direction} {symbol} QTY: {qty} via RSI Watcher")
 
+    # Initialisiere DCA und setze TP/SL
     with dca_lock:
         active_dca[symbol] = {
             "side": direction,
@@ -426,32 +363,164 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
             "tp_percent": tp_percent,
             "sl_percent": sl_percent
         }
-        logger.debug("execute_trade active_dca set for %s: %s", symbol, active_dca[symbol])
 
     time.sleep(2)
     reset_tp_sl(symbol, direction)
     set_tp_sl(symbol, direction, tp_percent, sl_percent)
 
+
 # ============================================================
-#   KLINES / HYBRID RSI
+#   RSI WATCHER LOGIC (NEU)
 # ============================================================
-def get_klines_raw_try_endpoint(symbol, endpoint, interval="1m", limit=100):
-    params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
-    logger.debug("get_klines try endpoint=%s symbol=%s", endpoint, symbol)
-    r = api_request("GET", endpoint, params)
-    logger.debug("get_klines raw response for %s @ %s: %s", symbol, endpoint, json.dumps(r, default=str)[:4000])
-    if not r:
+
+def get_klines(symbol, interval="1m", limit=15):
+    """Holt Kerzendaten (OHLCV) von BingX für RSI-Berechnung."""
+    # Wir brauchen mindestens 14 Kerzen für den RSI(14)
+    r = api_request("GET", "/openApi/swap/v2/market/kline", {
+        "symbol": symbol,
+        "intervalTime": interval,
+        "limit": limit
+    })
+    if r and "data" in r:
+        # Datenformat: [timestamp, open, high, low, close, volume, ...]
+        # Wir extrahieren die Close-Preise
+        closes = [float(kline[4]) for kline in r["data"]]
+        return closes
+    return None
+
+def calculate_rsi(closes):
+    """Berechnet den RSI (Relative Strength Index) aus einer Liste von Close-Preisen."""
+    if len(closes) < 14:
         return None
-    code = r.get("code")
-    if code == 100400:
-        logger.info("Endpoint %s not available for %s (code=100400).", endpoint, symbol)
-        return {"error_code": 100400, "response": r}
-    data = r.get("data")
-    if not data:
-        return None
-    closes = None
-    if isinstance(data, list) and len(data) and isinstance(data[0], dict) and "close" in data[0]:
+    df = pd.Series(closes)
+    delta = df.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    # Gibt den letzten (aktuellsten) RSI-Wert zurück
+    return rsi.iloc[-1]
+
+def rsi_watcher_thread():
+    print("[RSI WATCHER] Thread gestartet.")
+    while True:
         try:
-            closes = [float(item["close"]) for item in data]
+            for symbol in WATCHED_COINS:
+                closes = get_klines(symbol, limit=15)
+                if closes is None or len(closes) < 14:
+                    print(f"[RSI WATCHER ERROR] Nicht genug Daten für {symbol}")
+                    continue
+                
+                # Den RSI der VORLETZTEN Kerze (Index -2) und der LETZTEN Kerze (Index -1) berechnen
+                rsi_prev = calculate_rsi(closes[:-1])
+                rsi_current = calculate_rsi(closes)
+                
+                if rsi_prev is None or rsi_current is None:
+                    continue
+
+                print(f"[RSI WATCHER] {symbol} RSI: Vorher: {rsi_prev:.2f}, Aktuell: {rsi_current:.2f}")
+
+                # --- RSI crossing up 30 LONG ---
+                if rsi_prev <= 30 < rsi_current:
+                    print(f"[SIGNAL] LONG für {symbol} (RSI crossing up 30)")
+                    # Führt den Trade in einem neuen Thread aus, um den Watcher nicht zu blockieren
+                    threading.Thread(
+                        target=execute_trade,
+                        args=(symbol, "LONG", LEVERAGE, TRADE_SIZE, TP_PERCENT, SL_PERCENT)
+                    ).start()
+                
+                # --- RSI crossing down 70 SHORT ---
+                elif rsi_prev >= 70 > rsi_current:
+                    print(f"[SIGNAL] SHORT für {symbol} (RSI crossing down 70)")
+                    # Führt den Trade in einem neuen Thread aus, um den Watcher nicht zu blockieren
+                    threading.Thread(
+                        target=execute_trade,
+                        args=(symbol, "SHORT", LEVERAGE, TRADE_SIZE, TP_PERCENT, SL_PERCENT)
+                    ).start()
+
         except Exception as e:
-            logger.error("get
+            print(f"[RSI WATCHER CRASH]", e)
+            
+        # Prüfe jede Minute (60 Sekunden)
+        time.sleep(60)
+
+
+# ============================================================
+#   FLASK + THREADS
+# ============================================================
+
+@app.route("/testorder", methods=["POST"])
+def webhook():
+    data = request.get_json(silent=True) or {}
+
+    currency = str(data.get("currency", "")).upper()
+    direction = str(data.get("direction", "")).upper()
+    if not currency or direction not in ("LONG", "SHORT"):
+        return jsonify({"status": "ignored"}), 200
+
+    symbol = f"{currency}-USDT"
+    leverage = int(data.get("leverage", LEVERAGE))
+    trade_size = float(data.get("trade_size", TRADE_SIZE))
+    tp_percent = float(data.get("tp_percent", TP_PERCENT))
+    sl_percent = float(data.get("sl_percent", SL_PERCENT))
+
+    threading.Thread(
+        target=execute_trade,
+        args=(symbol, direction, leverage, trade_size, tp_percent, sl_percent)
+    ).start()
+
+    return jsonify({"status": "processing"}), 200
+
+
+@app.route("/ping")
+def ping():
+    return "pong", 200
+
+
+def keep_alive():
+    url = os.getenv("SELF_PING_URL")
+    if not url:
+        print("[KEEPALIVE] Kein SELF_PING_URL gesetzt")
+        return
+    while True:
+        try:
+            requests.get(url, timeout=5)
+        except:
+            pass
+        time.sleep(240)
+
+
+def start_dca_thread():
+    while True:
+        try:
+            monitor_dca()
+        except Exception as e:
+            print("[DCA CRASH]", e)
+            time.sleep(3)
+
+
+def dca_watchdog():
+    global last_dca_heartbeat
+    while True:
+        if time.time() - last_dca_heartbeat > 15:
+            print("[WATCHDOG] DCA Thread hängt → Neustart")
+            threading.Thread(target=start_dca_thread, daemon=True).start()
+            last_dca_heartbeat = time.time()
+        time.sleep(5)
+
+
+if __name__ == "__main__":
+    if not API_KEY or not API_SECRET:
+        print("FEHLER: API Keys fehlen")
+    else:
+        # STARTE ALLE THREADS IN DAEMON MODE
+        threading.Thread(target=start_dca_thread, daemon=True).start()
+        threading.Thread(target=dca_watchdog, daemon=True).start()
+        threading.Thread(target=keep_alive, daemon=True).start()
+        threading.Thread(target=tp_sl_watcher, daemon=True).start()
+        # >>> NEUER THREAD HIER STARTEN <<<
+        threading.Thread(target=rsi_watcher_thread, daemon=True).start()
+
+
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
