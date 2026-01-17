@@ -196,11 +196,19 @@ def calculate_dca_qty(base_trade_size, executed, current_price):
     return round((base_trade_size * multiplier) / current_price, 6)
 
 
-def should_trigger_dca(side, current, entry_static, deviation_percent):
+def should_trigger_dca(side, current, entry_ref, deviation_percent):
+    deviation = deviation_percent / 100
+
     if side == "LONG":
-        return current <= entry_static * (1 - deviation_percent / 100)
-    else:
-        return current >= entry_static * (1 + deviation_percent / 100)
+        # Preis fällt unter Entry → DCA
+        return current <= entry_ref * (1 - deviation)
+
+    if side == "SHORT":
+        # Preis steigt über Entry → DCA
+        return current >= entry_ref * (1 + deviation)
+
+    return False
+
 
 
 def monitor_dca():
@@ -241,7 +249,7 @@ def monitor_dca():
                 if d["executed"] >= DCA_COUNT:
                     continue
 
-                if not should_trigger_dca(side, current_price, d["entry_static"], DCA_DEVIATION_PERCENT):
+                if not should_trigger_dca(side, current_price, d["entry_dynamic"], DCA_DEVIATION_PERCENT):
                     continue
 
                 qty = calculate_dca_qty(
