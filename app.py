@@ -22,10 +22,9 @@ app = Flask(__name__)
 # --- DEFAULT SETTINGS ---
 LEVERAGE = 20
 TRADE_SIZE = 1250
-TP_PERCENT = 1
+TP_PERCENT = 20
 SL_PERCENT = 80
-TP_PERCENT_DEFAULT = 20
-SL_PERCENT_DEFAULT = 80
+
 
 # --- DCA SETTINGS ---
 DCA_INTERVAL = 5
@@ -316,7 +315,7 @@ def tp_sl_watcher():
                 if not has_tp or not has_sl:
                     print(f"[TP/SL WATCHER] Setze TP/SL neu für {symbol} ({side})")
                     reset_tp_sl(symbol, side)
-                    set_tp_sl(symbol, side, TP_PERCENT_DEFAULT, SL_PERCENT_DEFAULT)
+                    set_tp_sl(symbol, side, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT)
 
         except Exception as e:
             print("[TP/SL WATCHER ERROR]", e)
@@ -328,7 +327,7 @@ def tp_sl_watcher():
 #   execute_trade() MIT DCA-INTEGRATION
 # ============================================================
 
-def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
+def execute_trade(symbol, direction, leverage, trade_size, TP_PERCENT, SL_PERCENT):
     if not symbol_exists(symbol):
         print("[ERROR] Symbol existiert nicht:", symbol)
         return
