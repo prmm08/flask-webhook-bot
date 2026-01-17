@@ -283,6 +283,8 @@ def tp_sl_watcher():
         try:
             positions = get_positions()
 
+            print("[TP/SL WATCHER] Prüfe Positionen...")
+
             for pos in positions:
                 symbol = pos["symbol"]
                 side = pos["positionSide"]
@@ -299,6 +301,8 @@ def tp_sl_watcher():
                 has_tp = any(o.get("type") == "TAKE_PROFIT_MARKET" and o.get("positionSide") == side for o in orders)
                 has_sl = any(o.get("type") == "STOP_MARKET" and o.get("positionSide") == side for o in orders)
 
+                print(f"[TP/SL WATCHER] {symbol} {side} TP={has_tp} SL={has_sl}")
+
                 if not has_tp or not has_sl:
                     print(f"[TP/SL WATCHER] Setze TP/SL neu für {symbol} ({side})")
                     reset_tp_sl(symbol, side)
@@ -308,6 +312,7 @@ def tp_sl_watcher():
             print("[TP/SL WATCHER ERROR]", e)
 
         time.sleep(10)
+
 
 
 # ============================================================
