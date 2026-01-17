@@ -8,7 +8,7 @@ import time
 import json
 import sys
 import logging
-
+from pathlib import Path
 from flask import Flask, jsonify
 
 # --- CONFIG / ENV ---
@@ -50,13 +50,41 @@ dca_lock = threading.Lock()
 last_dca_heartbeat = time.time()
 
 # --- RSI / WATCHLIST SETTINGS ---
-WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "APR-USDT,C-USDT,COLLECT-USDT,DUSK-USDT,GRIFFAIN-USDT,ME-USDT,PIPPIN-USDT,SAND-USDT,USELESS-USDT,XPL-USDT").split(",") if s.strip()]
+WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "BTC-USDT,ETH-USDT").split(",") if s.strip()]
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", 14))
 RSI_INTERVAL = os.getenv("RSI_INTERVAL", "1m")   # Kline-Intervall
 RSI_CHECK_INTERVAL = int(os.getenv("RSI_CHECK_INTERVAL", 60))  # Sekunden
 
 rsi_state = {}
 rsi_lock = threading.Lock()
+
+# --- Safety / runtime flags ---
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+MIN_RSI_DELTA = float(os.getenv("MIN_RSI_DELTA", "0.0"))
+
+# --- Resolved symbol persistence ---
+RESOLVED_MAP_FILE = os.getenv("RESOLVED_MAP_FILE", "resolved_symbols.json")
+_resolved_map_lock = threading.Lock()
+
+def load_resolved_map():
+    p = Path(RESOLVED_MAP_FILE)
+    if not p.exists():
+        return {}
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning("load_resolved_map failed: %s", e)
+        return {}
+
+def save_resolved_map(m):
+    try:
+        with open(RESOLVED_MAP_FILE, "w", encoding="utf-8") as f:
+            json.dump(m, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error("save_resolved_map failed: %s", e, exc_info=True)
+
+resolved_map = load_resolved_map()
 
 # --- SIGNATURE ---
 def sign_bingx(params):
@@ -193,7 +221,6 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     entry = float(pos["avgPrice"])
     logger.debug("set_tp_sl %s side=%s entry=%s", symbol, side, entry)
 
-    # avgPrice-Update abwarten
     for _ in range(10):
         time.sleep(0.8)
         new_pos = next((p for p in get_positions()
@@ -225,7 +252,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     place(sl, "STOP_MARKET")
 
 # ============================================================
-#   DCA ENGINE — STABILE VERSION
+#   DCA ENGINE
 # ============================================================
 def update_entry(symbol, side):
     positions = get_positions()
@@ -317,7 +344,7 @@ def monitor_dca():
         time.sleep(DCA_INTERVAL)
 
 # ============================================================
-#   TP/SL WATCHER — setzt fehlende TP/SL neu
+#   TP/SL WATCHER
 # ============================================================
 def tp_sl_watcher():
     while True:
@@ -344,7 +371,6 @@ def tp_sl_watcher():
                 if not has_tp or not has_sl:
                     logger.info("TP/SL WATCHER Setze TP/SL neu für %s (%s)", symbol, side)
                     reset_tp_sl(symbol, side)
-                    set_tp_sl(symbol, side)
 
         except Exception as e:
             logger.error("TP/SL WATCHER ERROR %s", e, exc_info=True)
@@ -352,7 +378,7 @@ def tp_sl_watcher():
         time.sleep(10)
 
 # ============================================================
-#   execute_trade() MIT DCA-INTEGRATION
+#   execute_trade
 # ============================================================
 def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
     logger.info("execute_trade called symbol=%s direction=%s leverage=%s trade_size=%s", symbol, direction, leverage, trade_size)
@@ -361,7 +387,7 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
         return
 
     positions = get_positions()
-    if any(p["symbol"] == symbol and p.get("positionSide") == direction and float(p.get("positionAmt")) != 0 for p in positions):
+    if any(p["symbol"] == symbol and p.get("positionSide") == direction and float(p.get("positionAmt", 0)) != 0 for p in positions):
         logger.info("execute_trade skip position already open %s %s", symbol, direction)
         return
 
@@ -378,14 +404,17 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
     qty = round(trade_size / price, 6)
     logger.info("Placing market order %s qty=%s", symbol, qty)
 
-    api_request("POST", "/openApi/swap/v2/trade/order", {
-        "symbol": symbol,
-        "side": "BUY" if direction == "LONG" else "SELL",
-        "positionSide": direction,
-        "type": "MARKET",
-        "quantity": str(qty),
-        "timestamp": str(int(time.time() * 1000))
-    })
+    if DRY_RUN:
+        logger.info("DRY_RUN enabled — skipping real order placement for %s", symbol)
+    else:
+        api_request("POST", "/openApi/swap/v2/trade/order", {
+            "symbol": symbol,
+            "side": "BUY" if direction == "LONG" else "SELL",
+            "positionSide": direction,
+            "type": "MARKET",
+            "quantity": str(qty),
+            "timestamp": str(int(time.time() * 1000))
+        })
 
     with dca_lock:
         active_dca[symbol] = {
@@ -404,313 +433,25 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
     set_tp_sl(symbol, direction, tp_percent, sl_percent)
 
 # ============================================================
-#   KLINES / RSI BERECHNUNG UND MONITOR
+#   KLINES / HYBRID RSI
 # ============================================================
 def get_klines_raw_try_endpoint(symbol, endpoint, interval="1m", limit=100):
     params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
     logger.debug("get_klines try endpoint=%s symbol=%s", endpoint, symbol)
     r = api_request("GET", endpoint, params)
     logger.debug("get_klines raw response for %s @ %s: %s", symbol, endpoint, json.dumps(r, default=str)[:4000])
-    # return parsed closes or None
     if not r:
         return None
-    # If API explicitly says endpoint not exist, bubble up code for fallback logic
     code = r.get("code")
     if code == 100400:
-        logger.info("Endpoint %s not available for %s (code=100400). Will try alternatives.", endpoint, symbol)
+        logger.info("Endpoint %s not available for %s (code=100400).", endpoint, symbol)
         return {"error_code": 100400, "response": r}
     data = r.get("data")
     if not data:
         return None
-    # parsing same as before
     closes = None
     if isinstance(data, list) and len(data) and isinstance(data[0], dict) and "close" in data[0]:
         try:
             closes = [float(item["close"]) for item in data]
         except Exception as e:
-            logger.error("parse dict-list error %s", e, exc_info=True)
-    elif isinstance(data, list) and len(data) and isinstance(data[0], list):
-        try:
-            closes = [float(item[4]) for item in data]
-        except Exception as e:
-            logger.error("parse list-of-lists error %s", e, exc_info=True)
-    elif isinstance(data, dict):
-        for key in ("klines", "candles", "items"):
-            if key in data and isinstance(data[key], list):
-                first = data[key][0]
-                if isinstance(first, dict) and "close" in first:
-                    try:
-                        closes = [float(x["close"]) for x in data[key]]
-                    except Exception as e:
-                        logger.error("parse dict inside data error %s", e, exc_info=True)
-                elif isinstance(first, list):
-                    try:
-                        closes = [float(x[4]) for x in data[key]]
-                    except Exception as e:
-                        logger.error("parse list inside data error %s", e, exc_info=True)
-    if closes:
-        logger.debug("get_klines parsed %s closes_count=%d last_close=%s", symbol, len(closes), closes[-1])
-        return closes
-    logger.warning("get_klines could not parse closes for %s", symbol)
-    return None
-
-def get_klines_with_fallback(symbol, interval="1m", limit=100):
-    """
-    Versucht mehrere Endpoints und Symbol-Varianten, falls Standard-Aufruf fehlschlägt.
-    Reihenfolge:
-      1) swap kline (bestehend)
-      2) spot kline
-      3) symbol-varianten (ohne '-', mit '/', zusammengefügt)
-    """
-    tried = []
-    # candidate endpoints to try (swap first, then spot)
-    endpoints = [
-        "/openApi/swap/v2/quote/kline",   # original
-        "/openApi/spot/v1/market/kline",  # alternative spot endpoint (häufig)
-        "/openApi/spot/v1/market/kline"   # duplicate placeholder if needed to add others
-    ]
-
-    # candidate symbol variants
-    variants = [symbol]
-    if "-" in symbol:
-        variants.append(symbol.replace("-", ""))
-        variants.append(symbol.replace("-", "/"))
-        variants.append(symbol.split("-")[0] + "USDT")
-    else:
-        if symbol.endswith("USDT"):
-            variants.append(symbol.replace("USDT", "-USDT"))
-
-    # try endpoints x variants
-    for ep in endpoints:
-        for v in variants:
-            if not v:
-                continue
-            tried.append((ep, v))
-            res = get_klines_raw_try_endpoint(v, ep, interval, limit)
-            # if API explicitly returned code 100400 for this endpoint, skip to next endpoint
-            if isinstance(res, dict) and res.get("error_code") == 100400:
-                logger.info("Endpoint %s not supported for symbol %s, trying next endpoint/variant", ep, v)
-                continue
-            if res:
-                logger.info("get_klines_with_fallback success endpoint=%s symbol=%s", ep, v)
-                return res
-    logger.warning("get_klines_with_fallback: keine Variante lieferte Kerzen für %s (tried: %s)", symbol, tried)
-    return None
-
-
-def compute_rsi(closes, period=RSI_PERIOD):
-    if not closes or len(closes) < period + 1:
-        logger.debug("compute_rsi not enough closes len=%s period=%s", len(closes) if closes else 0, period)
-        return None
-
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [d if d > 0 else 0 for d in deltas]
-    losses = [-d if d < 0 else 0 for d in deltas]
-
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    logger.debug("compute_rsi initial avg_gain=%.6f avg_loss=%.6f", avg_gain, avg_loss)
-
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-
-    if avg_loss == 0:
-        logger.debug("compute_rsi avg_loss==0 returning 100")
-        return 100.0
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    logger.debug("compute_rsi result rsi=%.4f", rsi)
-    return rsi
-
-def get_latest_two_rsi(symbol, interval=RSI_INTERVAL, period=RSI_PERIOD):
-    closes = get_klines_with_fallback(symbol, interval=interval, limit=period + 5)
-    if not closes or len(closes) < period + 2:
-        logger.debug("get_latest_two_rsi not enough closes for %s len=%s", symbol, len(closes) if closes else 0)
-        return None, None
-    rsi_prev = compute_rsi(closes[:-1], period)
-    rsi_now = compute_rsi(closes, period)
-    logger.debug("get_latest_two_rsi %s rsi_prev=%s rsi_now=%s", symbol, rsi_prev, rsi_now)
-    return rsi_prev, rsi_now
-
-def check_and_trigger_rsi():
-    for symbol in WATCHLIST:
-        symbol = symbol.strip()
-        try:
-            # Resolve symbol used for API calls (falls du resolve_symbol implementiert hast)
-            resolved = None
-            try:
-                resolved = resolve_symbol(symbol) if 'resolve_symbol' in globals() else symbol
-            except Exception:
-                resolved = symbol
-
-            rsi_prev, rsi_now = get_latest_two_rsi(resolved or symbol, interval=RSI_INTERVAL, period=RSI_PERIOD)
-            logger.debug("RSI check %s resolved=%s rsi_prev=%s rsi_now=%s", symbol, resolved, rsi_prev, rsi_now)
-
-            if rsi_prev is None or rsi_now is None:
-                logger.info("RSI skip %s not enough data rsi_prev=%s rsi_now=%s", symbol, rsi_prev, rsi_now)
-                continue
-
-            # compute cross booleans explicitly
-            cross_up_30 = (rsi_prev < 30 and rsi_now >= 30)
-            cross_down_70 = (rsi_prev > 70 and rsi_now <= 70)
-
-            # extra safety: require rsi_now to actually be >=30 for long, <=70 for short
-            safe_long = cross_up_30 and (rsi_now >= 30)
-            safe_short = cross_down_70 and (rsi_now <= 70)
-
-            # optional: require a minimum change to avoid tiny oscillations
-            MIN_RSI_DELTA = float(os.getenv("MIN_RSI_DELTA", "0.0"))
-            if MIN_RSI_DELTA > 0:
-                safe_long = safe_long and ((rsi_now - rsi_prev) >= MIN_RSI_DELTA)
-                safe_short = safe_short and ((rsi_prev - rsi_now) >= MIN_RSI_DELTA)
-
-            # get positions using the same resolved symbol to avoid mismatch
-            positions = get_positions()
-            has_long = any(p["symbol"] == (resolved or symbol) and p.get("positionSide") == "LONG" and float(p.get("positionAmt", 0)) != 0 for p in positions)
-            has_short = any(p["symbol"] == (resolved or symbol) and p.get("positionSide") == "SHORT" and float(p.get("positionAmt", 0)) != 0 for p in positions)
-
-            logger.debug("RSI decision %s resolved=%s cross_up_30=%s cross_down_70=%s safe_long=%s safe_short=%s has_long=%s has_short=%s last_signal=%s",
-                         symbol, resolved, cross_up_30, cross_down_70, safe_long, safe_short, has_long, has_short, rsi_state.get(symbol, {}).get("last_signal"))
-
-            # LONG
-            if safe_long and not has_long:
-                with rsi_lock:
-                    last_signal = rsi_state.get(symbol, {}).get("last_signal")
-                    if last_signal == "LONG":
-                        logger.info("RSI skip LONG %s because last_signal already LONG", symbol)
-                    else:
-                        logger.info("RSI trigger LONG %s rsi_prev=%.4f rsi_now=%.4f", symbol, rsi_prev, rsi_now)
-                        order_payload = {
-                            "symbol": resolved or symbol,
-                            "side": "BUY",
-                            "positionSide": "LONG",
-                            "type": "MARKET",
-                            "quantity": "DRYRUN" if os.getenv("DRY_RUN", "false").lower() == "true" else "CALCULATED"
-                        }
-                        logger.debug("Order payload (preview) for %s: %s", symbol, order_payload)
-                        if os.getenv("DRY_RUN", "false").lower() == "true":
-                            logger.info("DRY_RUN enabled — not placing real order for %s", symbol)
-                        else:
-                            threading.Thread(target=execute_trade, args=(resolved or symbol, "LONG", LEVERAGE, TRADE_SIZE, TP_PERCENT, SL_PERCENT)).start()
-                        rsi_state[symbol] = {"last_rsi": rsi_now, "last_signal": "LONG"}
-                        continue
-
-            # SHORT
-            if safe_short and not has_short:
-                with rsi_lock:
-                    last_signal = rsi_state.get(symbol, {}).get("last_signal")
-                    if last_signal == "SHORT":
-                        logger.info("RSI skip SHORT %s because last_signal already SHORT", symbol)
-                    else:
-                        logger.info("RSI trigger SHORT %s rsi_prev=%.4f rsi_now=%.4f", symbol, rsi_prev, rsi_now)
-                        order_payload = {
-                            "symbol": resolved or symbol,
-                            "side": "SELL",
-                            "positionSide": "SHORT",
-                            "type": "MARKET",
-                            "quantity": "DRYRUN" if os.getenv("DRY_RUN", "false").lower() == "true" else "CALCULATED"
-                        }
-                        logger.debug("Order payload (preview) for %s: %s", symbol, order_payload)
-                        if os.getenv("DRY_RUN", "false").lower() == "true":
-                            logger.info("DRY_RUN enabled — not placing real order for %s", symbol)
-                        else:
-                            threading.Thread(target=execute_trade, args=(resolved or symbol, "SHORT", LEVERAGE, TRADE_SIZE, TP_PERCENT, SL_PERCENT)).start()
-                        rsi_state[symbol] = {"last_rsi": rsi_now, "last_signal": "SHORT"}
-                        continue
-
-            # update last_rsi if no trigger
-            with rsi_lock:
-                if symbol not in rsi_state:
-                    rsi_state[symbol] = {"last_rsi": rsi_now, "last_signal": None}
-                else:
-                    rsi_state[symbol]["last_rsi"] = rsi_now
-
-        except Exception as e:
-            logger.exception("RSI ERROR for %s", symbol)
-
-
-def rsi_monitor_loop():
-    while True:
-        try:
-            check_and_trigger_rsi()
-        except Exception as e:
-            logger.error("RSI MONITOR ERROR %s", e, exc_info=True)
-        time.sleep(RSI_CHECK_INTERVAL)
-
-# --- DEBUG: Symbol-Variantentest ---
-def debug_test_symbol_variants(symbol_base):
-    variants = [
-        symbol_base,
-        symbol_base.replace("-", ""),
-        symbol_base.replace("-", "/"),
-        (symbol_base.split("-")[0] + "USDT") if "-" in symbol_base else (symbol_base + "USDT"),
-        (symbol_base.replace("USDT", "-USDT") if "USDT" in symbol_base and "-" not in symbol_base else None)
-    ]
-    seen = set()
-    for v in variants:
-        if not v or v in seen:
-            continue
-        seen.add(v)
-        logger.info("DEBUG TEST trying variant: %s", v)
-        closes = get_klines_with_fallback(v, interval="1m", limit=20)
-        logger.info("DEBUG TEST %s -> closes_count=%s", v, len(closes) if closes else None)
-
-# --- KEEPALIVE (optional) ---
-def keep_alive():
-    url = os.getenv("SELF_PING_URL")
-    if not url:
-        logger.info("[KEEPALIVE] Kein SELF_PING_URL gesetzt")
-        return
-    while True:
-        try:
-            requests.get(url, timeout=5)
-            logger.debug("keep_alive pinged %s", url)
-        except Exception:
-            logger.warning("keep_alive ping failed", exc_info=True)
-        time.sleep(240)
-
-# --- DCA WATCHDOG ---
-def start_dca_thread():
-    while True:
-        try:
-            monitor_dca()
-        except Exception as e:
-            logger.error("DCA CRASH %s", e, exc_info=True)
-            time.sleep(3)
-
-def dca_watchdog():
-    global last_dca_heartbeat
-    while True:
-        if time.time() - last_dca_heartbeat > 15:
-            logger.warning("[WATCHDOG] DCA Thread hängt → Neustart")
-            threading.Thread(target=start_dca_thread, daemon=True).start()
-            last_dca_heartbeat = time.time()
-        time.sleep(5)
-
-# --- FLASK HEALTH ENDPOINT ---
-@app.route("/ping")
-def ping():
-    return "pong", 200
-
-# --- MAIN STARTUP ---
-if __name__ == "__main__":
-    if not API_KEY or not API_SECRET:
-        logger.error("FEHLER: API Keys fehlen")
-    else:
-        # Optional: beim Start kurz Symbol-Varianten testen (deaktiviere in Produktion)
-        try:
-            for s in WATCHLIST:
-                debug_test_symbol_variants(s)
-        except Exception:
-            logger.debug("debug_test_symbol_variants failed", exc_info=True)
-
-        # Threads starten (daemon)
-        threading.Thread(target=start_dca_thread, daemon=True).start()
-        threading.Thread(target=dca_watchdog, daemon=True).start()
-        threading.Thread(target=tp_sl_watcher, daemon=True).start()
-        threading.Thread(target=rsi_monitor_loop, daemon=True).start()
-        threading.Thread(target=keep_alive, daemon=True).start()
-
-        logger.info("Bot gestartet. Watchlist: %s", WATCHLIST)
-        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+            logger.error("get
