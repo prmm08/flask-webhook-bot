@@ -8,7 +8,6 @@ import urllib.parse
 import threading
 import time
 import json
-import numpy as np # Nur noch numpy für array-Operationen benötigt
 
 from flask import Flask, request, jsonify
 import logging
@@ -37,10 +36,6 @@ DCA_VOLUME_MULTIPLIER = 2
 active_dca = {}
 dca_lock = threading.Lock()
 last_dca_heartbeat = time.time()
-
-# --- WATCHER SETTINGS ---
-# Füge hier die Coins hinzu, die du beobachten möchtest, z.B. ["BTC-USDT", "ETH-USDT"]
-WATCHED_COINS = ["APR-USDT","C-USDT","COLLECT-USDT","DUSK-USDT","GRIFFAIN-USDT","ME-USDT","PIPPIN-USDT","SAND-USDT","USELESS-USDT","XPL-USDT"]
 
 
 # --- SIGNATURE ---
@@ -96,14 +91,17 @@ def get_price(symbol):
     except:
         return None
 
+
 def get_positions():
     ts = str(int(time.time() * 1000))
     r = api_request("GET", "/openApi/swap/v2/user/positions", {"timestamp": ts})
     return r.get("data", []) if r else []
 
+
 def symbol_exists(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     return r and "data" in r and "price" in r["data"]
+
 
 def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     ts = str(int(time.time() * 1000))
@@ -181,6 +179,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     place(tp, "TAKE_PROFIT_MARKET")
     place(sl, "STOP_MARKET")
 
+
 # ============================================================
 #   DCA ENGINE — STABILE VERSION
 # ============================================================
@@ -193,15 +192,18 @@ def update_entry(symbol, side):
         return float(pos["avgPrice"])
     return None
 
+
 def calculate_dca_qty(base_trade_size, executed, current_price):
     multiplier = DCA_VOLUME_MULTIPLIER ** (executed + 1)
     return round((base_trade_size * multiplier) / current_price, 6)
+
 
 def should_trigger_dca(side, current, entry_static, deviation_percent):
     if side == "LONG":
         return current <= entry_static * (1 - deviation_percent / 100)
     else:
         return current >= entry_static * (1 + deviation_percent / 100)
+
 
 def monitor_dca():
     global last_dca_heartbeat
@@ -287,6 +289,7 @@ def tp_sl_watcher():
             print(f"[WATCHER THREAD] ID={threading.get_ident()}")
             print("[TP/SL WATCHER]", time.strftime("%H:%M:%S"))
 
+
             for pos in positions:
                 symbol = pos["symbol"]
                 side = pos["positionSide"]
@@ -315,6 +318,8 @@ def tp_sl_watcher():
 
         time.sleep(10)
 
+
+
 # ============================================================
 #   execute_trade() MIT DCA-INTEGRATION
 # ============================================================
@@ -326,7 +331,7 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
 
     positions = get_positions()
     if any(p["symbol"] == symbol and p.get("positionSide") == direction and float(p["positionAmt"]) != 0 for p in positions):
-        print(f"[SKIP] Position {direction} für {symbol} bereits offen. Kein neuer Trade durch RSI Watcher.")
+        print("[SKIP] Position bereits offen:", symbol, direction)
         return
 
     price = get_price(symbol)
@@ -340,7 +345,6 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
 
     qty = round(trade_size / price, 6)
 
-    # Hier wird die Order ausgeführt
     api_request("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "side": "BUY" if direction == "LONG" else "SELL",
@@ -349,9 +353,7 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
         "quantity": str(qty),
         "timestamp": str(int(time.time() * 1000))
     })
-    print(f"[TRADE EXECUTED] {direction} {symbol} QTY: {qty} via RSI Watcher")
 
-    # Initialisiere DCA und setze TP/SL
     with dca_lock:
         active_dca[symbol] = {
             "side": direction,
@@ -366,98 +368,6 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
     time.sleep(2)
     reset_tp_sl(symbol, direction)
     set_tp_sl(symbol, direction, tp_percent, sl_percent)
-
-
-# ============================================================
-#   RSI WATCHER LOGIC (NEU)
-# ============================================================
-
-def get_klines(symbol, interval="1m", limit=16):
-    """Holt Kerzendaten (OHLCV) von BingX für RSI-Berechnung."""
-    # Wir brauchen 14 Perioden, 16 Klines geben uns genug Puffer für 2 RSI Werte
-    r = api_request("GET", "/openApi/swap/v2/market/kline", {
-        "symbol": symbol,
-        "intervalTime": interval,
-        "limit": limit 
-    })
-    if r and "data" in r:
-        closes = [float(kline) for kline in r["data"]]
-        return closes
-    return None
-
-def calculate_rsi_light(closes):
-    """Berechnet den RSI (Relative Strength Index) aus einer Liste von Close-Preisen ohne Pandas."""
-    # Source: Angepasste, effiziente Python/Numpy Implementierung
-    if len(closes) < 15: return None
-    closes = np.array(closes)
-    deltas = np.diff(closes)
-    seed = deltas[:14]
-    up = seed[seed > 0].sum() / 14
-    down = -seed[seed < 0].sum() / 14
-    rs = up / down
-
-    # Initialisiere RSI Array
-    rsi = np.zeros_like(closes)
-    rsi[:15] = 100. - 100. / (1. + rs)
-
-    # Berechne den Rest iterativ
-    for i in range(15, len(closes)):
-        delta = deltas[i - 1] # deltas hat N-1 Elemente
-        if delta > 0:
-            up_val, down_val = delta, 0.
-        else:
-            up_val, down_val = 0., -delta
-        up = (up * 13 + up_val) / 14
-        down = (down * 13 + down_val) / 14
-        rs = up / down
-        rsi[i] = 100. - 100. / (1. + rs)
-    
-    # Gibt den letzten (aktuellsten) RSI-Wert zurück
-    return rsi[-1]
-
-def rsi_watcher_thread():
-    print("[RSI WATCHER] Thread gestartet.")
-    while True:
-        try:
-            for symbol in WATCHED_COINS:
-                # Wir holen 16 Kerzen, um sicher 15 für die Berechnung zu haben
-                closes = get_klines(symbol, limit=16) 
-                if closes is None or len(closes) < 15:
-                    print(f"[RSI WATCHER ERROR] Nicht genug Daten für {symbol}. Habe {len(closes) if closes is not None else 0} Kerzen.")
-                    continue
-                
-                # Den RSI der VORLETZTEN Kerze (Index -2) und der LETZTEN Kerze (Index -1) berechnen
-                # Nutzt die neue, leichte Funktion
-                rsi_prev = calculate_rsi_light(closes[:-1])
-                rsi_current = calculate_rsi_light(closes)
-                
-                if rsi_prev is None or rsi_current is None:
-                    continue
-
-                print(f"[RSI WATCHER] {symbol} RSI: Vorher: {rsi_prev:.2f}, Aktuell: {rsi_current:.2f}")
-
-                # --- RSI crossing up 30 LONG ---
-                if rsi_prev <= 30 < rsi_current:
-                    print(f"[SIGNAL] LONG für {symbol} (RSI crossing up 30)")
-                    threading.Thread(
-                        target=execute_trade,
-                        args=(symbol, "LONG", LEVERAGE, TRADE_SIZE, TP_PERCENT, SL_PERCENT)
-                    ).start()
-                
-                # --- RSI crossing down 70 SHORT ---
-                elif rsi_prev >= 70 > rsi_current:
-                    print(f"[SIGNAL] SHORT für {symbol} (RSI crossing down 70)")
-                    threading.Thread(
-                        target=execute_trade,
-                        args=(symbol, "SHORT", LEVERAGE, TRADE_SIZE, TP_PERCENT, SL_PERCENT)
-                    ).start()
-
-        except Exception as e:
-            # Hier kann man das Logging verbessern, um den spezifischen Fehler zu sehen
-            print(f"[RSI WATCHER CRASH]", e)
-            
-        # Prüfe jede Minute (60 Sekunden)
-        time.sleep(60)
 
 
 # ============================================================
@@ -528,13 +438,9 @@ if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
         print("FEHLER: API Keys fehlen")
     else:
-        # STARTE ALLE THREADS IN DAEMON MODE
         threading.Thread(target=start_dca_thread, daemon=True).start()
         threading.Thread(target=dca_watchdog, daemon=True).start()
         threading.Thread(target=keep_alive, daemon=True).start()
         threading.Thread(target=tp_sl_watcher, daemon=True).start()
-        # >>> NEUER THREAD HIER STARTEN <<<
-        threading.Thread(target=rsi_watcher_thread, daemon=True).start()
-
 
         app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
