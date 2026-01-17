@@ -50,7 +50,7 @@ dca_lock = threading.Lock()
 last_dca_heartbeat = time.time()
 
 # --- RSI / WATCHLIST SETTINGS ---
-WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "APR-USDT,C-USDT,COLLECT-USDT,DUSK-USDT,GRIFFAIN-USDT,ME-USDT,PIPPIN-USDT,SAND-USDT,USELESS-USDT,XPL-USDT").split(",") if s.strip()]
+WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "APRUSDT,CUSDT,COLLECTUSDT,DUSKUSDT,GRIFFAINUSDT,MEUSDT,PIPPINUSDT,SANDUSDT,USELESSUSDT,XPLUSDT").split(",") if s.strip()]
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", 14))
 RSI_INTERVAL = os.getenv("RSI_INTERVAL", "1m")   # Kline-Intervall
 RSI_CHECK_INTERVAL = int(os.getenv("RSI_CHECK_INTERVAL", 60))  # Sekunden
