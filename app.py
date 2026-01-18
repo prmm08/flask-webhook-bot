@@ -21,7 +21,7 @@ app = Flask(__name__)
 
 # --- DEFAULT SETTINGS ---
 LEVERAGE = 20
-TRADE_SIZE = 20
+TRADE_SIZE = 40
 TP_PERCENT = 1
 SL_PERCENT = 40
 
