@@ -1,5 +1,3 @@
-#----------------- Working Skript WATCHER TP, SL, DCA Working 17.01.26 19.40 (angepasst) -------------------#
-
 import hmac
 import hashlib
 import requests
@@ -32,11 +30,14 @@ DCA_INTERVAL = 5
 DCA_COUNT = 5
 DCA_DEVIATION_PERCENT = 5  # angepasst auf 5% Trigger
 DCA_VOLUME_MULTIPLIER = 2
+MIN_ORDER_INTERVAL = 1.0  # minimaler Abstand zwischen Orders pro Symbol
+
+def dca_key(symbol, side):
+    return f"{symbol}:{side}"
 
 active_dca = {}
 dca_lock = threading.Lock()
-last_dca_heartbeat = time.time()
-
+last_dca_heartbeat = time.monotonic()
 
 # --- SIGNATURE ---
 def sign_bingx(params):
@@ -46,7 +47,6 @@ def sign_bingx(params):
         items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
         query_string = urllib.parse.urlencode(items)
     return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
-
 
 # --- API REQUEST ---
 def api_request(method, endpoint, params=None):
@@ -88,7 +88,6 @@ def api_request(method, endpoint, params=None):
                 print("[API ERROR POST]", e)
             return None
 
-
 # --- HELPERS ---
 def get_price(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
@@ -98,17 +97,14 @@ def get_price(symbol):
         print(f"[PRICE ERROR] Konnte Preis für {symbol} nicht lesen, response={r}")
         return None
 
-
 def get_positions():
     ts = str(int(time.time() * 1000))
     r = api_request("GET", "/openApi/swap/v2/user/positions", {"timestamp": ts})
     return r.get("data", []) if r else []
 
-
 def symbol_exists(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     return bool(r and "data" in r and "price" in r["data"])
-
 
 def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     ts = str(int(time.time() * 1000))
@@ -121,7 +117,6 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     if not r:
         print(f"[LEVERAGE ERROR] set_leverage_for_symbol failed for {symbol} resp={r}")
     return bool(r)
-
 
 # --- TP/SL ---
 def reset_tp_sl(symbol, position_side=None):
@@ -138,7 +133,6 @@ def reset_tp_sl(symbol, position_side=None):
             continue
         api_request("POST", "/openApi/swap/v2/trade/cancelOrder",
                     {"orderId": oid, "symbol": symbol, "timestamp": str(int(time.time() * 1000))})
-
 
 def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT):
     pos = None
@@ -188,7 +182,6 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     place(tp, "TAKE_PROFIT_MARKET")
     place(sl, "STOP_MARKET")
 
-
 # ============================================================
 #   DCA ENGINE — STABILE VERSION (mit Fixes)
 # ============================================================
@@ -204,13 +197,11 @@ def update_entry(symbol, side):
             return None
     return None
 
-
 def calculate_dca_qty(base_trade_size, executed, current_price):
     multiplier = DCA_VOLUME_MULTIPLIER ** (executed + 1)
     qty = (base_trade_size * multiplier) / current_price if current_price and current_price > 0 else 0
     qty = round(qty, 6)
     return qty
-
 
 def should_trigger_dca(side, current, entry_static, deviation_percent):
     if side == "LONG":
@@ -218,12 +209,11 @@ def should_trigger_dca(side, current, entry_static, deviation_percent):
     else:
         return current >= entry_static * (1 + deviation_percent / 100)
 
-
 def monitor_dca():
     global last_dca_heartbeat
 
     while True:
-        last_dca_heartbeat = time.time()
+        last_dca_heartbeat = time.monotonic()
 
         try:
             positions = get_positions()
@@ -239,10 +229,14 @@ def monitor_dca():
                 if not current_price:
                     continue
 
+                key = dca_key(symbol, side)
+
+                # Ensure active_dca entry exists (under lock)
                 with dca_lock:
-                    if symbol not in active_dca:
+                    if key not in active_dca:
                         base_value = abs(amt) * float(pos["avgPrice"])
-                        active_dca[symbol] = {
+                        active_dca[key] = {
+                            "symbol": symbol,
                             "side": side,
                             "entry_static": float(pos["avgPrice"]),
                             "entry_dynamic": float(pos["avgPrice"]),
@@ -250,24 +244,30 @@ def monitor_dca():
                             "base_trade_size": base_value,
                             "tp_percent": TP_PERCENT,
                             "sl_percent": SL_PERCENT,
-                            "last_order_ts": 0
+                            "last_order_ts": 0.0,
+                            "placing": False
                         }
+                    d = active_dca[key]
 
-                    d = active_dca[symbol]
+                # Logging
+                print(f"[DCA] {key} side={side} current={current_price} entry_static={d['entry_static']} executed={d['executed']} base_trade_size={d['base_trade_size']}")
 
-                # Logging der aktuellen Werte
-                print(f"[DCA] {symbol} side={side} current={current_price} entry_static={d['entry_static']} executed={d['executed']} base_trade_size={d['base_trade_size']}")
+                # Quick checks under lock to avoid races
+                with dca_lock:
+                    if d["executed"] >= DCA_COUNT:
+                        continue
+                    if d.get("placing"):
+                        continue
+                    if time.monotonic() - d.get("last_order_ts", 0.0) < MIN_ORDER_INTERVAL:
+                        continue
+                    trigger = should_trigger_dca(side, current_price, d["entry_static"], DCA_DEVIATION_PERCENT)
+                    if not trigger:
+                        continue
+                    # Reserve: setze last_order_ts und placing atomar
+                    d["last_order_ts"] = time.monotonic()
+                    d["placing"] = True
 
-                if d["executed"] >= DCA_COUNT:
-                    continue
-
-                # Verhindere zu schnelle Wiederholung: minimaler Abstand zwischen Orders (z.B. 1 Sekunde)
-                if time.time() - d.get("last_order_ts", 0) < 1.0:
-                    continue
-
-                if not should_trigger_dca(side, current_price, d["entry_static"], DCA_DEVIATION_PERCENT):
-                    continue
-
+                # Berechne qty außerhalb der Sperre
                 qty = calculate_dca_qty(
                     d["base_trade_size"],
                     d["executed"],
@@ -276,10 +276,13 @@ def monitor_dca():
 
                 if qty <= 0:
                     print(f"[DCA] Berechnete qty ist 0 für {symbol}, überspringe")
+                    with dca_lock:
+                        d["placing"] = False
                     continue
 
-                print(f"[DCA] Platziere DCA-Order für {symbol} qty={qty} side={'BUY' if side == 'LONG' else 'SELL'}")
+                print(f"[DCA] ({threading.get_ident()}) Platziere DCA-Order für {symbol} qty={qty} side={'BUY' if side == 'LONG' else 'SELL'} at {time.strftime('%H:%M:%S')}")
 
+                # API-Aufruf (außerhalb Lock)
                 resp = api_request("POST", "/openApi/swap/v2/trade/order", {
                     "symbol": symbol,
                     "side": "BUY" if side == "LONG" else "SELL",
@@ -291,9 +294,14 @@ def monitor_dca():
 
                 print("[DCA] order response:", resp)
 
+                # Nach erfolgreichem Senden: update shared state unter Lock
                 with dca_lock:
-                    d["executed"] += 1
-                    d["last_order_ts"] = time.time()
+                    success = bool(resp and (resp.get("code") in (None, 0, "0") or resp.get("success") is True))
+                    if success:
+                        d["executed"] += 1
+                    else:
+                        d["last_order_ts"] = time.monotonic() - (MIN_ORDER_INTERVAL * 0.5)
+                    d["placing"] = False
 
                 # Kurze Wartezeit, damit avgPrice/Positionen sich aktualisieren können
                 time.sleep(1.5)
@@ -301,21 +309,18 @@ def monitor_dca():
                 if new_entry:
                     with dca_lock:
                         d["entry_dynamic"] = new_entry
-                        # WICHTIG: Basis anpassen, damit nicht sofort erneut ausgelöst wird
                         d["entry_static"] = new_entry
                         print(f"[DCA] entry updated for {symbol} -> entry_static={d['entry_static']} entry_dynamic={d['entry_dynamic']}")
 
                 reset_tp_sl(symbol, side)
                 set_tp_sl(symbol, side, d["tp_percent"], d["sl_percent"])
 
-                # Verhindere weitere Orders für dieses Symbol in derselben Iteration
-                continue
+                time.sleep(0.2)
 
         except Exception as e:
             print("[DCA ERROR]", e)
 
         time.sleep(DCA_INTERVAL)
-
 
 # ============================================================
 #   TP/SL WATCHER — setzt fehlende TP/SL neu
@@ -329,7 +334,6 @@ def tp_sl_watcher():
             print("[TP/SL WATCHER] Prüfe Positionen...")
             print(f"[WATCHER THREAD] ID={threading.get_ident()}")
             print("[TP/SL WATCHER]", time.strftime("%H:%M:%S"))
-
 
             for pos in positions:
                 symbol = pos["symbol"]
@@ -358,8 +362,6 @@ def tp_sl_watcher():
             print("[TP/SL WATCHER ERROR]", e)
 
         time.sleep(10)
-
-
 
 # ============================================================
 #   execute_trade() MIT DCA-INTEGRATION
@@ -400,7 +402,9 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
     print("[EXECUTE TRADE] order response:", resp)
 
     with dca_lock:
-        active_dca[symbol] = {
+        key = dca_key(symbol, direction)
+        active_dca[key] = {
+            "symbol": symbol,
             "side": direction,
             "entry_static": price,
             "entry_dynamic": price,
@@ -408,13 +412,13 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
             "base_trade_size": trade_size,
             "tp_percent": tp_percent,
             "sl_percent": sl_percent,
-            "last_order_ts": time.time()
+            "last_order_ts": time.monotonic(),
+            "placing": False
         }
 
     time.sleep(2)
     reset_tp_sl(symbol, direction)
     set_tp_sl(symbol, direction, tp_percent, sl_percent)
-
 
 # ============================================================
 #   FLASK + THREADS
@@ -442,11 +446,9 @@ def webhook():
 
     return jsonify({"status": "processing"}), 200
 
-
 @app.route("/ping")
 def ping():
     return "pong", 200
-
 
 def keep_alive():
     url = os.getenv("SELF_PING_URL")
@@ -460,31 +462,28 @@ def keep_alive():
             pass
         time.sleep(240)
 
-
 def start_dca_thread():
-    while True:
-        try:
-            monitor_dca()
-        except Exception as e:
-            print("[DCA CRASH]", e)
-            time.sleep(3)
-
+    # Starte monitor_dca in einem benannten Daemon-Thread, falls noch nicht vorhanden
+    for t in threading.enumerate():
+        if t.name == "DCA-Monitor" and t.is_alive():
+            return
+    t = threading.Thread(target=monitor_dca, daemon=True, name="DCA-Monitor")
+    t.start()
 
 def dca_watchdog():
     global last_dca_heartbeat
     while True:
-        if time.time() - last_dca_heartbeat > 15:
-            print("[WATCHDOG] DCA Thread hängt → Neustart")
-            threading.Thread(target=start_dca_thread, daemon=True).start()
-            last_dca_heartbeat = time.time()
+        if time.monotonic() - last_dca_heartbeat > (DCA_INTERVAL * 3):
+            print("[WATCHDOG] DCA Thread hängt oder Heartbeat alt → Prüfe/Neustart")
+            start_dca_thread()
+            last_dca_heartbeat = time.monotonic()
         time.sleep(5)
-
 
 if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
         print("FEHLER: API Keys fehlen")
     else:
-        threading.Thread(target=start_dca_thread, daemon=True).start()
+        start_dca_thread()
         threading.Thread(target=dca_watchdog, daemon=True).start()
         threading.Thread(target=keep_alive, daemon=True).start()
         threading.Thread(target=tp_sl_watcher, daemon=True).start()
