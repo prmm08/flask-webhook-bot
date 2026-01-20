@@ -27,7 +27,7 @@ SL_PERCENT = 40
 
 # --- DCA SETTINGS ---
 DCA_INTERVAL = 5
-DCA_COUNT = 6
+DCA_COUNT = 7
 DCA_DEVIATION_PERCENT = 5  # angepasst auf 5% Trigger
 DCA_VOLUME_MULTIPLIER = 1.5
 MIN_ORDER_INTERVAL = 1.0  # minimaler Abstand zwischen Orders pro Symbol
