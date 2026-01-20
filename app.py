@@ -21,15 +21,15 @@ app = Flask(__name__)
 
 # --- DEFAULT SETTINGS ---
 LEVERAGE = 20
-TRADE_SIZE = 50
+TRADE_SIZE = 40
 TP_PERCENT = 1
 SL_PERCENT = 40
 
 # --- DCA SETTINGS ---
 DCA_INTERVAL = 5
-DCA_COUNT = 7
+DCA_COUNT = 6
 DCA_DEVIATION_PERCENT = 5  # angepasst auf 5% Trigger
-DCA_VOLUME_MULTIPLIER = 1.5
+DCA_VOLUME_MULTIPLIER = 2
 MIN_ORDER_INTERVAL = 1.0  # minimaler Abstand zwischen Orders pro Symbol
 
 def dca_key(symbol, side):
