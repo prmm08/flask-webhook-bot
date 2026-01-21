@@ -21,7 +21,7 @@ app = Flask(__name__)
 
 # --- DEFAULT SETTINGS ---
 LEVERAGE = 20
-TRADE_SIZE = 50
+TRADE_SIZE = 20
 TP_PERCENT = 1
 SL_PERCENT = 40
 
@@ -30,13 +30,13 @@ DCA_INTERVAL = 5
 DCA_COUNT = 7
 DCA_DEVIATION_PERCENT = 5        # Trigger in Prozent (z. B. 5)
 DCA_VOLUME_MULTIPLIER = 1.5
-MIN_ORDER_INTERVAL = 4.5         # minimaler Abstand zwischen Orders pro Symbol (Sekunden)
+MIN_ORDER_INTERVAL = 15         # minimaler Abstand zwischen Orders pro Symbol (Sekunden)
 HYSTERESIS = 0.002               # 0.2% zusätzlicher Preispuffer nach Ausführung
 API_ORDER_POLL_INTERVAL = 0.5    # Intervall zum Polling des Orderstatus (Sekunden)
 API_ORDER_POLL_TIMEOUT = 10      # Timeout für Polling (Sekunden)
 
-# --- NEW: Steuerung ob SL automatisch gesetzt werden soll ---
-AUTO_SET_SL = False  # False = Stop Loss wird nicht automatisch gesetzt; True = wie bisher
+# --- SL Steuerung ---
+AUTO_SET_SL = False  # True = TP+SL automatisch setzen; False = nur TP automatisch setzen
 
 def dca_key(symbol, side):
     return f"{symbol}:{side}"
@@ -128,7 +128,7 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
 def reset_tp_sl(symbol, position_side=None, cancel_sl=True):
     """
     Wenn cancel_sl False, werden nur TAKE_PROFIT_MARKET Orders gelöscht.
-    Wenn cancel_sl True, werden TP und SL gelöscht (wie vorher).
+    Wenn cancel_sl True, werden TP und SL gelöscht.
     """
     ts = str(int(time.time() * 1000))
     r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "timestamp": ts})
@@ -142,7 +142,6 @@ def reset_tp_sl(symbol, position_side=None, cancel_sl=True):
         oid = order.get("orderId")
         if not oid:
             continue
-        # Wenn cancel_sl False, überspringe STOP_MARKET (SL)
         if not cancel_sl and otype == "STOP_MARKET":
             continue
         api_request("POST", "/openApi/swap/v2/trade/cancelOrder",
@@ -325,7 +324,7 @@ def monitor_dca():
                             "base_trade_size": base_value,
                             "tp_percent": TP_PERCENT,
                             "sl_percent": SL_PERCENT,
-                            "last_order_ts": 0.0,
+                            "next_allowed_time": 0.0,
                             "placing": False,
                             "last_order_price": None,
                             "consecutive_failures": 0
@@ -334,7 +333,7 @@ def monitor_dca():
 
                 # Logging
                 next_trigger_price = (d["entry_initial"] * (1 - DCA_DEVIATION_PERCENT / 100)) if side == "LONG" else (d["entry_initial"] * (1 + DCA_DEVIATION_PERCENT / 100))
-                print(f"[DCA] {key} side={side} current={current_price} entry_initial={d['entry_initial']} next_trigger={next_trigger_price:.8f} executed={d['executed']} base_trade_size={d['base_trade_size']} last_order_ts={d['last_order_ts']}")
+                print(f"[DCA] {key} side={side} current={current_price} entry_initial={d['entry_initial']} next_trigger={next_trigger_price:.8f} executed={d['executed']} base_trade_size={d['base_trade_size']} next_allowed_time={d.get('next_allowed_time')} placing={d.get('placing')}")
 
                 # Quick checks unter Lock
                 with dca_lock:
@@ -342,8 +341,8 @@ def monitor_dca():
                         continue
                     if d.get("placing"):
                         continue
-                    # Zeitliche Sperre
-                    if time.monotonic() - d.get("last_order_ts", 0.0) < MIN_ORDER_INTERVAL:
+                    # Prüfe next_allowed_time (reservierte Sperre)
+                    if time.monotonic() < d.get("next_allowed_time", 0.0):
                         continue
                     # Hysterese: wenn bereits eine Order ausgeführt wurde, erwarte zusätzliche Bewegung
                     last_price = d.get("last_order_price")
@@ -358,7 +357,10 @@ def monitor_dca():
                     trigger = should_trigger_dca(side, current_price, d["entry_initial"], DCA_DEVIATION_PERCENT)
                     if not trigger:
                         continue
+
+                    # Atomare Reservierung: setze placing und next_allowed_time sofort
                     d["placing"] = True
+                    d["next_allowed_time"] = time.monotonic() + MIN_ORDER_INTERVAL
 
                 # Berechne qty außerhalb der Sperre
                 qty = calculate_dca_qty(
@@ -396,6 +398,7 @@ def monitor_dca():
                     if success_flag and order_id:
                         order_filled = poll_order_filled(symbol, order_id)
                     elif success_flag and not order_id:
+                        # Exchange meldet Erfolg ohne orderId: behandeln wir als Fill
                         order_filled = True
                     else:
                         order_filled = False
@@ -404,15 +407,16 @@ def monitor_dca():
                 with dca_lock:
                     if order_filled:
                         d["executed"] += 1
-                        d["last_order_ts"] = time.monotonic()  # setze Sperre NACH bestätigter Ausführung
                         d["last_order_price"] = current_price
                         d["consecutive_failures"] = 0
+                        # next_allowed_time bleibt wie reserviert (verhindert sofortige Folgeorder)
                         print(f"[DCA] Order gefüllt für {symbol} executed={d['executed']}")
                     else:
+                        # adaptives Backoff bei Fehlern: erhöhe next_allowed_time zusätzlich
                         d["consecutive_failures"] = d.get("consecutive_failures", 0) + 1
                         backoff_multiplier = min(4.0, 1.5 ** d["consecutive_failures"])
-                        d["last_order_ts"] = time.monotonic() + (MIN_ORDER_INTERVAL * (backoff_multiplier - 1))
-                        print(f"[DCA] Order nicht gefüllt für {symbol}, consecutive_failures={d['consecutive_failures']}, next_try_in={d['last_order_ts'] - time.monotonic():.1f}s")
+                        d["next_allowed_time"] = time.monotonic() + (MIN_ORDER_INTERVAL * backoff_multiplier)
+                        print(f"[DCA] Order nicht gefüllt für {symbol}, consecutive_failures={d['consecutive_failures']}, next_try_in={d['next_allowed_time'] - time.monotonic():.1f}s")
                     d["placing"] = False
 
                 # Kurze Wartezeit, damit avgPrice/Positionen sich aktualisieren können
@@ -428,7 +432,6 @@ def monitor_dca():
                     reset_tp_sl(symbol, side, cancel_sl=True)
                     set_tp_sl(symbol, side, d["tp_percent"], d["sl_percent"])
                 else:
-                    # Lösche nur TP und setze nur TP
                     reset_tp_sl(symbol, side, cancel_sl=False)
                     set_tp_only(symbol, side, d["tp_percent"])
 
@@ -478,7 +481,6 @@ def tp_sl_watcher():
 
                 if AUTO_SET_SL and not has_sl:
                     print(f"[TP/SL WATCHER] Setze SL neu für {symbol} ({side})")
-                    # Wenn AUTO_SET_SL True, setze TP+SL komplett neu
                     reset_tp_sl(symbol, side, cancel_sl=True)
                     set_tp_sl(symbol, side)
 
@@ -549,7 +551,7 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
             "base_trade_size": trade_size,
             "tp_percent": tp_percent,
             "sl_percent": sl_percent,
-            "last_order_ts": time.monotonic() if order_filled else time.monotonic() + MIN_ORDER_INTERVAL,
+            "next_allowed_time": time.monotonic() if order_filled else time.monotonic() + MIN_ORDER_INTERVAL,
             "placing": False,
             "last_order_price": price if order_filled else None,
             "consecutive_failures": 0 if order_filled else 1
