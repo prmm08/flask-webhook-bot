@@ -35,6 +35,9 @@ HYSTERESIS = 0.002               # 0.2% zusätzlicher Preispuffer nach Ausführu
 API_ORDER_POLL_INTERVAL = 0.5    # Intervall zum Polling des Orderstatus (Sekunden)
 API_ORDER_POLL_TIMEOUT = 10      # Timeout für Polling (Sekunden)
 
+# --- NEW: Steuerung ob SL automatisch gesetzt werden soll ---
+AUTO_SET_SL = False  # False = Stop Loss wird nicht automatisch gesetzt; True = wie bisher
+
 def dca_key(symbol, side):
     return f"{symbol}:{side}"
 
@@ -121,8 +124,12 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
         print(f"[LEVERAGE ERROR] set_leverage_for_symbol failed for {symbol} resp={r}")
     return bool(r)
 
-# --- TP/SL ---
-def reset_tp_sl(symbol, position_side=None):
+# --- TP/SL helpers with SL control ---
+def reset_tp_sl(symbol, position_side=None, cancel_sl=True):
+    """
+    Wenn cancel_sl False, werden nur TAKE_PROFIT_MARKET Orders gelöscht.
+    Wenn cancel_sl True, werden TP und SL gelöscht (wie vorher).
+    """
     ts = str(int(time.time() * 1000))
     r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "timestamp": ts})
     orders = r.get("data", {}).get("orders", []) if r else []
@@ -131,13 +138,20 @@ def reset_tp_sl(symbol, position_side=None):
         pos_side = order.get("positionSide") or order.get("position")
         if position_side and pos_side != position_side:
             continue
+        otype = order.get("type")
         oid = order.get("orderId")
         if not oid:
+            continue
+        # Wenn cancel_sl False, überspringe STOP_MARKET (SL)
+        if not cancel_sl and otype == "STOP_MARKET":
             continue
         api_request("POST", "/openApi/swap/v2/trade/cancelOrder",
                     {"orderId": oid, "symbol": symbol, "timestamp": str(int(time.time() * 1000))})
 
 def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT):
+    """
+    Setzt TP und SL wie vorher. Wird nur aufgerufen wenn AUTO_SET_SL True ist.
+    """
     pos = None
     for _ in range(8):
         positions = get_positions()
@@ -168,7 +182,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     tp = entry * (1 + tp_percent / 100) if side == "LONG" else entry * (1 - tp_percent / 100)
     sl = entry * (1 - sl_percent / 100) if side == "LONG" else entry * (1 + sl_percent / 100)
 
-    reset_tp_sl(symbol, side)
+    reset_tp_sl(symbol, side, cancel_sl=True)
 
     def place(price, otype):
         api_request("POST", "/openApi/swap/v2/trade/order", {
@@ -184,6 +198,54 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
 
     place(tp, "TAKE_PROFIT_MARKET")
     place(sl, "STOP_MARKET")
+
+def set_tp_only(symbol, desired_side=None, tp_percent=TP_PERCENT):
+    """
+    Setzt nur TAKE_PROFIT_MARKET. Löscht vorher nur TP-Orders, nicht SL.
+    Wird verwendet wenn AUTO_SET_SL == False.
+    """
+    pos = None
+    for _ in range(8):
+        positions = get_positions()
+        pos = next((p for p in positions
+                    if p["symbol"] == symbol
+                    and float(p.get("positionAmt", 0)) != 0
+                    and (desired_side is None or p.get("positionSide") == desired_side)), None)
+        if pos:
+            break
+        time.sleep(1)
+
+    if not pos:
+        print("[ERROR] Position nicht gefunden für TP")
+        return
+
+    side = pos["positionSide"]
+    entry = float(pos["avgPrice"])
+
+    # avgPrice-Update abwarten
+    for _ in range(10):
+        time.sleep(0.8)
+        new_pos = next((p for p in get_positions()
+                        if p["symbol"] == symbol and p.get("positionSide") == side), None)
+        if new_pos and abs(float(new_pos["avgPrice"]) - entry) > 0.0001:
+            entry = float(new_pos["avgPrice"])
+            break
+
+    tp = entry * (1 + tp_percent / 100) if side == "LONG" else entry * (1 - tp_percent / 100)
+
+    # Lösche nur TP-Orders, nicht SL
+    reset_tp_sl(symbol, side, cancel_sl=False)
+
+    api_request("POST", "/openApi/swap/v2/trade/order", {
+        "symbol": symbol,
+        "side": "SELL" if side == "LONG" else "BUY",
+        "positionSide": side,
+        "type": "TAKE_PROFIT_MARKET",
+        "stopPrice": f"{tp:.6f}",
+        "workingType": "MARK_PRICE",
+        "closePosition": "true",
+        "timestamp": str(int(time.time() * 1000))
+    })
 
 # ============================================================
 #   DCA ENGINE — STABILE VERSION (mit Robustheits-Fixes)
@@ -221,7 +283,6 @@ def poll_order_filled(symbol, order_id, timeout=API_ORDER_POLL_TIMEOUT):
         if r:
             data = r.get("data") or {}
             status = data.get("status") or data.get("orderStatus") or data.get("state")
-            # Mögliche Statusnamen variieren; prüfe gängige Varianten
             if status in ("FILLED", "filled", "FILLED_PARTIAL", "FILLED_PARTIALLY"):
                 return True
             if status in ("CANCELED", "CANCELLED", "REJECTED", "FAILED"):
@@ -288,7 +349,6 @@ def monitor_dca():
                     last_price = d.get("last_order_price")
                     if last_price is not None:
                         if side == "LONG":
-                            # Preis muss zusätzlich unter trigger - HYSTERESIS*entry_initial liegen
                             if not (current_price <= d["entry_initial"] * (1 - DCA_DEVIATION_PERCENT / 100) - HYSTERESIS * d["entry_initial"]):
                                 continue
                         else:
@@ -298,7 +358,6 @@ def monitor_dca():
                     trigger = should_trigger_dca(side, current_price, d["entry_initial"], DCA_DEVIATION_PERCENT)
                     if not trigger:
                         continue
-                    # Markiere als in Platzierung, aber setze last_order_ts erst nach bestätigtem Erfolg oder sicherem Backoff
                     d["placing"] = True
 
                 # Berechne qty außerhalb der Sperre
@@ -332,15 +391,11 @@ def monitor_dca():
                 order_filled = False
                 order_id = None
                 if resp:
-                    # Versuche gängige Felder zu lesen
                     order_id = resp.get("data", {}).get("orderId") or resp.get("orderId") or resp.get("data", {}).get("order_id")
-                    # Wenn API direkt Erfolg meldet (success flag), wir behandeln als Erfolg; ansonsten pollen wir falls order_id vorhanden
                     success_flag = resp.get("success") is True or resp.get("code") in (0, "0", None)
                     if success_flag and order_id:
-                        # Poll auf FILLED
                         order_filled = poll_order_filled(symbol, order_id)
                     elif success_flag and not order_id:
-                        # Kein orderId, aber success -> behandeln als Erfolg (Exchange-spezifisch)
                         order_filled = True
                     else:
                         order_filled = False
@@ -354,10 +409,7 @@ def monitor_dca():
                         d["consecutive_failures"] = 0
                         print(f"[DCA] Order gefüllt für {symbol} executed={d['executed']}")
                     else:
-                        # Bei Fehlern: setze Backoff und erhöhe Fehlerzähler
-                        d["last_order_ts"] = time.monotonic()  # setze Sperre auch bei Fehler, um aggressive Retries zu vermeiden
                         d["consecutive_failures"] = d.get("consecutive_failures", 0) + 1
-                        # Optional: adaptives Backoff (erhöhe MIN_ORDER_INTERVAL temporär für dieses Symbol)
                         backoff_multiplier = min(4.0, 1.5 ** d["consecutive_failures"])
                         d["last_order_ts"] = time.monotonic() + (MIN_ORDER_INTERVAL * (backoff_multiplier - 1))
                         print(f"[DCA] Order nicht gefüllt für {symbol}, consecutive_failures={d['consecutive_failures']}, next_try_in={d['last_order_ts'] - time.monotonic():.1f}s")
@@ -369,11 +421,16 @@ def monitor_dca():
                 if new_entry:
                     with dca_lock:
                         d["entry_dynamic"] = new_entry
-                        # entry_initial bleibt unverändert, damit Trigger immer relativ zum ursprünglichen Einstieg geprüft wird
                         print(f"[DCA] entry_dynamic updated for {symbol} -> entry_dynamic={d['entry_dynamic']}")
 
-                reset_tp_sl(symbol, side)
-                set_tp_sl(symbol, side, d["tp_percent"], d["sl_percent"])
+                # --- Hier: setze TP und optional SL abhängig von AUTO_SET_SL ---
+                if AUTO_SET_SL:
+                    reset_tp_sl(symbol, side, cancel_sl=True)
+                    set_tp_sl(symbol, side, d["tp_percent"], d["sl_percent"])
+                else:
+                    # Lösche nur TP und setze nur TP
+                    reset_tp_sl(symbol, side, cancel_sl=False)
+                    set_tp_only(symbol, side, d["tp_percent"])
 
                 time.sleep(0.2)
 
@@ -383,7 +440,7 @@ def monitor_dca():
         time.sleep(DCA_INTERVAL)
 
 # ============================================================
-#   TP/SL WATCHER — setzt fehlende TP/SL neu
+#   TP/SL WATCHER — setzt fehlende TP/SL neu (respektiert AUTO_SET_SL)
 # ============================================================
 
 def tp_sl_watcher():
@@ -413,9 +470,16 @@ def tp_sl_watcher():
 
                 print(f"[TP/SL WATCHER] {symbol} {side} TP={has_tp} SL={has_sl}")
 
-                if not has_tp or not has_sl:
-                    print(f"[TP/SL WATCHER] Setze TP/SL neu für {symbol} ({side})")
-                    reset_tp_sl(symbol, side)
+                if not has_tp:
+                    # TP immer setzen (unabhängig von AUTO_SET_SL)
+                    print(f"[TP/SL WATCHER] Setze TP neu für {symbol} ({side})")
+                    reset_tp_sl(symbol, side, cancel_sl=False)
+                    set_tp_only(symbol, side)
+
+                if AUTO_SET_SL and not has_sl:
+                    print(f"[TP/SL WATCHER] Setze SL neu für {symbol} ({side})")
+                    # Wenn AUTO_SET_SL True, setze TP+SL komplett neu
+                    reset_tp_sl(symbol, side, cancel_sl=True)
                     set_tp_sl(symbol, side)
 
         except Exception as e:
@@ -492,8 +556,13 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
         }
 
     time.sleep(2)
-    reset_tp_sl(symbol, direction)
-    set_tp_sl(symbol, direction, tp_percent, sl_percent)
+    # Setze TP und optional SL abhängig von AUTO_SET_SL
+    if AUTO_SET_SL:
+        reset_tp_sl(symbol, direction, cancel_sl=True)
+        set_tp_sl(symbol, direction, tp_percent, sl_percent)
+    else:
+        reset_tp_sl(symbol, direction, cancel_sl=False)
+        set_tp_only(symbol, direction, tp_percent)
 
 # ============================================================
 #   FLASK + THREADS
