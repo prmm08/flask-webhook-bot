@@ -21,16 +21,19 @@ app = Flask(__name__)
 
 # --- DEFAULT SETTINGS ---
 LEVERAGE = 20
-TRADE_SIZE = 20
+TRADE_SIZE = 50
 TP_PERCENT = 1
 SL_PERCENT = 40
 
 # --- DCA SETTINGS ---
 DCA_INTERVAL = 5
 DCA_COUNT = 7
-DCA_DEVIATION_PERCENT = 5  # angepasst auf 5% Trigger
+DCA_DEVIATION_PERCENT = 5        # Trigger in Prozent (z. B. 5)
 DCA_VOLUME_MULTIPLIER = 1.5
-MIN_ORDER_INTERVAL = 4.5  # minimaler Abstand zwischen Orders pro Symbol
+MIN_ORDER_INTERVAL = 4.5         # minimaler Abstand zwischen Orders pro Symbol (Sekunden)
+HYSTERESIS = 0.002               # 0.2% zusätzlicher Preispuffer nach Ausführung
+API_ORDER_POLL_INTERVAL = 0.5    # Intervall zum Polling des Orderstatus (Sekunden)
+API_ORDER_POLL_TIMEOUT = 10      # Timeout für Polling (Sekunden)
 
 def dca_key(symbol, side):
     return f"{symbol}:{side}"
@@ -183,7 +186,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     place(sl, "STOP_MARKET")
 
 # ============================================================
-#   DCA ENGINE — STABILE VERSION (mit Fixes)
+#   DCA ENGINE — STABILE VERSION (mit Robustheits-Fixes)
 # ============================================================
 
 def update_entry(symbol, side):
@@ -209,6 +212,23 @@ def should_trigger_dca(side, current, entry_initial, deviation_percent):
     else:
         return current >= entry_initial * (1 + deviation_percent / 100)
 
+def poll_order_filled(symbol, order_id, timeout=API_ORDER_POLL_TIMEOUT):
+    """Pollt den Orderstatus bis FILLED oder Timeout. Gibt True bei Fill, False sonst."""
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        ts = str(int(time.time() * 1000))
+        r = api_request("GET", "/openApi/swap/v2/trade/order", {"symbol": symbol, "orderId": order_id, "timestamp": ts})
+        if r:
+            data = r.get("data") or {}
+            status = data.get("status") or data.get("orderStatus") or data.get("state")
+            # Mögliche Statusnamen variieren; prüfe gängige Varianten
+            if status in ("FILLED", "filled", "FILLED_PARTIAL", "FILLED_PARTIALLY"):
+                return True
+            if status in ("CANCELED", "CANCELLED", "REJECTED", "FAILED"):
+                return False
+        time.sleep(API_ORDER_POLL_INTERVAL)
+    return False
+
 def monitor_dca():
     global last_dca_heartbeat
 
@@ -231,7 +251,7 @@ def monitor_dca():
 
                 key = dca_key(symbol, side)
 
-                # Ensure active_dca entry exists (under lock)
+                # Ensure active_dca entry exists (unter Lock)
                 with dca_lock:
                     if key not in active_dca:
                         base_value = abs(amt) * float(pos["avgPrice"])
@@ -245,26 +265,40 @@ def monitor_dca():
                             "tp_percent": TP_PERCENT,
                             "sl_percent": SL_PERCENT,
                             "last_order_ts": 0.0,
-                            "placing": False
+                            "placing": False,
+                            "last_order_price": None,
+                            "consecutive_failures": 0
                         }
                     d = active_dca[key]
 
                 # Logging
-                print(f"[DCA] {key} side={side} current={current_price} entry_initial={d['entry_initial']} executed={d['executed']} base_trade_size={d['base_trade_size']}")
+                next_trigger_price = (d["entry_initial"] * (1 - DCA_DEVIATION_PERCENT / 100)) if side == "LONG" else (d["entry_initial"] * (1 + DCA_DEVIATION_PERCENT / 100))
+                print(f"[DCA] {key} side={side} current={current_price} entry_initial={d['entry_initial']} next_trigger={next_trigger_price:.8f} executed={d['executed']} base_trade_size={d['base_trade_size']} last_order_ts={d['last_order_ts']}")
 
-                # Quick checks under lock to avoid races
+                # Quick checks unter Lock
                 with dca_lock:
                     if d["executed"] >= DCA_COUNT:
                         continue
                     if d.get("placing"):
                         continue
+                    # Zeitliche Sperre
                     if time.monotonic() - d.get("last_order_ts", 0.0) < MIN_ORDER_INTERVAL:
                         continue
+                    # Hysterese: wenn bereits eine Order ausgeführt wurde, erwarte zusätzliche Bewegung
+                    last_price = d.get("last_order_price")
+                    if last_price is not None:
+                        if side == "LONG":
+                            # Preis muss zusätzlich unter trigger - HYSTERESIS*entry_initial liegen
+                            if not (current_price <= d["entry_initial"] * (1 - DCA_DEVIATION_PERCENT / 100) - HYSTERESIS * d["entry_initial"]):
+                                continue
+                        else:
+                            if not (current_price >= d["entry_initial"] * (1 + DCA_DEVIATION_PERCENT / 100) + HYSTERESIS * d["entry_initial"]):
+                                continue
+
                     trigger = should_trigger_dca(side, current_price, d["entry_initial"], DCA_DEVIATION_PERCENT)
                     if not trigger:
                         continue
-                    # Reserve: setze last_order_ts und placing atomar
-                    d["last_order_ts"] = time.monotonic()
+                    # Markiere als in Platzierung, aber setze last_order_ts erst nach bestätigtem Erfolg oder sicherem Backoff
                     d["placing"] = True
 
                 # Berechne qty außerhalb der Sperre
@@ -294,14 +328,39 @@ def monitor_dca():
 
                 print("[DCA] order response:", resp)
 
-                # Nach erfolgreichem Senden: update shared state unter Lock
-                with dca_lock:
-                    success = bool(resp and (resp.get("code") in (None, 0, "0") or resp.get("success") is True))
-                    if success:
-                        d["executed"] += 1
+                # Nach API-Call: handle response, Polling nach Fill falls orderId vorhanden
+                order_filled = False
+                order_id = None
+                if resp:
+                    # Versuche gängige Felder zu lesen
+                    order_id = resp.get("data", {}).get("orderId") or resp.get("orderId") or resp.get("data", {}).get("order_id")
+                    # Wenn API direkt Erfolg meldet (success flag), wir behandeln als Erfolg; ansonsten pollen wir falls order_id vorhanden
+                    success_flag = resp.get("success") is True or resp.get("code") in (0, "0", None)
+                    if success_flag and order_id:
+                        # Poll auf FILLED
+                        order_filled = poll_order_filled(symbol, order_id)
+                    elif success_flag and not order_id:
+                        # Kein orderId, aber success -> behandeln als Erfolg (Exchange-spezifisch)
+                        order_filled = True
                     else:
-                        # bei Fehlern: last_order_ts etwas zurücksetzen, damit Retry möglich ist
-                        d["last_order_ts"] = time.monotonic() - (MIN_ORDER_INTERVAL * 0.5)
+                        order_filled = False
+
+                # Update shared state unter Lock
+                with dca_lock:
+                    if order_filled:
+                        d["executed"] += 1
+                        d["last_order_ts"] = time.monotonic()  # setze Sperre NACH bestätigter Ausführung
+                        d["last_order_price"] = current_price
+                        d["consecutive_failures"] = 0
+                        print(f"[DCA] Order gefüllt für {symbol} executed={d['executed']}")
+                    else:
+                        # Bei Fehlern: setze Backoff und erhöhe Fehlerzähler
+                        d["last_order_ts"] = time.monotonic()  # setze Sperre auch bei Fehler, um aggressive Retries zu vermeiden
+                        d["consecutive_failures"] = d.get("consecutive_failures", 0) + 1
+                        # Optional: adaptives Backoff (erhöhe MIN_ORDER_INTERVAL temporär für dieses Symbol)
+                        backoff_multiplier = min(4.0, 1.5 ** d["consecutive_failures"])
+                        d["last_order_ts"] = time.monotonic() + (MIN_ORDER_INTERVAL * (backoff_multiplier - 1))
+                        print(f"[DCA] Order nicht gefüllt für {symbol}, consecutive_failures={d['consecutive_failures']}, next_try_in={d['last_order_ts'] - time.monotonic():.1f}s")
                     d["placing"] = False
 
                 # Kurze Wartezeit, damit avgPrice/Positionen sich aktualisieren können
@@ -402,20 +461,34 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
     })
     print("[EXECUTE TRADE] order response:", resp)
 
+    # Falls OrderId vorhanden, pollen wir auf Fill; ansonsten behandeln wir success-Flag
+    order_filled = False
+    order_id = None
+    if resp:
+        order_id = resp.get("data", {}).get("orderId") or resp.get("orderId") or resp.get("data", {}).get("order_id")
+        success_flag = resp.get("success") is True or resp.get("code") in (0, "0", None)
+        if success_flag and order_id:
+            order_filled = poll_order_filled(symbol, order_id)
+        elif success_flag and not order_id:
+            order_filled = True
+        else:
+            order_filled = False
+
     with dca_lock:
         key = dca_key(symbol, direction)
-        # base_trade_size hier als monetärer Wert (trade_size) setzen, entry_initial = aktueller Preis
         active_dca[key] = {
             "symbol": symbol,
             "side": direction,
             "entry_initial": price,   # unveränderliche Referenz für DCA-Trigger
             "entry_dynamic": price,
-            "executed": 0,
+            "executed": 1 if order_filled else 0,  # falls initiale Order gefüllt, zählen wir sie
             "base_trade_size": trade_size,
             "tp_percent": tp_percent,
             "sl_percent": sl_percent,
-            "last_order_ts": time.monotonic(),
-            "placing": False
+            "last_order_ts": time.monotonic() if order_filled else time.monotonic() + MIN_ORDER_INTERVAL,
+            "placing": False,
+            "last_order_price": price if order_filled else None,
+            "consecutive_failures": 0 if order_filled else 1
         }
 
     time.sleep(2)
