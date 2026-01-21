@@ -203,11 +203,11 @@ def calculate_dca_qty(base_trade_size, executed, current_price):
     qty = round(qty, 6)
     return qty
 
-def should_trigger_dca(side, current, entry_static, deviation_percent):
+def should_trigger_dca(side, current, entry_initial, deviation_percent):
     if side == "LONG":
-        return current <= entry_static * (1 - deviation_percent / 100)
+        return current <= entry_initial * (1 - deviation_percent / 100)
     else:
-        return current >= entry_static * (1 + deviation_percent / 100)
+        return current >= entry_initial * (1 + deviation_percent / 100)
 
 def monitor_dca():
     global last_dca_heartbeat
@@ -238,8 +238,8 @@ def monitor_dca():
                         active_dca[key] = {
                             "symbol": symbol,
                             "side": side,
-                            "entry_static": float(pos["avgPrice"]),
-                            "entry_dynamic": float(pos["avgPrice"]),
+                            "entry_initial": float(pos["avgPrice"]),  # unveränderliche Referenz
+                            "entry_dynamic": float(pos["avgPrice"]),  # für Anzeige/TP-SL
                             "executed": 0,
                             "base_trade_size": base_value,
                             "tp_percent": TP_PERCENT,
@@ -250,7 +250,7 @@ def monitor_dca():
                     d = active_dca[key]
 
                 # Logging
-                print(f"[DCA] {key} side={side} current={current_price} entry_static={d['entry_static']} executed={d['executed']} base_trade_size={d['base_trade_size']}")
+                print(f"[DCA] {key} side={side} current={current_price} entry_initial={d['entry_initial']} executed={d['executed']} base_trade_size={d['base_trade_size']}")
 
                 # Quick checks under lock to avoid races
                 with dca_lock:
@@ -260,7 +260,7 @@ def monitor_dca():
                         continue
                     if time.monotonic() - d.get("last_order_ts", 0.0) < MIN_ORDER_INTERVAL:
                         continue
-                    trigger = should_trigger_dca(side, current_price, d["entry_static"], DCA_DEVIATION_PERCENT)
+                    trigger = should_trigger_dca(side, current_price, d["entry_initial"], DCA_DEVIATION_PERCENT)
                     if not trigger:
                         continue
                     # Reserve: setze last_order_ts und placing atomar
@@ -300,6 +300,7 @@ def monitor_dca():
                     if success:
                         d["executed"] += 1
                     else:
+                        # bei Fehlern: last_order_ts etwas zurücksetzen, damit Retry möglich ist
                         d["last_order_ts"] = time.monotonic() - (MIN_ORDER_INTERVAL * 0.5)
                     d["placing"] = False
 
@@ -309,8 +310,8 @@ def monitor_dca():
                 if new_entry:
                     with dca_lock:
                         d["entry_dynamic"] = new_entry
-                        d["entry_static"] = new_entry
-                        print(f"[DCA] entry updated for {symbol} -> entry_static={d['entry_static']} entry_dynamic={d['entry_dynamic']}")
+                        # entry_initial bleibt unverändert, damit Trigger immer relativ zum ursprünglichen Einstieg geprüft wird
+                        print(f"[DCA] entry_dynamic updated for {symbol} -> entry_dynamic={d['entry_dynamic']}")
 
                 reset_tp_sl(symbol, side)
                 set_tp_sl(symbol, side, d["tp_percent"], d["sl_percent"])
@@ -403,10 +404,11 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
 
     with dca_lock:
         key = dca_key(symbol, direction)
+        # base_trade_size hier als monetärer Wert (trade_size) setzen, entry_initial = aktueller Preis
         active_dca[key] = {
             "symbol": symbol,
             "side": direction,
-            "entry_static": price,
+            "entry_initial": price,   # unveränderliche Referenz für DCA-Trigger
             "entry_dynamic": price,
             "executed": 0,
             "base_trade_size": trade_size,
