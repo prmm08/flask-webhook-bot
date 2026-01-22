@@ -29,12 +29,16 @@ DCA_INTERVAL = 10
 DCA_COUNT = 7
 DCA_DEVIATION_PERCENT = 5        
 DCA_VOLUME_MULTIPLIER = 1.5
-MIN_ORDER_INTERVAL = 30          # Erhöht auf 30 Sek, um "Double-Fires" zu verhindern
+MIN_ORDER_INTERVAL = 30          
 API_ORDER_POLL_INTERVAL = 0.5
 API_ORDER_POLL_TIMEOUT = 10
 
 active_dca = {}
 dca_lock = threading.Lock()
+
+# --- MISSING FUNCTION (FIXED) ---
+def dca_key(symbol, side):
+    return f"{symbol}:{side}"
 
 # --- SIGNATURE & API ---
 def sign_bingx(params):
@@ -72,14 +76,16 @@ def api_request(method, endpoint, params=None):
 # --- HELPERS ---
 def get_price(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-    return float(r["data"]["price"]) if r and "data" in r else None
+    try:
+        return float(r["data"]["price"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 def get_positions():
     r = api_request("GET", "/openApi/swap/v2/user/positions")
     return r.get("data", []) if r and r.get("code") == 0 else []
 
 def get_last_fill_price(symbol, position_side):
-    """Sucht in der Order-Historie nach dem echten Preis der letzten Kauf-Order."""
     try:
         r = api_request("GET", "/openApi/swap/v2/trade/allOrders", {"symbol": symbol, "limit": 20})
         orders = r.get("data", {}).get("orders", []) if r else []
@@ -107,7 +113,7 @@ def set_tp_only(symbol, desired_side, tp_percent=TP_PERCENT):
     r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
     orders = r.get("data", {}).get("orders", []) if r else []
     for o in orders:
-        if o.get("type") == "TAKE_PROFIT_MARKET" and o.get("positionSide") == side:
+        if o.get("type") in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and o.get("positionSide") == side:
             api_request("POST", "/openApi/swap/v2/trade/cancelOrder", {"orderId": o["orderId"], "symbol": symbol})
 
     # Neuen TP setzen
@@ -123,8 +129,7 @@ def monitor_dca():
             positions = get_positions()
             for pos in positions:
                 symbol, side = pos["symbol"], pos["positionSide"]
-                amt = float(pos["positionAmt"])
-                if amt == 0: continue
+                if float(pos["positionAmt"]) == 0: continue
 
                 key = dca_key(symbol, side)
                 current_price = get_price(symbol)
@@ -132,23 +137,19 @@ def monitor_dca():
 
                 with dca_lock:
                     if key not in active_dca:
-                        # Falls der Bot neu startet oder die Position nicht kennt:
                         hist_price, hist_count = get_last_fill_price(symbol, side)
                         active_dca[key] = {
                             "symbol": symbol, "side": side,
                             "executed": hist_count if hist_count > 0 else 1,
                             "last_order_price": hist_price if hist_price else float(pos["avgPrice"]),
-                            "next_allowed_time": time.monotonic() + 20, # Sicherheits-Delay nach Recovery
+                            "next_allowed_time": time.monotonic() + 15, 
                             "placing": False
                         }
                     
                     d = active_dca[key]
-
-                    # Überspringen, wenn gerade eine Order platziert wird oder die Sperrzeit läuft
-                    if d["placing"] or time.monotonic() < d.get("next_allowed_time", 0):
+                    if d.get("placing") or time.monotonic() < d.get("next_allowed_time", 0):
                         continue
 
-                    # Trigger Berechnung
                     last_price = d["last_order_price"]
                     if side == "LONG":
                         target = last_price * (1 - DCA_DEVIATION_PERCENT / 100)
@@ -161,7 +162,6 @@ def monitor_dca():
                         d["placing"] = True
                         print(f"[DCA] Trigger {symbol} {side} - Aktuell: {current_price} | Ziel: {target}")
                         
-                        # Berechnung Menge
                         multiplier = DCA_VOLUME_MULTIPLIER ** d["executed"]
                         qty = (TRADE_SIZE * multiplier) / current_price
                         
@@ -183,13 +183,16 @@ def monitor_dca():
         time.sleep(DCA_INTERVAL)
 
 def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
-    # Sofortiger Lock-Eintrag um monitor_dca zuvorzukommen
     key = dca_key(symbol, direction)
     with dca_lock:
         active_dca[key] = {"placing": True, "next_allowed_time": time.monotonic() + 60} 
 
     price = get_price(symbol)
-    if not price: return
+    if not price:
+        print(f"[EXECUTE FAIL] Preis für {symbol} nicht abrufbar.")
+        with dca_lock: 
+            if key in active_dca: del active_dca[key]
+        return
 
     api_request("POST", "/openApi/swap/v2/trade/leverage", {"symbol": symbol, "leverage": str(leverage), "positionSide": direction})
 
@@ -200,6 +203,7 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
     })
     
     if resp and resp.get("code") == 0:
+        print(f"[EXECUTE SUCCESS] {symbol} {direction}")
         with dca_lock:
             active_dca[key] = {
                 "symbol": symbol, "side": direction, "executed": 1,
@@ -222,7 +226,7 @@ def webhook():
     
     threading.Thread(target=execute_trade, args=(f"{currency}-USDT", direction, 
                       int(data.get("leverage", LEVERAGE)), float(data.get("trade_size", TRADE_SIZE)), 
-                      float(data.get("tp_percent", TP_PERCENT)), float(data.get("sl_percent", SL_PERCENT)))).start()
+                      float(data.get("tp_percent", TP_PERCENT)), float(data.get("sl_percent", SL_PERCENT))), daemon=True).start()
     return jsonify({"status": "processing"}), 200
 
 @app.route("/ping")
@@ -230,5 +234,6 @@ def webhook():
 def health(): return "OK", 200
 
 if __name__ == "__main__":
-    threading.Thread(target=monitor_dca, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    if API_KEY and API_SECRET:
+        threading.Thread(target=monitor_dca, daemon=True).start()
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
