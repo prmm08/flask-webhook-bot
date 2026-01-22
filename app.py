@@ -36,7 +36,6 @@ API_ORDER_POLL_TIMEOUT = 10
 active_dca = {}
 dca_lock = threading.Lock()
 
-# --- MISSING FUNCTION (FIXED) ---
 def dca_key(symbol, side):
     return f"{symbol}:{side}"
 
@@ -54,7 +53,6 @@ def api_request(method, endpoint, params=None):
         params_for_sign = dict(params)
         ts = str(int(time.time() * 1000))
         params_for_sign["timestamp"] = ts
-        
         sorted_params = sorted((k, str(v)) for k, v in params_for_sign.items())
         query = urllib.parse.urlencode(sorted_params)
         signature = sign_bingx(params_for_sign)
@@ -78,7 +76,7 @@ def get_price(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     try:
         return float(r["data"]["price"])
-    except (KeyError, TypeError, ValueError):
+    except:
         return None
 
 def get_positions():
@@ -89,17 +87,15 @@ def get_last_fill_price(symbol, position_side):
     try:
         r = api_request("GET", "/openApi/swap/v2/trade/allOrders", {"symbol": symbol, "limit": 20})
         orders = r.get("data", {}).get("orders", []) if r else []
-        
         target_side = "BUY" if position_side == "LONG" else "SELL"
         filled = [o for o in orders if o["status"] == "FILLED" and o["positionSide"] == position_side and o["side"] == target_side]
-        
         if not filled: return None, 0
         filled.sort(key=lambda x: x["updateTime"], reverse=True)
         return float(filled[0]["avgFilledPrice"]), len(filled)
     except:
         return None, 0
 
-# --- TRADE LOGIC ---
+# --- TP LOGIK ---
 def set_tp_only(symbol, desired_side, tp_percent=TP_PERCENT):
     positions = get_positions()
     pos = next((p for p in positions if p["symbol"] == symbol and float(p["positionAmt"]) != 0 and p["positionSide"] == desired_side), None)
@@ -109,24 +105,32 @@ def set_tp_only(symbol, desired_side, tp_percent=TP_PERCENT):
     entry = float(pos["avgPrice"])
     tp = entry * (1 + tp_percent/100) if side == "LONG" else entry * (1 - tp_percent/100)
 
-    # Bestehende TPs löschen
     r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
     orders = r.get("data", {}).get("orders", []) if r else []
     for o in orders:
         if o.get("type") in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and o.get("positionSide") == side:
             api_request("POST", "/openApi/swap/v2/trade/cancelOrder", {"orderId": o["orderId"], "symbol": symbol})
 
-    # Neuen TP setzen
     api_request("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", "positionSide": side,
         "type": "TAKE_PROFIT_MARKET", "stopPrice": f"{tp:.6f}", "workingType": "MARK_PRICE", "closePosition": "true"
     })
 
+# --- DCA MONITOR ---
 def monitor_dca():
     print("[SYSTEM] DCA Monitor aktiv.")
     while True:
         try:
             positions = get_positions()
+            # Wir säubern active_dca: Wenn keine Position mehr existiert, löschen wir den Eintrag
+            current_pos_keys = [dca_key(p["symbol"], p["positionSide"]) for p in positions if float(p["positionAmt"]) != 0]
+            
+            with dca_lock:
+                for key in list(active_dca.keys()):
+                    if key not in current_pos_keys and not active_dca[key].get("placing"):
+                        print(f"[CLEANUP] Position {key} geschlossen. Entferne aus DCA-Überwachung.")
+                        del active_dca[key]
+
             for pos in positions:
                 symbol, side = pos["symbol"], pos["positionSide"]
                 if float(pos["positionAmt"]) == 0: continue
@@ -142,7 +146,7 @@ def monitor_dca():
                             "symbol": symbol, "side": side,
                             "executed": hist_count if hist_count > 0 else 1,
                             "last_order_price": hist_price if hist_price else float(pos["avgPrice"]),
-                            "next_allowed_time": time.monotonic() + 15, 
+                            "next_allowed_time": time.monotonic() + 10,
                             "placing": False
                         }
                     
@@ -150,18 +154,16 @@ def monitor_dca():
                     if d.get("placing") or time.monotonic() < d.get("next_allowed_time", 0):
                         continue
 
+                    # Trigger
                     last_price = d["last_order_price"]
                     if side == "LONG":
-                        target = last_price * (1 - DCA_DEVIATION_PERCENT / 100)
-                        trigger = current_price <= target
+                        trigger = current_price <= last_price * (1 - DCA_DEVIATION_PERCENT / 100)
                     else:
-                        target = last_price * (1 + DCA_DEVIATION_PERCENT / 100)
-                        trigger = current_price >= target
+                        trigger = current_price >= last_price * (1 + DCA_DEVIATION_PERCENT / 100)
 
                     if trigger and d["executed"] < DCA_COUNT:
                         d["placing"] = True
-                        print(f"[DCA] Trigger {symbol} {side} - Aktuell: {current_price} | Ziel: {target}")
-                        
+                        print(f"[DCA] Trigger {symbol} {side} - Aktuell: {current_price}")
                         multiplier = DCA_VOLUME_MULTIPLIER ** d["executed"]
                         qty = (TRADE_SIZE * multiplier) / current_price
                         
@@ -176,24 +178,38 @@ def monitor_dca():
                             d["next_allowed_time"] = time.monotonic() + MIN_ORDER_INTERVAL
                             time.sleep(2)
                             set_tp_only(symbol, side)
-                        
                         d["placing"] = False
         except Exception as e:
             print(f"[DCA ERROR] {e}")
         time.sleep(DCA_INTERVAL)
 
+# --- TRADE EXECUTION (MIT SIGNAL-FILTER) ---
 def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
     key = dca_key(symbol, direction)
+    
+    # SCHRITT 1: Prüfen ob bereits ein Trade für dieses Symbol läuft (im Bot-Speicher)
+    with dca_lock:
+        if key in active_dca:
+            print(f"[SIGNAL IGNORED] {symbol} {direction} bereits aktiv.")
+            return
+
+    # SCHRITT 2: Sicherheitshalber die API fragen (falls der Bot neu gestartet wurde)
+    positions = get_positions()
+    existing_pos = next((p for p in positions if p["symbol"] == symbol and float(p["positionAmt"]) != 0), None)
+    if existing_pos:
+        print(f"[SIGNAL IGNORED] API meldet bereits offene Position für {symbol}.")
+        return
+
+    # SCHRITT 3: Lock setzen
     with dca_lock:
         active_dca[key] = {"placing": True, "next_allowed_time": time.monotonic() + 60} 
 
     price = get_price(symbol)
     if not price:
-        print(f"[EXECUTE FAIL] Preis für {symbol} nicht abrufbar.")
-        with dca_lock: 
-            if key in active_dca: del active_dca[key]
+        with dca_lock: del active_dca[key]
         return
 
+    # Leverage
     api_request("POST", "/openApi/swap/v2/trade/leverage", {"symbol": symbol, "leverage": str(leverage), "positionSide": direction})
 
     qty = round(trade_size / price, 6)
@@ -203,7 +219,7 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
     })
     
     if resp and resp.get("code") == 0:
-        print(f"[EXECUTE SUCCESS] {symbol} {direction}")
+        print(f"[FIRST ORDER SUCCESS] {symbol} gestartet.")
         with dca_lock:
             active_dca[key] = {
                 "symbol": symbol, "side": direction, "executed": 1,
@@ -222,18 +238,22 @@ def webhook():
     data = request.get_json(silent=True) or {}
     currency = str(data.get("currency", "")).upper()
     direction = str(data.get("direction", "")).upper()
-    if not currency or direction not in ("LONG", "SHORT"): return jsonify({"status": "ignored"}), 200
     
-    threading.Thread(target=execute_trade, args=(f"{currency}-USDT", direction, 
+    if not currency or direction not in ("LONG", "SHORT"): 
+        return jsonify({"status": "ignored"}), 200
+    
+    symbol = f"{currency}-USDT"
+    
+    # Den Thread starten - die Prüfung passiert innerhalb des Threads
+    threading.Thread(target=execute_trade, args=(symbol, direction, 
                       int(data.get("leverage", LEVERAGE)), float(data.get("trade_size", TRADE_SIZE)), 
                       float(data.get("tp_percent", TP_PERCENT)), float(data.get("sl_percent", SL_PERCENT))), daemon=True).start()
+    
     return jsonify({"status": "processing"}), 200
 
 @app.route("/ping")
-@app.route("/")
 def health(): return "OK", 200
 
 if __name__ == "__main__":
-    if API_KEY and API_SECRET:
-        threading.Thread(target=monitor_dca, daemon=True).start()
-        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    threading.Thread(target=monitor_dca, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
