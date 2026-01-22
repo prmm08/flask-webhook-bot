@@ -29,7 +29,7 @@ DCA_INTERVAL = 5
 DCA_COUNT = 7
 DCA_DEVIATION_PERCENT = 5        # 5% Abstand zwischen den Orders
 DCA_VOLUME_MULTIPLIER = 1.5
-MIN_ORDER_INTERVAL = 15          # Sekunden
+MIN_ORDER_INTERVAL = 10          # Sekunden
 HYSTERESIS = 0.002               
 API_ORDER_POLL_INTERVAL = 0.5
 API_ORDER_POLL_TIMEOUT = 10
@@ -213,9 +213,9 @@ def monitor_dca():
                 if trigger and d["executed"] < DCA_COUNT and not d["placing"] and time.monotonic() > d["next_allowed_time"]:
                     d["placing"] = True
                     qty = calculate_dca_qty(d["base_trade_size"], d["executed"], current_price)
-                    
+                     
                     print(f"[DCA TRIGGER] {symbol} {side} - Letzter Preis: {last_ref_price} -> Aktuell: {current_price}")
-                    
+                     
                     resp = api_request("POST", "/openApi/swap/v2/trade/order", {
                         "symbol": symbol, "side": "BUY" if side == "LONG" else "SELL",
                         "positionSide": side, "type": "MARKET", "quantity": str(qty)
@@ -228,11 +228,11 @@ def monitor_dca():
                                 d["executed"] += 1
                                 d["last_order_price"] = current_price # Setzt neuen Ankerpunkt
                                 d["next_allowed_time"] = time.monotonic() + MIN_ORDER_INTERVAL
-                            
+                             
                             time.sleep(2)
                             if AUTO_SET_SL: set_tp_sl(symbol, side)
                             else: set_tp_only(symbol, side)
-                    
+                     
                     d["placing"] = False
 
         except Exception as e:
@@ -276,6 +276,12 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
         time.sleep(2)
         set_tp_only(symbol, direction, tp_percent)
 
+# --- NEUER HEALTH CHECK ENDPOINT (WICHTIG FÜR RENDER) ---
+@app.route("/ping")
+@app.route("/")
+def health_check():
+    return "OK", 200
+
 @app.route("/testorder", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
@@ -284,12 +290,13 @@ def webhook():
     if not currency or direction not in ("LONG", "SHORT"): return jsonify({"status": "ignored"}), 200
     
     threading.Thread(target=execute_trade, args=(f"{currency}-USDT", direction, 
-                     int(data.get("leverage", LEVERAGE)), float(data.get("trade_size", TRADE_SIZE)), 
-                     float(data.get("tp_percent", TP_PERCENT)), float(data.get("sl_percent", SL_PERCENT)))).start()
+                      int(data.get("leverage", LEVERAGE)), float(data.get("trade_size", TRADE_SIZE)), 
+                      float(data.get("tp_percent", TP_PERCENT)), float(data.get("sl_percent", SL_PERCENT)))).start()
     return jsonify({"status": "processing"}), 200
 
 if __name__ == "__main__":
     if API_KEY and API_SECRET:
         threading.Thread(target=monitor_dca, daemon=True).start()
         threading.Thread(target=tp_sl_watcher, daemon=True).start()
+        # Auf Render wird der Port über die Environment Variable gesetzt
         app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
