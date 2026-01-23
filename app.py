@@ -15,9 +15,9 @@ BINGX_BASE = "https://open-api.bingx.com"
 app = Flask(__name__)
 
 # --- STRATEGIE EINSTELLUNGEN ---
-USE_SL = False          
-SL_PERCENT = 40        
-TP_PERCENT = 2.5         
+USE_SL = False
+SL_PERCENT = 40
+TP_PERCENT = 1
 
 DCA_COUNT = 6     
 DCA_DEVIATION_PERCENT = 5
