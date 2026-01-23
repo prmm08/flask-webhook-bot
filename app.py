@@ -15,11 +15,12 @@ BINGX_BASE = "https://open-api.bingx.com"
 app = Flask(__name__)
 
 # --- STRATEGIE EINSTELLUNGEN ---
-USE_SL = False
-SL_PERCENT = 40
-TP_PERCENT = 1
+TP_MODE = "FIRST_ORDER"    # OPTIONEN: "AVERAGE" (Break-Even) oder "FIRST_ORDER"
+USE_SL = False          
+SL_PERCENT = 40       
+TP_PERCENT = 1         
 
-DCA_COUNT = 6     
+DCA_COUNT = 6          
 DCA_DEVIATION_PERCENT = 5
 DCA_VOLUME_MULTIPLIER = 2
 MIN_ORDER_INTERVAL = 30
@@ -80,7 +81,7 @@ def get_last_fill_price(symbol, side):
         return float(filled[0]["avgFilledPrice"]), len(filled)
     except: return None, 0
 
-# --- TP & SL LOGIK (BREAK-EVEN BASIERT) ---
+# --- TP & SL LOGIK MIT MODUS-AUSWAHL ---
 def set_tp_sl(symbol, side, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT):
     r_pos = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
     positions = r_pos.get("data", []) if r_pos else []
@@ -88,8 +89,19 @@ def set_tp_sl(symbol, side, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT):
     
     if not pos: return
 
-    break_even = float(pos["avgPrice"])
-    tp_price = break_even * (1 + tp_percent/100) if side == "LONG" else break_even * (1 - tp_percent/100)
+    # MODUS LOGIK
+    if TP_MODE == "AVERAGE":
+        base_price = float(pos["avgPrice"]) # Break-Even
+    else:
+        # Wir suchen den Preis der ALLERERSTEN Order in unserem Speicher
+        key = dca_key(symbol, side)
+        with dca_lock:
+            if key in active_dca and "initial_price" in active_dca[key]:
+                base_price = active_dca[key]["initial_price"]
+            else:
+                base_price = float(pos["avgPrice"]) # Fallback
+
+    tp_price = base_price * (1 + tp_percent/100) if side == "LONG" else base_price * (1 - tp_percent/100)
 
     # Alte löschen
     r_orders = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
@@ -103,9 +115,12 @@ def set_tp_sl(symbol, side, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT):
         "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", "positionSide": side,
         "type": "TAKE_PROFIT_MARKET", "stopPrice": f"{tp_price:.6f}", "workingType": "MARK_PRICE", "closePosition": "true"
     })
+    print(f"[TP UPDATE] Modus: {TP_MODE} | Basis: {base_price:.4f} | Ziel: {tp_price:.4f}")
 
     if USE_SL:
-        sl_price = break_even * (1 - sl_percent/100) if side == "LONG" else break_even * (1 + sl_percent/100)
+        # SL orientiert sich meist immer am Break-Even um das Gesamtrisiko zu deckeln
+        current_avg = float(pos["avgPrice"])
+        sl_price = current_avg * (1 - sl_percent/100) if side == "LONG" else current_avg * (1 + sl_percent/100)
         api_request("POST", "/openApi/swap/v2/trade/order", {
             "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", "positionSide": side,
             "type": "STOP_MARKET", "stopPrice": f"{sl_price:.6f}", "workingType": "MARK_PRICE", "closePosition": "true"
@@ -138,6 +153,7 @@ def monitor_dca():
                         active_dca[key] = {
                             "symbol": symbol, "side": side, "executed": count if count > 0 else 1,
                             "last_order_price": last_p if last_p else float(pos["avgPrice"]),
+                            "initial_price": float(pos["avgPrice"]), # Als Referenz speichern
                             "next_allowed_time": time.monotonic() + 10, "placing": False
                         }
                     
@@ -194,7 +210,9 @@ def execute_trade(symbol, direction, leverage, trade_size):
         with dca_lock:
             active_dca[key] = {
                 "symbol": symbol, "side": direction, "executed": 1,
-                "last_order_price": price, "placing": False,
+                "last_order_price": price, 
+                "initial_price": price, # Hier speichern wir den Preis der allerersten Order
+                "placing": False,
                 "next_allowed_time": time.monotonic() + MIN_ORDER_INTERVAL
             }
         time.sleep(3)
@@ -203,11 +221,10 @@ def execute_trade(symbol, direction, leverage, trade_size):
         with dca_lock: 
             if key in active_dca: del active_dca[key]
 
-# --- FLASK ENDPOINTS ---
+# --- FLASK ---
 @app.route("/ping")
 @app.route("/")
-def health_check():
-    return "OK", 200
+def health_check(): return "OK", 200
 
 @app.route("/testorder", methods=["POST"])
 def webhook():
@@ -219,13 +236,5 @@ def webhook():
     return jsonify({"status": "ok"}), 200
 
 if __name__ == "__main__":
-    # 1. API Keys prüfen
-    if not API_KEY or not API_SECRET:
-        print("[CRITICAL] API Keys fehlen!")
-    
-    # 2. Monitor Thread starten
     threading.Thread(target=monitor_dca, daemon=True).start()
-    
-    # 3. Flask Server starten (Render-konform)
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
