@@ -26,11 +26,11 @@ TP_MODE = "FIRST_ORDER"    # "AVERAGE" (Break-Even) oder "FIRST_ORDER"
 USE_SL = False         # True = Stop Loss aktiv
 SL_PERCENT = 40.0      # Stop Loss in %
 TP_PERCENT = 1.0       # Take Profit in %
-DCA_COUNT = 6          # Max Nachkäufe
+DCA_COUNT = 4          # Max Nachkäufe
 DCA_DEVIATION_PERCENT = 5.0
 DCA_VOLUME_MULTIPLIER = 2
 MIN_ORDER_INTERVAL = 30
-TRADE_SIZE = 40.0
+TRADE_SIZE = 200.0
 LEVERAGE = 20
 
 # Tracking-Speicher
