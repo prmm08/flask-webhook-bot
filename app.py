@@ -56,8 +56,6 @@ def api_request(method, endpoint, params=None):
         if method == "POST": resp = requests.post(full_url, headers=headers, timeout=15)
         elif method == "GET": resp = requests.get(full_url, headers=headers, timeout=15)
         elif method == "DELETE": resp = requests.delete(full_url, headers=headers, timeout=15)
-        
-        # Sicherstellen, dass wir JSON bekommen
         data = resp.json()
         if data.get("code") != 0:
             log_print(f"API Warnung {endpoint}: {data.get('msg')} (Code: {data.get('code')})")
@@ -76,34 +74,27 @@ def send_telegram(msg):
 # --- HISTORIE ABFRAGEN (Zustand ermitteln) ---
 def get_dca_history(symbol, side):
     r = api_request("GET", "/openApi/swap/v2/trade/allOrders", {"symbol": symbol, "limit": 20})
-    
-    # Validierung: r muss ein Dict sein und r["data"] eine Liste
     if not isinstance(r, dict) or not isinstance(r.get("data"), list):
         return 1, None, None
 
-    # Filtern der Orders
     filled_orders = []
     for o in r["data"]:
-        # Sicherstellen, dass 'o' ein Dictionary ist (verhindert den 'string indices' Fehler)
         if isinstance(o, dict) and o.get("status") == "FILLED" and o.get("positionSide") == side and o.get("type") == "MARKET":
             filled_orders.append(o)
     
-    if not filled_orders:
-        return 1, None, None
+    if not filled_orders: return 1, None, None
 
     level = len(filled_orders)
     try:
         last_price = float(filled_orders[0]["avgPrice"])   
         first_price = float(filled_orders[-1]["avgPrice"]) 
         return level, last_price, first_price
-    except (KeyError, ValueError, IndexError):
-        return 1, None, None
+    except: return 1, None, None
 
 # --- TP / SL LOGIK ---
 def set_tp_sl(symbol, side, current_level, first_price=None):
-    log_print(f"Aktualisiere TP/SL für {symbol} (Level {current_level})")
+    log_print(f"Setze TP/SL für {symbol} (Level {current_level})")
     r_pos = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
-    
     if not r_pos or not isinstance(r_pos.get("data"), list): return
     
     pos = next((p for p in r_pos["data"] if p.get("positionSide") == side and float(p.get("positionAmt", 0)) != 0), None)
@@ -134,17 +125,48 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
             "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", "positionSide": side,
             "type": "STOP_MARKET", "stopPrice": f"{sl_price:.6f}", "workingType": "MARK_PRICE", "closePosition": "true"
         })
-    log_print(f"TP/SL aktualisiert (Ziel: {target_tp_pct}%)")
+    log_print(f"TP/SL aktualisiert auf Basis von Level {current_level}")
 
-# --- MONITOR ---
+# --- NEU: TP/SL WATCHER (Prüft alle 10s) ---
+def tp_watcher():
+    log_print("[SYSTEM] TP/SL Watcher Thread gestartet.")
+    while True:
+        try:
+            r_pos = api_request("GET", "/openApi/swap/v2/user/positions")
+            if not r_pos or not isinstance(r_pos.get("data"), list):
+                time.sleep(10); continue
+            
+            for pos in r_pos["data"]:
+                amt = float(pos.get("positionAmt", 0))
+                if amt == 0: continue
+                
+                symbol = pos["symbol"]
+                side = pos["positionSide"]
+                
+                # Offene Orders für dieses Symbol holen
+                r_orders = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
+                if not r_orders or not isinstance(r_orders.get("data"), list): continue
+                
+                has_tp = any(o.get("type") == "TAKE_PROFIT_MARKET" for o in r_orders["data"])
+                has_sl = any(o.get("type") == "STOP_MARKET" for o in r_orders["data"]) if USE_SL else True
+                
+                if not has_tp or not has_sl:
+                    log_print(f"[WATCHER] Fehlende Orders bei {symbol} {side} erkannt! Repariere...")
+                    level, _, first_p = get_dca_history(symbol, side)
+                    set_tp_sl(symbol, side, level, first_p)
+                    
+        except Exception as e:
+            log_print(f"Watcher Fehler: {e}")
+        time.sleep(10) # 10 Sekunden Intervall
+
+# --- MONITOR (DCA Trigger) ---
 def monitor_dca():
     log_print("[SYSTEM] Stateless Monitor aktiv.")
     while True:
         try:
             r_pos = api_request("GET", "/openApi/swap/v2/user/positions")
             if not r_pos or not isinstance(r_pos.get("data"), list):
-                time.sleep(10)
-                continue
+                time.sleep(10); continue
             
             for pos in r_pos["data"]:
                 if float(pos.get("positionAmt", 0)) == 0: continue
@@ -154,8 +176,7 @@ def monitor_dca():
                 if last_price is None: continue
                 
                 r_ticker = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-                if not r_ticker or "data" not in r_ticker or not isinstance(r_ticker["data"], dict):
-                    continue
+                if not r_ticker or "data" not in r_ticker: continue
                 
                 curr_price = float(r_ticker["data"].get("price", 0))
                 if curr_price == 0: continue
@@ -167,12 +188,10 @@ def monitor_dca():
                 if trigger and level < DCA_COUNT:
                     log_print(f"DCA TRIGGER {symbol} Level {level+1} | Diff: {diff:.2f}%")
                     qty = (TRADE_SIZE * (DCA_VOLUME_MULTIPLIER ** level)) / curr_price
-                    
                     resp = api_request("POST", "/openApi/swap/v2/trade/order", {
                         "symbol": symbol, "side": "BUY" if side == "LONG" else "SELL",
                         "positionSide": side, "type": "MARKET", "quantity": str(round(qty, 6))
                     })
-                    
                     if resp and resp.get("code") == 0:
                         if level + 1 == BE_DCA_LEVEL:
                             send_telegram(f"⚠️ DCA {BE_DCA_LEVEL} @ {symbol} erreicht. Break-Even aktiv.")
@@ -186,7 +205,7 @@ def monitor_dca():
 # --- WEBHOOKS ---
 @app.route("/ping")
 @app.route("/")
-def health(): return "STATLESS_BOT_ONLINE", 200
+def health(): return "STATLESS_BOT_V1.3_ONLINE", 200
 
 @app.route("/testorder", methods=["POST"])
 def webhook():
@@ -203,18 +222,17 @@ def execute_initial_trade(symbol, direction):
     if not r_ticker or "data" not in r_ticker: return
     price = float(r_ticker["data"].get("price", 0))
     if price == 0: return
-    
     qty = round(TRADE_SIZE / price, 6)
     resp = api_request("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol, "side": "BUY" if direction == "LONG" else "SELL",
         "positionSide": direction, "type": "MARKET", "quantity": str(qty)
     })
-    
     if resp and resp.get("code") == 0:
         log_print(f"Initialkauf {symbol} erfolgreich.")
-        time.sleep(3)
-        set_tp_sl(symbol, direction, 1, price)
+        time.sleep(3); set_tp_sl(symbol, direction, 1, price)
 
 if __name__ == "__main__":
+    # Beide Background-Threads starten
     threading.Thread(target=monitor_dca, daemon=True).start()
+    threading.Thread(target=tp_watcher, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
