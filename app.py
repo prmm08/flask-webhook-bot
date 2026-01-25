@@ -32,7 +32,7 @@ is_synced = False
 TP_MODE = "AVERAGE"        
 USE_SL = False              
 SL_PERCENT = 40.0          
-TP_PERCENT = 1.0           
+TP_PERCENT = 0.5          
 BE_DCA_LEVEL = 3           
 BE_PROFIT_PERCENT = 0.05   
 
