@@ -26,7 +26,7 @@ app = Flask(__name__)
 # --- LOKALER SPEICHER ---
 pos_tracker = {}
 tracker_lock = threading.Lock()
-is_synced = False  # Neu: Status-Flag für den Sync
+is_synced = False 
 
 # --- STRATEGIE EINSTELLUNGEN ---
 TP_MODE = "FIRST_ORDER"        
@@ -58,7 +58,7 @@ def api_request(method, endpoint, params=None):
         log_print(f"API Fehler {endpoint}: {e}")
         return None
 
-# --- INITIALER SCAN (Jetzt als Hintergrund-Thread) ---
+# --- INITIALER SCAN ---
 def sync_positions_with_bingx():
     global is_synced
     log_print("[SYNC] Starte Hintergrund-Scan der Positionen...")
@@ -86,7 +86,7 @@ def sync_positions_with_bingx():
                         log_print(f"[SYNC] Gefunden: {key} auf DCA Level {len(filled)}")
     
     is_synced = True
-    log_print("[SYNC] Initialer Scan abgeschlossen. Monitor bereit.")
+    log_print("[SYNC] Scan abgeschlossen.")
 
 # --- TP / SL SETZEN ---
 def set_tp_sl(symbol, side, current_level, first_price=None):
@@ -114,7 +114,7 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
 
 # --- MONITOR ---
 def monitor_dca():
-    while not is_synced:  # Warten bis Sync fertig ist
+    while not is_synced:
         time.sleep(2)
         
     log_print("[SYSTEM] Monitor aktiv.")
@@ -154,7 +154,9 @@ def monitor_dca():
                     active_keys = [f"{p['symbol']}_{p['positionSide']}" for p in r_pos["data"] if float(p.get("positionAmt", 0)) != 0]
                     with tracker_lock:
                         for k in list(pos_tracker.keys()):
-                            if k not in active_keys: del pos_tracker[k]
+                            if k not in active_keys:
+                                log_print(f"[CLEANUP] Position {k} beendet.")
+                                del pos_tracker[k]
         except Exception as e: log_print(f"Monitor Fehler: {e}")
         time.sleep(10)
 
@@ -167,26 +169,41 @@ def health(): return "BOT_ONLINE", 200
 def webhook():
     data = request.get_json(silent=True) or {}
     currency, direction = str(data.get("currency", "")).upper(), str(data.get("direction", "")).upper()
+    
     if currency and direction in ["LONG", "SHORT"]:
-        threading.Thread(target=execute_initial_trade, args=(f"{currency}-USDT", direction)).start()
+        symbol = f"{currency}-USDT"
+        key = f"{symbol}_{direction}"
+        
+        # FILTER: Nur ausführen, wenn wir das Symbol NICHT im Tracker haben
+        if key in pos_tracker:
+            log_print(f"[WEBHOOK] Signal ignoriert: {key} ist bereits aktiv.")
+            return jsonify({"status": "ignored", "reason": "position_active"}), 200
+            
+        threading.Thread(target=execute_initial_trade, args=(symbol, direction)).start()
+        
     return jsonify({"status": "ok"}), 200
 
 def execute_initial_trade(symbol, direction):
+    # Doppelte Sicherheit auch hier im Thread
+    key = f"{symbol}_{direction}"
+    if key in pos_tracker: return
+
     api_request("POST", "/openApi/swap/v2/trade/leverage", {"symbol": symbol, "leverage": str(LEVERAGE), "side": direction, "positionSide": direction})
     r_ticker = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     price = float(r_ticker["data"].get("price", 0)) if r_ticker else 0
     if price == 0: return
+    
     qty = round(TRADE_SIZE / price, 6)
     resp = api_request("POST", "/openApi/swap/v2/trade/order", {"symbol": symbol, "side": "BUY" if direction == "LONG" else "SELL", "positionSide": direction, "type": "MARKET", "quantity": str(qty)})
+    
     if resp and resp.get("code") == 0:
-        key = f"{symbol}_{direction}"
         with tracker_lock:
             pos_tracker[key] = {"level": 1, "last_price": price, "first_price": price}
+        log_print(f"[INIT] {symbol} gestartet.")
         time.sleep(3)
         set_tp_sl(symbol, direction, 1, price)
 
 if __name__ == "__main__":
-    # Flask sofort starten, damit Render Health Check nicht timed out
     threading.Thread(target=sync_positions_with_bingx, daemon=True).start()
     threading.Thread(target=monitor_dca, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
