@@ -45,7 +45,6 @@ LEVERAGE = 20
 def api_request(method, endpoint, params=None):
     global rate_limit_backoff_until
     
-    # Prüfen, ob wir gerade pausieren müssen wegen Rate Limit
     if time.time() < rate_limit_backoff_until:
         return None
 
@@ -64,13 +63,10 @@ def api_request(method, endpoint, params=None):
         elif method == "DELETE": resp = requests.delete(full_url, headers=headers, timeout=15)
         
         data = resp.json()
-        
-        # RATE LIMIT HANDLING
         if data.get("code") == 100410:
-            log_print("!!! RATE LIMIT ERREICHT !!! Pausiere API-Anfragen für 2 Minuten...")
-            rate_limit_backoff_until = time.time() + 120 # 2 Minuten Sperre einhalten
+            log_print("!!! RATE LIMIT !!! Pausiere alle Anfragen für 2 Min...")
+            rate_limit_backoff_until = time.time() + 120
             return None
-            
         return data
     except Exception as e:
         log_print(f"Netzwerk-Fehler: {e}")
@@ -83,7 +79,7 @@ def send_telegram(msg):
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
     except: pass
 
-# --- HISTORIE ABFRAGEN ---
+# --- HISTORIE ABFRAGEN (Zustand ermitteln) ---
 def get_dca_history(symbol, side):
     r = api_request("GET", "/openApi/swap/v2/trade/allOrders", {"symbol": symbol, "limit": 20})
     if not r or not isinstance(r.get("data"), list): return 1, None, None
@@ -117,10 +113,11 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
             "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", "positionSide": side,
             "type": "STOP_MARKET", "stopPrice": f"{sl_price:.6f}", "workingType": "MARK_PRICE", "closePosition": "true"
         })
+    log_print(f"[SUCCESS] TP/SL erneuert für {symbol}")
 
-# --- WATCHER (Mit Rate-Limit Schutz) ---
+# --- WATCHER (Intervall: 10 Sek) ---
 def tp_watcher():
-    log_print("[SYSTEM] TP/SL Watcher aktiv.")
+    log_print("[SYSTEM] TP/SL Watcher (10s) aktiv.")
     while True:
         try:
             r_pos = api_request("GET", "/openApi/swap/v2/user/positions")
@@ -135,19 +132,17 @@ def tp_watcher():
                         has_sl = any(o.get("type") in ["STOP_MARKET", "STOP"] for o in r_orders["data"]) if USE_SL else True
                         
                         if not has_tp or not has_sl:
-                            log_print(f"[WATCHER] Reparatur für {symbol}...")
+                            log_print(f"[WATCHER] TP/SL fehlt bei {symbol}! Repariere...")
                             level, _, first_p = get_dca_history(symbol, side)
                             set_tp_sl(symbol, side, level, first_p)
+                            send_telegram(f"🔧 Watcher hat TP/SL für {symbol} nachgesetzt.")
         except Exception as e:
             log_print(f"Watcher Fehler: {e}")
-        
-        # Falls wir gerade ein Rate Limit haben, warten wir länger
-        wait_time = 30 if time.time() < rate_limit_backoff_until else 15
-        time.sleep(wait_time)
+        time.sleep(10) # <-- Auf 10 Sekunden gesetzt
 
-# --- MONITOR (DCA) ---
+# --- MONITOR (DCA - Intervall: 10 Sek) ---
 def monitor_dca():
-    log_print("[SYSTEM] Monitor aktiv.")
+    log_print("[SYSTEM] Monitor (10s) aktiv.")
     while True:
         try:
             r_pos = api_request("GET", "/openApi/swap/v2/user/positions")
@@ -165,16 +160,17 @@ def monitor_dca():
                         trigger = (side == "LONG" and diff <= -DCA_DEVIATION_PERCENT) or (side == "SHORT" and diff >= DCA_DEVIATION_PERCENT)
                         
                         if trigger and level < DCA_COUNT:
+                            log_print(f"DCA TRIGGER {symbol} Level {level+1} | Diff: {diff:.2f}%")
                             qty = (TRADE_SIZE * (DCA_VOLUME_MULTIPLIER ** level)) / curr_price
                             resp = api_request("POST", "/openApi/swap/v2/trade/order", {"symbol": symbol, "side": "BUY" if side == "LONG" else "SELL", "positionSide": side, "type": "MARKET", "quantity": str(round(qty, 6))})
                             if resp and resp.get("code") == 0:
                                 time.sleep(3); set_tp_sl(symbol, side, level + 1, first_price)
         except Exception as e: log_print(f"Monitor Fehler: {e}")
-        time.sleep(30)
+        time.sleep(10) # <-- Auf 10 Sekunden gesetzt
 
 @app.route("/ping")
 @app.route("/")
-def health(): return "STATLESS_BOT_V1.5_ONLINE", 200
+def health(): return "STATLESS_BOT_V1.6_ONLINE", 200
 
 @app.route("/testorder", methods=["POST"])
 def webhook():
