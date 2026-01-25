@@ -23,10 +23,10 @@ BINGX_BASE = "https://open-api.bingx.com"
 
 app = Flask(__name__)
 
-# --- LOKALER SPEICHER (Wird beim Start gefüllt) ---
-# Struktur: {"SYMBOL_SIDE": {"level": 1, "last_price": 0.0, "first_price": 0.0}}
+# --- LOKALER SPEICHER ---
 pos_tracker = {}
 tracker_lock = threading.Lock()
+is_synced = False  # Neu: Status-Flag für den Sync
 
 # --- STRATEGIE EINSTELLUNGEN ---
 TP_MODE = "FIRST_ORDER"        
@@ -58,34 +58,35 @@ def api_request(method, endpoint, params=None):
         log_print(f"API Fehler {endpoint}: {e}")
         return None
 
-# --- INITIALER SCAN BEIM START ---
+# --- INITIALER SCAN (Jetzt als Hintergrund-Thread) ---
 def sync_positions_with_bingx():
-    log_print("[SYNC] Starte initialen Positions-Scan...")
+    global is_synced
+    log_print("[SYNC] Starte Hintergrund-Scan der Positionen...")
     r_pos = api_request("GET", "/openApi/swap/v2/user/positions")
-    if not r_pos or not isinstance(r_pos.get("data"), list):
-        log_print("[SYNC] Keine aktiven Positionen gefunden.")
-        return
-
-    with tracker_lock:
-        for pos in r_pos["data"]:
-            amt = float(pos.get("positionAmt", 0))
-            if amt == 0: continue
-            
-            symbol = pos["symbol"]
-            side = pos["positionSide"]
-            key = f"{symbol}_{side}"
-            
-            # Historie für diese Position einmalig abfragen
-            r_orders = api_request("GET", "/openApi/swap/v2/trade/allOrders", {"symbol": symbol, "limit": 20})
-            if r_orders and isinstance(r_orders.get("data"), list):
-                filled = [o for o in r_orders["data"] if o.get("status") == "FILLED" and o.get("positionSide") == side and o.get("type") == "MARKET"]
-                if filled:
-                    pos_tracker[key] = {
-                        "level": len(filled),
-                        "last_price": float(filled[0]["avgPrice"]),
-                        "first_price": float(filled[-1]["avgPrice"])
-                    }
-                    log_print(f"[SYNC] Gefunden: {key} auf DCA Level {len(filled)}")
+    
+    if r_pos and isinstance(r_pos.get("data"), list):
+        with tracker_lock:
+            for pos in r_pos["data"]:
+                amt = float(pos.get("positionAmt", 0))
+                if amt == 0: continue
+                
+                symbol = pos["symbol"]
+                side = pos["positionSide"]
+                key = f"{symbol}_{side}"
+                
+                r_orders = api_request("GET", "/openApi/swap/v2/trade/allOrders", {"symbol": symbol, "limit": 20})
+                if r_orders and isinstance(r_orders.get("data"), list):
+                    filled = [o for o in r_orders["data"] if o.get("status") == "FILLED" and o.get("positionSide") == side and o.get("type") == "MARKET"]
+                    if filled:
+                        pos_tracker[key] = {
+                            "level": len(filled),
+                            "last_price": float(filled[0]["avgPrice"]),
+                            "first_price": float(filled[-1]["avgPrice"])
+                        }
+                        log_print(f"[SYNC] Gefunden: {key} auf DCA Level {len(filled)}")
+    
+    is_synced = True
+    log_print("[SYNC] Initialer Scan abgeschlossen. Monitor bereit.")
 
 # --- TP / SL SETZEN ---
 def set_tp_sl(symbol, side, current_level, first_price=None):
@@ -111,67 +112,57 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
             "type": "STOP_MARKET", "stopPrice": f"{sl_price:.6f}", "workingType": "MARK_PRICE", "closePosition": "true"
         })
 
-# --- MONITOR (Arbeitet jetzt mit lokalem pos_tracker) ---
+# --- MONITOR ---
 def monitor_dca():
-    log_print("[SYSTEM] Monitor (10s) mit lokalem Tracking aktiv.")
+    while not is_synced:  # Warten bis Sync fertig ist
+        time.sleep(2)
+        
+    log_print("[SYSTEM] Monitor aktiv.")
     while True:
         try:
-            # Wir prüfen nur Symbole, die wir im Tracker haben
             keys_to_check = list(pos_tracker.keys())
-            if not keys_to_check:
-                time.sleep(10)
-                continue
-
             for key in keys_to_check:
                 symbol, side = key.split("_")
                 data = pos_tracker.get(key)
                 if not data: continue
 
-                # Aktuellen Preis holen
                 r_ticker = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
                 if not r_ticker or "data" not in r_ticker: continue
                 curr_price = float(r_ticker["data"].get("price", 0))
                 
-                last_price = data["last_price"]
-                level = data["level"]
-                
-                diff = ((curr_price / last_price) - 1) * 100
+                diff = ((curr_price / data["last_price"]) - 1) * 100
                 trigger = (side == "LONG" and diff <= -DCA_DEVIATION_PERCENT) or (side == "SHORT" and diff >= DCA_DEVIATION_PERCENT)
 
-                if trigger and level < DCA_COUNT:
-                    log_print(f"[DCA] Trigger {symbol} Level {level+1} (Diff: {diff:.2f}%)")
-                    qty = (TRADE_SIZE * (DCA_VOLUME_MULTIPLIER ** level)) / curr_price
+                if trigger and data["level"] < DCA_COUNT:
+                    log_print(f"[DCA] Trigger {symbol} Level {data['level']+1}")
+                    qty = (TRADE_SIZE * (DCA_VOLUME_MULTIPLIER ** data["level"])) / curr_price
                     resp = api_request("POST", "/openApi/swap/v2/trade/order", {
                         "symbol": symbol, "side": "BUY" if side == "LONG" else "SELL",
                         "positionSide": side, "type": "MARKET", "quantity": str(round(qty, 6))
                     })
-                    
                     if resp and resp.get("code") == 0:
-                        # Lokalen Speicher SOFORT aktualisieren
                         with tracker_lock:
                             pos_tracker[key]["level"] += 1
                             pos_tracker[key]["last_price"] = curr_price
-                        
                         time.sleep(2)
-                        set_tp_sl(symbol, side, level + 1, data["first_price"])
+                        set_tp_sl(symbol, side, data["level"], data["first_price"])
             
-            # Check, ob Positionen geschlossen wurden (aus Tracker entfernen)
-            # Um API zu sparen, machen wir das nur alle 30 Sek
+            # Alle 30 Sek Cleanup
             if int(time.time()) % 30 < 10:
                 r_pos = api_request("GET", "/openApi/swap/v2/user/positions")
                 if r_pos and "data" in r_pos:
                     active_keys = [f"{p['symbol']}_{p['positionSide']}" for p in r_pos["data"] if float(p.get("positionAmt", 0)) != 0]
                     with tracker_lock:
                         for k in list(pos_tracker.keys()):
-                            if k not in active_keys:
-                                log_print(f"[CLEANUP] Position {k} geschlossen. Entferne aus Tracker.")
-                                del pos_tracker[k]
-
-        except Exception as e:
-            log_print(f"Monitor Fehler: {e}")
+                            if k not in active_keys: del pos_tracker[k]
+        except Exception as e: log_print(f"Monitor Fehler: {e}")
         time.sleep(10)
 
 # --- WEBHOOKS ---
+@app.route("/ping")
+@app.route("/")
+def health(): return "BOT_ONLINE", 200
+
 @app.route("/testorder", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
@@ -185,21 +176,17 @@ def execute_initial_trade(symbol, direction):
     r_ticker = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     price = float(r_ticker["data"].get("price", 0)) if r_ticker else 0
     if price == 0: return
-    
     qty = round(TRADE_SIZE / price, 6)
     resp = api_request("POST", "/openApi/swap/v2/trade/order", {"symbol": symbol, "side": "BUY" if direction == "LONG" else "SELL", "positionSide": direction, "type": "MARKET", "quantity": str(qty)})
-    
     if resp and resp.get("code") == 0:
         key = f"{symbol}_{direction}"
         with tracker_lock:
             pos_tracker[key] = {"level": 1, "last_price": price, "first_price": price}
-        log_print(f"[INIT] {symbol} gestartet & im Tracker gespeichert.")
         time.sleep(3)
         set_tp_sl(symbol, direction, 1, price)
 
 if __name__ == "__main__":
-    # 1. Einmalige Synchronisation beim Start
-    sync_positions_with_bingx()
-    # 2. Monitor starten
+    # Flask sofort starten, damit Render Health Check nicht timed out
+    threading.Thread(target=sync_positions_with_bingx, daemon=True).start()
     threading.Thread(target=monitor_dca, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
