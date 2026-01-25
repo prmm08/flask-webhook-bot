@@ -30,7 +30,7 @@ is_synced = False
 
 # --- STRATEGIE EINSTELLUNGEN ---
 TP_MODE = "FIRST_ORDER"        
-USE_SL = False              
+USE_SL = True              
 SL_PERCENT = 0.5        
 TP_PERCENT = 0.5          
 BE_DCA_LEVEL = 1           
