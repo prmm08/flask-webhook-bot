@@ -115,31 +115,6 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
         })
     log_print(f"[SUCCESS] TP/SL erneuert für {symbol}")
 
-# --- WATCHER (Intervall: 10 Sek) ---
-def tp_watcher():
-    log_print("[SYSTEM] TP/SL Watcher (10s) aktiv.")
-    while True:
-        try:
-            r_pos = api_request("GET", "/openApi/swap/v2/user/positions")
-            if r_pos and isinstance(r_pos.get("data"), list):
-                for pos in r_pos["data"]:
-                    if float(pos.get("positionAmt", 0)) == 0: continue
-                    symbol, side = pos["symbol"], pos["positionSide"]
-                    
-                    r_orders = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
-                    if r_orders and isinstance(r_orders.get("data"), list):
-                        has_tp = any(o.get("type") in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] for o in r_orders["data"])
-                        has_sl = any(o.get("type") in ["STOP_MARKET", "STOP"] for o in r_orders["data"]) if USE_SL else True
-                        
-                        if not has_tp or not has_sl:
-                            log_print(f"[WATCHER] TP/SL fehlt bei {symbol}! Repariere...")
-                            level, _, first_p = get_dca_history(symbol, side)
-                            set_tp_sl(symbol, side, level, first_p)
-                            send_telegram(f"🔧 Watcher hat TP/SL für {symbol} nachgesetzt.")
-        except Exception as e:
-            log_print(f"Watcher Fehler: {e}")
-        time.sleep(10) # <-- Auf 10 Sekunden gesetzt
-
 # --- MONITOR (DCA - Intervall: 10 Sek) ---
 def monitor_dca():
     log_print("[SYSTEM] Monitor (10s) aktiv.")
@@ -166,11 +141,11 @@ def monitor_dca():
                             if resp and resp.get("code") == 0:
                                 time.sleep(3); set_tp_sl(symbol, side, level + 1, first_price)
         except Exception as e: log_print(f"Monitor Fehler: {e}")
-        time.sleep(10) # <-- Auf 10 Sekunden gesetzt
+        time.sleep(10)
 
 @app.route("/ping")
 @app.route("/")
-def health(): return "STATLESS_BOT_V1.6_ONLINE", 200
+def health(): return "STATLESS_BOT_V1.7_ONLINE", 200
 
 @app.route("/testorder", methods=["POST"])
 def webhook():
@@ -191,6 +166,6 @@ def execute_initial_trade(symbol, direction):
             time.sleep(3); set_tp_sl(symbol, direction, 1, price)
 
 if __name__ == "__main__":
+    # Nur noch der DCA Monitor wird gestartet
     threading.Thread(target=monitor_dca, daemon=True).start()
-    threading.Thread(target=tp_watcher, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
