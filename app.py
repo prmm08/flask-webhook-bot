@@ -29,7 +29,7 @@ tracker_lock = threading.Lock()
 is_synced = False 
 
 # --- STRATEGIE EINSTELLUNGEN ---
-TP_MODE = "FIRST_ORDER"        
+TP_MODE = "AVERAGE"        
 USE_SL = False              
 SL_PERCENT = 40.0          
 TP_PERCENT = 1.0           
