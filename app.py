@@ -33,13 +33,13 @@ TP_MODE = "AVERAGE"
 USE_SL = False              
 SL_PERCENT = 2.5          
 TP_PERCENT = 0.5           
-BE_DCA_LEVEL = 2           
+BE_DCA_LEVEL = 3           
 BE_PROFIT_PERCENT = 0.05   
 
-DCA_COUNT = 4          
+DCA_COUNT = 6          
 DCA_DEVIATION_PERCENT = 5.0
 DCA_VOLUME_MULTIPLIER = 2
-TRADE_SIZE = 200.0
+TRADE_SIZE = 20.0
 LEVERAGE = 20
 
 # --- API CORE ---
