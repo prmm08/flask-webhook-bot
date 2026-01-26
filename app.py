@@ -31,7 +31,7 @@ is_synced = False
 # --- STRATEGIE EINSTELLUNGEN ---
 TP_MODE = "AVERAGE"        
 USE_SL = False              
-SL_PERCENT = 40.0          
+SL_PERCENT = 2.5          
 TP_PERCENT = 0.5           
 BE_DCA_LEVEL = 2           
 BE_PROFIT_PERCENT = 0.05   
