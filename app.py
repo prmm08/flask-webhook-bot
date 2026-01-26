@@ -29,14 +29,14 @@ tracker_lock = threading.Lock()
 is_synced = False 
 
 # --- STRATEGIE EINSTELLUNGEN ---
-TP_MODE = "FIRST_ORDER"        
+TP_MODE = "AVERAGE"        
 USE_SL = False              
 SL_PERCENT = 40.0          
 TP_PERCENT = 0.5           
 BE_DCA_LEVEL = 2           
 BE_PROFIT_PERCENT = 0.05   
 
-DCA_COUNT = 3          
+DCA_COUNT = 4          
 DCA_DEVIATION_PERCENT = 5.0
 DCA_VOLUME_MULTIPLIER = 2
 TRADE_SIZE = 10.0
