@@ -193,7 +193,7 @@ def cancel_order_by_id_verbose(symbol, order_id):
     return resp
 
 def set_tp_sl(symbol, side, current_level, first_price=None):
-    # Hole Position (robust)
+    # Hole Position
     r_pos = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
     log_print(f"[TP/SL] user/positions resp={r_pos}")
     if not r_pos or not isinstance(r_pos.get("data"), list):
@@ -210,10 +210,10 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
     tp_price = base_price * (1 + target_tp_pct / 100) if side == "LONG" else base_price * (1 - target_tp_pct / 100)
     log_print(f"[TP/SL] current_level={current_level} target_tp_pct={target_tp_pct} base_price={base_price:.8f} tp_price={tp_price:.8f}")
 
-    # Debug: offene Orders vor Änderung
+    # 1) Debug dump offene Orders vor Änderung
     debug_dump_open_orders(symbol)
 
-    # Lösche vorhandene TAKE_PROFIT Orders gezielt per orderId
+    # 2) Lösche vorhandene TP Orders gezielt per orderId
     open_orders = debug_dump_open_orders(symbol) or []
     for o in open_orders:
         o_type = str(o.get("type", "")).upper()
@@ -223,7 +223,7 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
                 cancel_order_by_id_verbose(symbol, oid)
                 time.sleep(0.25)
 
-    # Nur erlaubte workingType Werte (Bingx validiert strikt)
+    # 3) Versuche TP mit erlaubten workingType Werten
     working_types = ["MARK_PRICE", "CONTRACT_PRICE"]
 
     # Warte kurz, falls Position gerade erst gefüllt wurde
@@ -268,9 +268,32 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
             log_print(f"[TP] TP erfolgreich gesetzt für {symbol} mit workingType={wt} stopPrice={tp_price:.8f}")
             return
         else:
-            # Wenn API eine klare Fehlermeldung zurückgab, loggen und ggf. abbrechen
             if resp and isinstance(resp, dict) and resp.get("code") is not None and resp.get("code") != 0:
-                log_print(f"[TP
+                log_print(f"[TP_ERROR] API-Antwort workingType={wt}: {resp}")
+                if str(resp.get("code")).startswith("109") or "Invalid parameters" in str(resp.get("msg", "")):
+                    log_print(f"[TP] Abbruch für workingType={wt} wegen Validierungsfehler.")
+                    continue
+            log_print(f"[TP] TP nicht gefunden nach POST mit workingType={wt}, versuche nächsten workingType")
+            time.sleep(1.0)
+
+    log_print(f"[TP] Konnte TP nicht verifizieren für {symbol}. Bitte manuell prüfen. Erwartet stopPrice={tp_price:.8f}")
+
+    # Optional: SL setzen (analog)
+    if USE_SL:
+        sl_price = avg_price * (1 - SL_PERCENT / 100) if side == "LONG" else avg_price * (1 + SL_PERCENT / 100)
+        sl_params = {
+            "symbol": symbol,
+            "side": "SELL" if side == "LONG" else "BUY",
+            "positionSide": side,
+            "type": "STOP_MARKET",
+            "stopPrice": f"{sl_price:.8f}",
+            "workingType": "MARK_PRICE",
+            "closePosition": "true"
+        }
+        resp_sl = api_request("POST", "/openApi/swap/v2/trade/order", sl_params)
+        log_print(f"[SL_POST] params={sl_params} resp={resp_sl}")
+        time.sleep(0.6)
+        debug_dump_open_orders(symbol)
 
 # --- MONITOR (DCA Check) ---
 def monitor_dca():
