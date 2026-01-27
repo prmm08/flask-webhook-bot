@@ -193,7 +193,7 @@ def cancel_order_by_id_verbose(symbol, order_id):
     return resp
 
 def set_tp_sl(symbol, side, current_level, first_price=None):
-    # Hole Position
+    # Hole Position (robust)
     r_pos = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
     log_print(f"[TP/SL] user/positions resp={r_pos}")
     if not r_pos or not isinstance(r_pos.get("data"), list):
@@ -210,10 +210,10 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
     tp_price = base_price * (1 + target_tp_pct / 100) if side == "LONG" else base_price * (1 - target_tp_pct / 100)
     log_print(f"[TP/SL] current_level={current_level} target_tp_pct={target_tp_pct} base_price={base_price:.8f} tp_price={tp_price:.8f}")
 
-    # 1) Debug dump offene Orders vor Änderung
+    # Debug: offene Orders vor Änderung
     debug_dump_open_orders(symbol)
 
-    # 2) Lösche vorhandene TP Orders gezielt per orderId
+    # Lösche vorhandene TAKE_PROFIT Orders gezielt per orderId
     open_orders = debug_dump_open_orders(symbol) or []
     for o in open_orders:
         o_type = str(o.get("type", "")).upper()
@@ -223,8 +223,12 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
                 cancel_order_by_id_verbose(symbol, oid)
                 time.sleep(0.25)
 
-    # 3) Versuche TP mit verschiedenen workingType falls nötig
-    working_types = ["MARK_PRICE", "CONTRACT_PRICE", "LAST_PRICE"]
+    # Nur erlaubte workingType Werte (Bingx validiert strikt)
+    working_types = ["MARK_PRICE", "CONTRACT_PRICE"]
+
+    # Warte kurz, falls Position gerade erst gefüllt wurde
+    time.sleep(1.2)
+
     for wt in working_types:
         tp_params = {
             "symbol": symbol,
@@ -236,16 +240,16 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
             "closePosition": "true"
         }
         resp = api_request("POST", "/openApi/swap/v2/trade/order", tp_params)
-        log_print(f"[TP_POST] attempt workingType={wt} params={tp_params} resp={resp}")
+        log_print(f"[TP_POST] workingType={wt} params={tp_params} resp={resp}")
 
-        # Wenn API orderId zurückgibt, nutze sie zur Verifikation
+        # Wenn API orderId zurückgibt, notiere sie
         order_id = None
         if resp and isinstance(resp, dict):
             order_id = resp.get("data", {}).get("orderId") or resp.get("orderId") or resp.get("data", {}).get("order_id") or resp.get("data", {}).get("id")
             log_print(f"[TP_POST] returned order_id={order_id}")
 
         # kurze Wartezeit, dann offene Orders prüfen
-        time.sleep(0.8)
+        time.sleep(0.9)
         open_after = debug_dump_open_orders(symbol) or []
         found = False
         for o in open_after:
@@ -262,27 +266,11 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
 
         if found:
             log_print(f"[TP] TP erfolgreich gesetzt für {symbol} mit workingType={wt} stopPrice={tp_price:.8f}")
-            break
+            return
         else:
-            log_print(f"[TP] TP nicht gefunden nach POST mit workingType={wt}, versuche nächsten workingType")
-            time.sleep(1.0)
-
-    # 4) Falls SL gewünscht, analog setzen und verifizieren
-    if USE_SL:
-        sl_price = avg_price * (1 - SL_PERCENT / 100) if side == "LONG" else avg_price * (1 + SL_PERCENT / 100)
-        sl_params = {
-            "symbol": symbol,
-            "side": "SELL" if side == "LONG" else "BUY",
-            "positionSide": side,
-            "type": "STOP_MARKET",
-            "stopPrice": f"{sl_price:.8f}",
-            "workingType": "MARK_PRICE",
-            "closePosition": "true"
-        }
-        resp_sl = api_request("POST", "/openApi/swap/v2/trade/order", sl_params)
-        log_print(f"[SL_POST] params={sl_params} resp={resp_sl}")
-        time.sleep(0.6)
-        debug_dump_open_orders(symbol)
+            # Wenn API eine klare Fehlermeldung zurückgab, loggen und ggf. abbrechen
+            if resp and isinstance(resp, dict) and resp.get("code") is not None and resp.get("code") != 0:
+                log_print(f"[TP
 
 # --- MONITOR (DCA Check) ---
 def monitor_dca():
