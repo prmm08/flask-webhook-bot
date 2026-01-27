@@ -34,13 +34,17 @@ USE_SL = False
 SL_PERCENT = 2.5
 TP_PERCENT = 0.5
 BE_DCA_LEVEL = 2
-BE_PROFIT_PERCENT = 0.05
+BE_PROFIT_PERCENT = 2
 
 DCA_COUNT = 6
 DCA_DEVIATION_PERCENT = 2.5
 DCA_VOLUME_MULTIPLIER = 2
 TRADE_SIZE = 10
 LEVERAGE = 20
+
+# --- TP/Retry Einstellungen ---
+MAX_RETRIES_TP = 3
+RETRY_BACKOFF = 1.5  # Sekunden, multipliziert pro Versuch
 
 # --- API CORE ---
 def api_request(method, endpoint, params=None, max_retries=3):
@@ -109,8 +113,37 @@ def compute_target_price(last_price, side, deviation_pct):
 def round_qty_to_step(qty, step=0.000001):
     if qty <= 0:
         return 0
-    # Simple rounding to step; adapt if you fetch real exchange stepSize
     return round(qty - (qty % step), 6)
+
+# --- ORDER / OPEN ORDERS HELPERS ---
+def list_open_orders(symbol):
+    resp = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "limit": 200})
+    if not resp:
+        log_print(f"[OPEN_ORDERS] Keine Antwort für {symbol}")
+        return []
+    return resp.get("data") if isinstance(resp.get("data"), list) else []
+
+def find_tp_orders(open_orders, positionSide):
+    tps = []
+    for o in open_orders:
+        o_type = str(o.get("type", "")).upper()
+        if "TAKE_PROFIT" in o_type and o.get("positionSide") == positionSide:
+            tps.append(o)
+    return tps
+
+def cancel_order_by_id(symbol, order_id):
+    resp = api_request("DELETE", "/openApi/swap/v2/trade/order", {"symbol": symbol, "orderId": str(order_id)})
+    log_print(f"[CANCEL] cancel order {order_id} resp={resp}")
+    return resp
+
+def ensure_tp_exists(symbol, side, positionSide, expected_stop_price):
+    open_orders = list_open_orders(symbol)
+    tps = find_tp_orders(open_orders, positionSide)
+    for o in tps:
+        stop = safe_float(o.get("stopPrice") or o.get("price") or o.get("triggerPrice") or 0)
+        if abs(stop - expected_stop_price) <= (expected_stop_price * 0.0005 + 1e-8):
+            return True, o
+    return False, None
 
 # --- SYNC LOGIK ---
 def sync_with_bingx():
@@ -148,9 +181,21 @@ def minute_sync_task():
         except Exception as e:
             log_print(f"[ERROR] minute_sync_task: {e}")
 
-# --- TP / SL SETZEN ---
+# --- ROBUSTES TP / SL SETZEN (mit Verifikation, Debug und Retry) ---
+def debug_dump_open_orders(symbol):
+    resp = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "limit": 200})
+    log_print(f"[DEBUG_OPEN_ORDERS] symbol={symbol} resp={resp}")
+    return resp.get("data") if resp and isinstance(resp.get("data"), list) else []
+
+def cancel_order_by_id_verbose(symbol, order_id):
+    resp = api_request("DELETE", "/openApi/swap/v2/trade/order", {"symbol": symbol, "orderId": str(order_id)})
+    log_print(f"[CANCEL_VERBOSE] symbol={symbol} orderId={order_id} resp={resp}")
+    return resp
+
 def set_tp_sl(symbol, side, current_level, first_price=None):
+    # Hole Position
     r_pos = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
+    log_print(f"[TP/SL] user/positions resp={r_pos}")
     if not r_pos or not isinstance(r_pos.get("data"), list):
         log_print(f"[TP/SL] Keine Positionsdaten für {symbol}")
         return
@@ -158,25 +203,71 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
     if not pos:
         log_print(f"[TP/SL] Keine offene Position gefunden für {symbol} {side}")
         return
+
     avg_price = safe_float(pos.get("avgPrice"))
     target_tp_pct = BE_PROFIT_PERCENT if current_level >= BE_DCA_LEVEL else TP_PERCENT
     base_price = avg_price if (TP_MODE == "AVERAGE" or current_level >= BE_DCA_LEVEL) else (first_price or avg_price)
     tp_price = base_price * (1 + target_tp_pct / 100) if side == "LONG" else base_price * (1 - target_tp_pct / 100)
+    log_print(f"[TP/SL] current_level={current_level} target_tp_pct={target_tp_pct} base_price={base_price:.8f} tp_price={tp_price:.8f}")
 
-    api_request("DELETE", "/openApi/swap/v2/trade/order", {"symbol": symbol})
+    # 1) Debug dump offene Orders vor Änderung
+    debug_dump_open_orders(symbol)
 
-    tp_params = {
-        "symbol": symbol,
-        "side": "SELL" if side == "LONG" else "BUY",
-        "positionSide": side,
-        "type": "TAKE_PROFIT_MARKET",
-        "stopPrice": f"{tp_price:.6f}",
-        "workingType": "MARK_PRICE",
-        "closePosition": "true"
-    }
-    api_request("POST", "/openApi/swap/v2/trade/order", tp_params)
-    log_print(f"[TP] TP gesetzt für {symbol} {side} bei {tp_price:.6f}")
+    # 2) Lösche vorhandene TP Orders gezielt per orderId
+    open_orders = debug_dump_open_orders(symbol) or []
+    for o in open_orders:
+        o_type = str(o.get("type", "")).upper()
+        if "TAKE_PROFIT" in o_type and o.get("positionSide") == side:
+            oid = o.get("orderId") or o.get("order_id") or o.get("id")
+            if oid:
+                cancel_order_by_id_verbose(symbol, oid)
+                time.sleep(0.25)
 
+    # 3) Versuche TP mit verschiedenen workingType falls nötig
+    working_types = ["MARK_PRICE", "CONTRACT_PRICE", "LAST_PRICE"]
+    for wt in working_types:
+        tp_params = {
+            "symbol": symbol,
+            "side": "SELL" if side == "LONG" else "BUY",
+            "positionSide": side,
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": f"{tp_price:.8f}",
+            "workingType": wt,
+            "closePosition": "true"
+        }
+        resp = api_request("POST", "/openApi/swap/v2/trade/order", tp_params)
+        log_print(f"[TP_POST] attempt workingType={wt} params={tp_params} resp={resp}")
+
+        # Wenn API orderId zurückgibt, nutze sie zur Verifikation
+        order_id = None
+        if resp and isinstance(resp, dict):
+            order_id = resp.get("data", {}).get("orderId") or resp.get("orderId") or resp.get("data", {}).get("order_id") or resp.get("data", {}).get("id")
+            log_print(f"[TP_POST] returned order_id={order_id}")
+
+        # kurze Wartezeit, dann offene Orders prüfen
+        time.sleep(0.8)
+        open_after = debug_dump_open_orders(symbol) or []
+        found = False
+        for o in open_after:
+            stop = safe_float(o.get("stopPrice") or o.get("price") or o.get("triggerPrice") or 0)
+            oid2 = o.get("orderId") or o.get("order_id") or o.get("id")
+            if abs(stop - tp_price) <= (tp_price * 0.0005 + 1e-10):
+                log_print(f"[TP_VERIFY] Found TP order matching stopPrice={stop} oid={oid2} workingType={o.get('workingType')}")
+                found = True
+                break
+            if order_id and oid2 and str(order_id) == str(oid2):
+                log_print(f"[TP_VERIFY] Found TP by orderId match oid={oid2}")
+                found = True
+                break
+
+        if found:
+            log_print(f"[TP] TP erfolgreich gesetzt für {symbol} mit workingType={wt} stopPrice={tp_price:.8f}")
+            break
+        else:
+            log_print(f"[TP] TP nicht gefunden nach POST mit workingType={wt}, versuche nächsten workingType")
+            time.sleep(1.0)
+
+    # 4) Falls SL gewünscht, analog setzen und verifizieren
     if USE_SL:
         sl_price = avg_price * (1 - SL_PERCENT / 100) if side == "LONG" else avg_price * (1 + SL_PERCENT / 100)
         sl_params = {
@@ -184,12 +275,14 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
             "side": "SELL" if side == "LONG" else "BUY",
             "positionSide": side,
             "type": "STOP_MARKET",
-            "stopPrice": f"{sl_price:.6f}",
+            "stopPrice": f"{sl_price:.8f}",
             "workingType": "MARK_PRICE",
             "closePosition": "true"
         }
-        api_request("POST", "/openApi/swap/v2/trade/order", sl_params)
-        log_print(f"[SL] SL gesetzt für {symbol} {side} bei {sl_price:.6f}")
+        resp_sl = api_request("POST", "/openApi/swap/v2/trade/order", sl_params)
+        log_print(f"[SL_POST] params={sl_params} resp={resp_sl}")
+        time.sleep(0.6)
+        debug_dump_open_orders(symbol)
 
 # --- MONITOR (DCA Check) ---
 def monitor_dca():
