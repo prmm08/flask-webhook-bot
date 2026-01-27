@@ -42,6 +42,10 @@ DCA_VOLUME_MULTIPLIER = 2
 TRADE_SIZE = 10
 LEVERAGE = 20
 
+# --- DCA / TP Timing (Sekunden) ---
+DCA_TP_REMOVE_WAIT = 5
+DCA_TP_SET_WAIT = 5
+
 # --- TP/Retry Einstellungen ---
 MAX_RETRIES_TP = 3
 RETRY_BACKOFF = 1.5  # Sekunden, multipliziert pro Versuch
@@ -136,6 +140,16 @@ def cancel_order_by_id(symbol, order_id):
     log_print(f"[CANCEL] cancel order {order_id} resp={resp}")
     return resp
 
+def debug_dump_open_orders(symbol):
+    resp = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "limit": 200})
+    log_print(f"[DEBUG_OPEN_ORDERS] symbol={symbol} resp={resp}")
+    return resp.get("data") if resp and isinstance(resp.get("data"), list) else []
+
+def cancel_order_by_id_verbose(symbol, order_id):
+    resp = api_request("DELETE", "/openApi/swap/v2/trade/order", {"symbol": symbol, "orderId": str(order_id)})
+    log_print(f"[CANCEL_VERBOSE] symbol={symbol} orderId={order_id} resp={resp}")
+    return resp
+
 def ensure_tp_exists(symbol, side, positionSide, expected_stop_price):
     open_orders = list_open_orders(symbol)
     tps = find_tp_orders(open_orders, positionSide)
@@ -181,17 +195,35 @@ def minute_sync_task():
         except Exception as e:
             log_print(f"[ERROR] minute_sync_task: {e}")
 
+# --- REMOVE TP ORDERS HELPER ---
+def remove_tp_orders(symbol, side):
+    """
+    Löscht gezielt TAKE_PROFIT Orders für ein Symbol/PositionSide.
+    Nutzt orderId wenn vorhanden und loggt die Antworten.
+    """
+    try:
+        open_orders = debug_dump_open_orders(symbol) or []
+        removed = 0
+        for o in open_orders:
+            o_type = str(o.get("type", "")).upper()
+            if "TAKE_PROFIT" in o_type and o.get("positionSide") == side:
+                oid = o.get("orderId") or o.get("order_id") or o.get("id")
+                if oid:
+                    resp = cancel_order_by_id_verbose(symbol, oid)
+                    removed += 1
+                    time.sleep(0.25)
+                else:
+                    resp = api_request("DELETE", "/openApi/swap/v2/trade/order", {"symbol": symbol})
+                    log_print(f"[CANCEL_FALLBACK] symbol={symbol} resp={resp}")
+                    removed += 1
+                    time.sleep(0.25)
+        log_print(f"[REMOVE_TP] Entfernte TP Orders für {symbol} {side}: {removed}")
+        return removed
+    except Exception as e:
+        log_print(f"[ERROR] remove_tp_orders für {symbol} {side}: {e}")
+        return 0
+
 # --- ROBUSTES TP / SL SETZEN (mit Verifikation, Debug und Retry) ---
-def debug_dump_open_orders(symbol):
-    resp = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "limit": 200})
-    log_print(f"[DEBUG_OPEN_ORDERS] symbol={symbol} resp={resp}")
-    return resp.get("data") if resp and isinstance(resp.get("data"), list) else []
-
-def cancel_order_by_id_verbose(symbol, order_id):
-    resp = api_request("DELETE", "/openApi/swap/v2/trade/order", {"symbol": symbol, "orderId": str(order_id)})
-    log_print(f"[CANCEL_VERBOSE] symbol={symbol} orderId={order_id} resp={resp}")
-    return resp
-
 def set_tp_sl(symbol, side, current_level, first_price=None):
     # Hole Position
     r_pos = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
@@ -295,7 +327,7 @@ def set_tp_sl(symbol, side, current_level, first_price=None):
         time.sleep(0.6)
         debug_dump_open_orders(symbol)
 
-# --- MONITOR (DCA Check) ---
+# --- MONITOR (DCA Check) with TP remove/wait/set flow ---
 def monitor_dca():
     while not is_synced:
         time.sleep(2)
@@ -339,6 +371,8 @@ def monitor_dca():
                     continue
 
                 log_print(f"[DCA] Trigger für {symbol} {side} level={data['level']} curr={curr_price:.6f} target={target_price:.6f} qty={qty}")
+
+                # DCA Market Order platzieren
                 resp = api_request("POST", "/openApi/swap/v2/trade/order", {
                     "symbol": symbol,
                     "side": "BUY" if side == "LONG" else "SELL",
@@ -356,9 +390,11 @@ def monitor_dca():
                     log_print(f"[ERROR] DCA Order abgelehnt für {symbol}: {resp}")
                     continue
 
+                # Kurz warten, dann ausgeführten Preis holen
                 time.sleep(1)
                 executed_price = get_executed_price_from_position(symbol, side) or get_order_fill_price_from_resp(resp) or curr_price
 
+                # Tracker atomar updaten
                 with tracker_lock:
                     pos_tracker[key]["level"] = data["level"] + 1
                     pos_tracker[key]["last_price"] = executed_price
@@ -366,8 +402,20 @@ def monitor_dca():
                         pos_tracker[key]["first_price"] = executed_price
 
                 log_print(f"[DCA] Order gefüllt für {symbol} at {executed_price:.6f} new_level={pos_tracker[key]['level']}")
-                time.sleep(2)
+
+                # --- Neuer Ablauf: 5s warten, TP entfernen, 5s warten, TP neu setzen ---
+                log_print(f"[DCA_FLOW] Warte {DCA_TP_REMOVE_WAIT}s vor Entfernen TP für {symbol}")
+                time.sleep(DCA_TP_REMOVE_WAIT)
+
+                # Entferne vorhandene TP Orders
+                removed = remove_tp_orders(symbol, side)
+
+                log_print(f"[DCA_FLOW] Warte {DCA_TP_SET_WAIT}s vor Neusetzen TP für {symbol}")
+                time.sleep(DCA_TP_SET_WAIT)
+
+                # Setze neuen TP (verifiziert in set_tp_sl)
                 set_tp_sl(symbol, side, pos_tracker[key]["level"], pos_tracker[key]["first_price"])
+
         except Exception as e:
             log_print(f"[EXCEPTION] monitor_dca: {e}")
         time.sleep(5)
