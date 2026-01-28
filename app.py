@@ -1,4 +1,4 @@
-#----------------- Working Skript WATCHER TP, SL, DCA mit BE und Telegram 28.01.2026 12:58-------------------#
+#----------------- Working Skript WATCHER TP, SL, DCA mit BE, Telegram und Max Open Positions -------------------#
 
 import hmac
 import hashlib
@@ -24,13 +24,16 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 LEVERAGE = 20
 TRADE_SIZE = 200
 TP_PERCENT = 0.5
-SL_PERCENT = 50
+SL_PERCENT = 40
 
 # --- DCA SETTINGS ---
 DCA_INTERVAL = 5                # Sekunden zwischen DCA-Checks
 DCA_COUNT = 4
-DCA_DEVIATION_PERCENT = 100     # Prozent Abweichung vom entry_static für DCA-Trigger
+DCA_DEVIATION_PERCENT = 5       # Prozent Abweichung vom entry_static für DCA-Trigger
 DCA_VOLUME_MULTIPLIER = 2
+
+# --- RISK / LIMITS ---
+MAX_OPEN_POSITIONS = 15         # Maximale Anzahl gleichzeitig offener Positionen beim Exchange
 
 active_dca = {}
 dca_lock = threading.Lock()
@@ -386,15 +389,30 @@ def tp_sl_watcher():
 
 
 # ============================================================
-#   execute_trade() MIT DCA-INTEGRATION
+#   execute_trade() MIT DCA-INTEGRATION UND MAX OPEN POSITIONS CHECK
 # ============================================================
 
 def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
+    # Prüfe Anzahl offener Positionen insgesamt
+    positions = get_positions()
+    if positions is None:
+        print("[ERROR] Konnte Positionen nicht abrufen")
+        return
+
+    open_positions_count = sum(1 for p in positions if float(p.get("positionAmt", 0)) != 0)
+
+    if open_positions_count >= MAX_OPEN_POSITIONS:
+        msg = (f"[LIMIT] Offene Positionen {open_positions_count} >= MAX_OPEN_POSITIONS ({MAX_OPEN_POSITIONS}). "
+               f"Neuer Trade für {symbol} wird nicht eröffnet.")
+        print(msg)
+        send_telegram(msg)
+        return
+
     if not symbol_exists(symbol):
         print("[ERROR] Symbol existiert nicht:", symbol)
         return
 
-    positions = get_positions()
+    # Prüfe ob bereits eine Position für dieses Symbol+Side offen ist
     if any(p["symbol"] == symbol and p.get("positionSide") == direction and float(p["positionAmt"]) != 0 for p in positions):
         print("[SKIP] Position bereits offen:", symbol, direction)
         return
