@@ -1,4 +1,4 @@
-#----------------- Working Skript WATCHER TP, SL, DCA Working 17.01.26 19.40 (angepasst BE) -------------------#
+#----------------- Working Skript WATCHER TP, SL, DCA mit BE und Telegram 28.01.2026 12:58-------------------#
 
 import hmac
 import hashlib
@@ -12,30 +12,56 @@ import json
 from flask import Flask, request, jsonify
 import logging
 
-# --- API ---
+# --- CONFIG / ENV ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
-app = Flask(__name__)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # --- DEFAULT SETTINGS ---
 LEVERAGE = 20
 TRADE_SIZE = 200
 TP_PERCENT = 0.5
-SL_PERCENT = 80
+SL_PERCENT = 50
 
 # --- DCA SETTINGS ---
-DCA_INTERVAL = 5
+DCA_INTERVAL = 5                # Sekunden zwischen DCA-Checks
 DCA_COUNT = 4
-DCA_DEVIATION_PERCENT = 100
+DCA_DEVIATION_PERCENT = 100     # Prozent Abweichung vom entry_static für DCA-Trigger
 DCA_VOLUME_MULTIPLIER = 2
 
 active_dca = {}
 dca_lock = threading.Lock()
 last_dca_heartbeat = time.time()
+
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+app = Flask(__name__)
+
+
+# --- TELEGRAM HELPERS ---
+def send_telegram(message):
+    """
+    Sendet eine Textnachricht an den konfigurierten Telegram-Chat.
+    Wenn TELEGRAM_BOT_TOKEN oder TELEGRAM_CHAT_ID nicht gesetzt sind, passiert nichts.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        r = requests.post(url, data=payload, timeout=5)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print("[TELEGRAM ERROR]", e)
+        return False
 
 
 # --- SIGNATURE ---
@@ -191,7 +217,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
 
 
 # ============================================================
-#   DCA ENGINE — STABILE VERSION MIT BE-LOGIK
+#   DCA ENGINE — STABILE VERSION MIT BE-LOGIK UND TELEGRAM
 # ============================================================
 
 def update_entry(symbol, side):
@@ -262,7 +288,8 @@ def monitor_dca():
                     current_price
                 )
 
-                api_request("POST", "/openApi/swap/v2/trade/order", {
+                # Platzieren der Market-Order
+                resp = api_request("POST", "/openApi/swap/v2/trade/order", {
                     "symbol": symbol,
                     "side": "BUY" if side == "LONG" else "SELL",
                     "positionSide": side,
@@ -273,24 +300,37 @@ def monitor_dca():
 
                 with dca_lock:
                     d["executed"] += 1
-                    # avgPrice aktualisieren (intern, durch API Abfrage)
                     new_entry = update_entry(symbol, side)
                     if new_entry:
                         d["entry_dynamic"] = new_entry
 
-                    # Wenn mindestens 1 DCA ausgeführt wurde, BE setzen (TP = avgPrice)
                     if d["executed"] >= 1:
                         tp_price = d["entry_dynamic"]
                     else:
                         tp_price = None
 
-                # TP/SL neu setzen: wenn tp_price gesetzt -> BE, sonst Prozent
+                # TP/SL neu setzen
                 reset_tp_sl(symbol, side)
                 if tp_price is not None:
                     print(f"[DCA] {symbol} DCA#{d['executed']} executed. Set BE TP at {tp_price:.6f}")
                     set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"], tp_price=tp_price)
                 else:
                     set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"])
+
+                # Telegram Nachricht: nur wenn Order-Platzierung versucht wurde
+                try:
+                    if resp is None:
+                        msg = (f"⚠️ DCA Fehler für {symbol}\n"
+                               f"DCA#{d['executed']} qty={qty} price={current_price:.6f}\n"
+                               f"TP(BE)={'n/a' if tp_price is None else f'{tp_price:.6f}'}\n"
+                               f"API response: None or error")
+                    else:
+                        msg = (f"✅ DCA ausgeführt für {symbol}\n"
+                               f"DCA#{d['executed']} qty={qty} price={current_price:.6f}\n"
+                               f"TP(BE)={'n/a' if tp_price is None else f'{tp_price:.6f}'}")
+                    send_telegram(msg)
+                except Exception as e:
+                    print("[TELEGRAM SEND ERROR]", e)
 
         except Exception as e:
             print("[DCA ERROR]", e)
@@ -310,7 +350,6 @@ def tp_sl_watcher():
             print("[TP/SL WATCHER] Prüfe Positionen...")
             print(f"[WATCHER THREAD] ID={threading.get_ident()}")
             print("[TP/SL WATCHER]", time.strftime("%H:%M:%S"))
-
 
             for pos in positions:
                 symbol = pos["symbol"]
@@ -333,11 +372,9 @@ def tp_sl_watcher():
                 if not has_tp or not has_sl:
                     print(f"[TP/SL WATCHER] Setze TP/SL neu für {symbol} ({side})")
                     reset_tp_sl(symbol, side)
-                    # Versuche BE zu verwenden, falls wir DCA Daten haben
                     with dca_lock:
                         d = active_dca.get(symbol)
                         if d and d.get("executed", 0) >= 1:
-                            # BE auf entry_dynamic
                             set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"], tp_price=d["entry_dynamic"])
                         else:
                             set_tp_sl(symbol, side)
@@ -346,7 +383,6 @@ def tp_sl_watcher():
             print("[TP/SL WATCHER ERROR]", e)
 
         time.sleep(10)
-
 
 
 # ============================================================
