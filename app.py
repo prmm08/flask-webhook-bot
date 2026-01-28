@@ -33,7 +33,7 @@ DCA_DEVIATION_PERCENT = 5       # Prozent Abweichung vom entry_static für DCA-T
 DCA_VOLUME_MULTIPLIER = 2
 
 # --- RISK / LIMITS ---
-MAX_OPEN_POSITIONS = 15         # Maximale Anzahl gleichzeitig offener Positionen beim Exchange
+MAX_OPEN_POSITIONS = 20         # Maximale Anzahl gleichzeitig offener Positionen beim Exchange
 
 active_dca = {}
 dca_lock = threading.Lock()
