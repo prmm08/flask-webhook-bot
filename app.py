@@ -1,3 +1,5 @@
+#----------------- Working Skript WATCHER TP, SL, DCA Working 17.01.26 19.40 (angepasst BE) -------------------#
+
 import hmac
 import hashlib
 import requests
@@ -5,493 +7,470 @@ import os
 import urllib.parse
 import threading
 import time
-import sys
+import json
+
 from flask import Flask, request, jsonify
+import logging
 
-# --- LOGGING HELPER ---
-def log_print(msg):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {msg}")
-    sys.stdout.flush()
-
-# --- CONFIG ---
+# --- API ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BINGX_BASE = "https://open-api.bingx.com"
 
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
-# --- LOKALER SPEICHER ---
-pos_tracker = {}
-tracker_lock = threading.Lock()
-is_synced = False
-
-# --- STRATEGIE EINSTELLUNGEN ---
-TP_MODE = "AVERAGE"        # "AVERAGE" or "FIRST"
-USE_SL = False
-SL_PERCENT = 2.5
-TP_PERCENT = 0.5
-BE_DCA_LEVEL = 2
-BE_PROFIT_PERCENT = 0.1
-
-DCA_COUNT = 6
-DCA_DEVIATION_PERCENT = 5
-DCA_VOLUME_MULTIPLIER = 2
-TRADE_SIZE = 10
+# --- DEFAULT SETTINGS ---
 LEVERAGE = 20
+TRADE_SIZE = 10
+TP_PERCENT = 0.5
+SL_PERCENT = 80
 
-# --- DCA / TP Timing (Sekunden) ---
-DCA_TP_REMOVE_WAIT = 5
-DCA_TP_SET_WAIT = 5
+# --- DCA SETTINGS ---
+DCA_INTERVAL = 5
+DCA_COUNT = 6
+DCA_DEVIATION_PERCENT = 20
+DCA_VOLUME_MULTIPLIER = 2
 
-# --- TP/Retry Einstellungen ---
-MAX_RETRIES_TP = 3
-RETRY_BACKOFF = 1.5  # Sekunden, multipliziert pro Versuch
+active_dca = {}
+dca_lock = threading.Lock()
+last_dca_heartbeat = time.time()
 
-# --- API CORE ---
-def api_request(method, endpoint, params=None, max_retries=3):
-    url = f"{BINGX_BASE}{endpoint}"
-    headers = {"X-BX-APIKEY": API_KEY} if API_KEY else {}
-    params = dict(params) if params else {}
-    params["timestamp"] = str(int(time.time() * 1000))
-    query_string = urllib.parse.urlencode(sorted(params.items()))
-    signature = hmac.new((API_SECRET or "").encode(), query_string.encode(), hashlib.sha256).hexdigest()
-    full_url = f"{url}?{query_string}&signature={signature}"
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = requests.request(method, full_url, headers=headers, timeout=15)
-            if resp.status_code == 429:
-                backoff = 2 ** attempt
-                log_print(f"[RATE_LIMIT] {endpoint} 429, backoff {backoff}s")
-                time.sleep(backoff)
-                continue
-            try:
-                return resp.json()
-            except ValueError:
-                log_print(f"[ERROR] Nicht-JSON Antwort von {endpoint}: {resp.text}")
-                return None
-        except requests.RequestException as e:
-            log_print(f"[API Fehler] {endpoint} Versuch {attempt}: {e}")
-            time.sleep(1)
-    return None
 
-# --- HILFSFUNKTIONEN ---
-def safe_float(x, default=0.0):
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-def get_executed_price_from_position(symbol, side):
-    r_pos = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
-    if not r_pos or not isinstance(r_pos.get("data"), list):
-        return None
-    pos = next((p for p in r_pos["data"] if p.get("positionSide") == side and safe_float(p.get("positionAmt", 0)) != 0), None)
-    if pos:
-        return safe_float(pos.get("avgPrice"))
-    return None
-
-def get_order_fill_price_from_resp(resp):
-    if not resp:
-        return None
-    data = resp.get("data") or resp
-    for key in ("avgPrice", "filledAvgPrice", "executedPrice", "avg_price"):
-        if key in data:
-            return safe_float(data.get(key))
-    if isinstance(data, dict):
-        for v in data.values():
-            if isinstance(v, dict):
-                for key in ("avgPrice", "filledAvgPrice", "executedPrice"):
-                    if key in v:
-                        return safe_float(v.get(key))
-    return None
-
-def compute_target_price(last_price, side, deviation_pct):
-    if side == "LONG":
-        return last_price * (1 - deviation_pct / 100.0)
+# --- SIGNATURE ---
+def sign_bingx(params):
+    if not params:
+        query_string = ""
     else:
-        return last_price * (1 + deviation_pct / 100.0)
+        items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
+        query_string = urllib.parse.urlencode(items)
+    return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
-def round_qty_to_step(qty, step=0.000001):
-    if qty <= 0:
-        return 0
-    return round(qty - (qty % step), 6)
 
-# --- ORDER / OPEN ORDERS HELPERS ---
-def list_open_orders(symbol):
-    resp = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "limit": 200})
-    if not resp:
-        log_print(f"[OPEN_ORDERS] Keine Antwort für {symbol}")
-        return []
-    return resp.get("data") if isinstance(resp.get("data"), list) else []
+# --- API REQUEST ---
+def api_request(method, endpoint, params=None):
+    url = f"{BINGX_BASE}{endpoint}"
+    headers = {"X-BX-APIKEY": API_KEY}
+    params = {} if params is None else dict(params)
+    timeout = (5, 10)
 
-def find_tp_orders(open_orders, positionSide):
-    tps = []
-    for o in open_orders:
-        o_type = str(o.get("type", "")).upper()
-        if "TAKE_PROFIT" in o_type and o.get("positionSide") == positionSide:
-            tps.append(o)
-    return tps
+    if method == "GET":
+        try:
+            params_for_sign = dict(params)
+            signature = sign_bingx(params_for_sign)
+            params_for_sign["signature"] = signature
+            query = urllib.parse.urlencode(params_for_sign)
+            response = requests.get(f"{url}?{query}", headers=headers, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print("[API ERROR GET]", e)
+            return None
 
-def cancel_order_by_id(symbol, order_id):
-    resp = api_request("DELETE", "/openApi/swap/v2/trade/order", {"symbol": symbol, "orderId": str(order_id)})
-    log_print(f"[CANCEL] cancel order {order_id} resp={resp}")
-    return resp
+    if method == "POST":
+        try:
+            params_for_sign = dict(params)
+            if "timestamp" not in params_for_sign:
+                params_for_sign["timestamp"] = str(int(time.time() * 1000))
+            query = urllib.parse.urlencode(sorted((k, str(v)) for k, v in params_for_sign.items()))
+            signature = sign_bingx(params_for_sign)
+            response = requests.post(f"{url}?{query}&signature={signature}", headers=headers, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print("[API ERROR POST]", e)
+            return None
 
-def debug_dump_open_orders(symbol):
-    resp = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "limit": 200})
-    log_print(f"[DEBUG_OPEN_ORDERS] symbol={symbol} resp={resp}")
-    return resp.get("data") if resp and isinstance(resp.get("data"), list) else []
 
-def cancel_order_by_id_verbose(symbol, order_id):
-    resp = api_request("DELETE", "/openApi/swap/v2/trade/order", {"symbol": symbol, "orderId": str(order_id)})
-    log_print(f"[CANCEL_VERBOSE] symbol={symbol} orderId={order_id} resp={resp}")
-    return resp
+# --- HELPERS ---
+def get_price(symbol):
+    r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
+    try:
+        return float(r["data"]["price"])
+    except:
+        return None
 
-def ensure_tp_exists(symbol, side, positionSide, expected_stop_price):
-    open_orders = list_open_orders(symbol)
-    tps = find_tp_orders(open_orders, positionSide)
-    for o in tps:
-        stop = safe_float(o.get("stopPrice") or o.get("price") or o.get("triggerPrice") or 0)
-        if abs(stop - expected_stop_price) <= (expected_stop_price * 0.0005 + 1e-8):
-            return True, o
-    return False, None
 
-# --- SYNC LOGIK ---
-def sync_with_bingx():
-    global is_synced
-    r_pos = api_request("GET", "/openApi/swap/v2/user/positions")
-    if r_pos and isinstance(r_pos.get("data"), list):
-        active_api_keys = []
-        with tracker_lock:
-            for pos in r_pos["data"]:
-                amt = safe_float(pos.get("positionAmt", 0))
+def get_positions():
+    ts = str(int(time.time() * 1000))
+    r = api_request("GET", "/openApi/swap/v2/user/positions", {"timestamp": ts})
+    return r.get("data", []) if r else []
+
+
+def symbol_exists(symbol):
+    r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
+    return r and "data" in r and "price" in r["data"]
+
+
+def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
+    ts = str(int(time.time() * 1000))
+    params = {"symbol": symbol, "leverage": str(leverage), "timestamp": ts}
+    if position_side:
+        params["positionSide"] = position_side
+    if side:
+        params["side"] = side
+    r = api_request("POST", "/openApi/swap/v2/trade/leverage", params)
+    return bool(r)
+
+
+# --- TP/SL ---
+def reset_tp_sl(symbol, position_side=None):
+    ts = str(int(time.time() * 1000))
+    r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "timestamp": ts})
+    orders = r.get("data", {}).get("orders", []) if r else []
+
+    for order in orders:
+        pos_side = order.get("positionSide") or order.get("position")
+        if position_side and pos_side != position_side:
+            continue
+        oid = order.get("orderId")
+        if not oid:
+            continue
+        api_request("POST", "/openApi/swap/v2/trade/cancelOrder",
+                    {"orderId": oid, "symbol": symbol, "timestamp": str(int(time.time() * 1000))})
+
+
+def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT, tp_price=None):
+    """
+    Setzt TP und SL für eine Position.
+    - Wenn tp_price gesetzt ist, wird TP exakt auf diesen Preis gesetzt (BE-Logik).
+    - Ansonsten wird TP aus tp_percent relativ zum Entry berechnet.
+    """
+    pos = None
+    for _ in range(8):
+        positions = get_positions()
+        pos = next((p for p in positions
+                    if p["symbol"] == symbol
+                    and float(p.get("positionAmt", 0)) != 0
+                    and (desired_side is None or p.get("positionSide") == desired_side)), None)
+        if pos:
+            break
+        time.sleep(1)
+
+    if not pos:
+        print("[ERROR] Position nicht gefunden für TP/SL")
+        return
+
+    side = pos["positionSide"]
+    entry = float(pos["avgPrice"])
+
+    # avgPrice-Update abwarten
+    for _ in range(10):
+        time.sleep(0.8)
+        new_pos = next((p for p in get_positions()
+                        if p["symbol"] == symbol and p.get("positionSide") == side), None)
+        if new_pos and abs(float(new_pos["avgPrice"]) - entry) > 0.0001:
+            entry = float(new_pos["avgPrice"])
+            break
+
+    # Wenn tp_price übergeben wurde, verwende diesen als TP (BE)
+    if tp_price is not None:
+        tp = float(tp_price)
+    else:
+        tp = entry * (1 + tp_percent / 100) if side == "LONG" else entry * (1 - tp_percent / 100)
+
+    sl = entry * (1 - sl_percent / 100) if side == "LONG" else entry * (1 + sl_percent / 100)
+
+    reset_tp_sl(symbol, side)
+
+    def place(price, otype):
+        api_request("POST", "/openApi/swap/v2/trade/order", {
+            "symbol": symbol,
+            "side": "SELL" if side == "LONG" else "BUY",
+            "positionSide": side,
+            "type": otype,
+            "stopPrice": f"{price:.6f}",
+            "workingType": "MARK_PRICE",
+            "closePosition": "true",
+            "timestamp": str(int(time.time() * 1000))
+        })
+
+    place(tp, "TAKE_PROFIT_MARKET")
+    place(sl, "STOP_MARKET")
+
+
+# ============================================================
+#   DCA ENGINE — STABILE VERSION MIT BE-LOGIK
+# ============================================================
+
+def update_entry(symbol, side):
+    positions = get_positions()
+    pos = next((p for p in positions
+                if p["symbol"] == symbol and p["positionSide"] == side), None)
+    if pos:
+        return float(pos["avgPrice"])
+    return None
+
+
+def calculate_dca_qty(base_trade_size, executed, current_price):
+    multiplier = DCA_VOLUME_MULTIPLIER ** (executed + 1)
+    return round((base_trade_size * multiplier) / current_price, 6)
+
+
+def should_trigger_dca(side, current, entry_static, deviation_percent):
+    if side == "LONG":
+        return current <= entry_static * (1 - deviation_percent / 100)
+    else:
+        return current >= entry_static * (1 + deviation_percent / 100)
+
+
+def monitor_dca():
+    global last_dca_heartbeat
+
+    while True:
+        last_dca_heartbeat = time.time()
+
+        try:
+            positions = get_positions()
+
+            for pos in positions:
+                symbol = pos["symbol"]
+                side = pos["positionSide"]
+                amt = float(pos["positionAmt"])
                 if amt == 0:
                     continue
-                symbol, side = pos["symbol"], pos["positionSide"]
-                key = f"{symbol}_{side}"
-                active_api_keys.append(key)
-                if key not in pos_tracker:
-                    r_orders = api_request("GET", "/openApi/swap/v2/trade/allOrders", {"symbol": symbol, "limit": 50})
-                    if r_orders and isinstance(r_orders.get("data"), list):
-                        filled = [o for o in r_orders["data"] if o.get("status") == "FILLED" and o.get("positionSide") == side and o.get("type") == "MARKET"]
-                        if filled:
-                            first_price = safe_float(filled[-1].get("avgPrice") or filled[-1].get("price") or 0)
-                            last_price = safe_float(filled[0].get("avgPrice") or filled[0].get("price") or 0)
-                            pos_tracker[key] = {"level": len(filled), "last_price": last_price or safe_float(pos.get("avgPrice")), "first_price": first_price or safe_float(pos.get("avgPrice"))}
-            for k in list(pos_tracker.keys()):
-                if k not in active_api_keys:
-                    log_print(f"[SYNC] Entferne {k} aus Tracker (nicht mehr aktiv)")
-                    del pos_tracker[k]
-    is_synced = True
 
-def minute_sync_task():
-    while True:
-        time.sleep(60)
-        try:
-            sync_with_bingx()
-        except Exception as e:
-            log_print(f"[ERROR] minute_sync_task: {e}")
-
-# --- REMOVE TP ORDERS HELPER ---
-def remove_tp_orders(symbol, side):
-    """
-    Löscht gezielt TAKE_PROFIT Orders für ein Symbol/PositionSide.
-    Nutzt orderId wenn vorhanden und loggt die Antworten.
-    """
-    try:
-        open_orders = debug_dump_open_orders(symbol) or []
-        removed = 0
-        for o in open_orders:
-            o_type = str(o.get("type", "")).upper()
-            if "TAKE_PROFIT" in o_type and o.get("positionSide") == side:
-                oid = o.get("orderId") or o.get("order_id") or o.get("id")
-                if oid:
-                    resp = cancel_order_by_id_verbose(symbol, oid)
-                    removed += 1
-                    time.sleep(0.25)
-                else:
-                    resp = api_request("DELETE", "/openApi/swap/v2/trade/order", {"symbol": symbol})
-                    log_print(f"[CANCEL_FALLBACK] symbol={symbol} resp={resp}")
-                    removed += 1
-                    time.sleep(0.25)
-        log_print(f"[REMOVE_TP] Entfernte TP Orders für {symbol} {side}: {removed}")
-        return removed
-    except Exception as e:
-        log_print(f"[ERROR] remove_tp_orders für {symbol} {side}: {e}")
-        return 0
-
-# --- ROBUSTES TP / SL SETZEN (mit Verifikation, Debug und Retry) ---
-def set_tp_sl(symbol, side, current_level, first_price=None):
-    # Hole Position
-    r_pos = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
-    log_print(f"[TP/SL] user/positions resp={r_pos}")
-    if not r_pos or not isinstance(r_pos.get("data"), list):
-        log_print(f"[TP/SL] Keine Positionsdaten für {symbol}")
-        return
-    pos = next((p for p in r_pos["data"] if p.get("positionSide") == side and safe_float(p.get("positionAmt", 0)) != 0), None)
-    if not pos:
-        log_print(f"[TP/SL] Keine offene Position gefunden für {symbol} {side}")
-        return
-
-    avg_price = safe_float(pos.get("avgPrice"))
-    target_tp_pct = BE_PROFIT_PERCENT if current_level >= BE_DCA_LEVEL else TP_PERCENT
-    base_price = avg_price if (TP_MODE == "AVERAGE" or current_level >= BE_DCA_LEVEL) else (first_price or avg_price)
-    tp_price = base_price * (1 + target_tp_pct / 100) if side == "LONG" else base_price * (1 - target_tp_pct / 100)
-    log_print(f"[TP/SL] current_level={current_level} target_tp_pct={target_tp_pct} base_price={base_price:.8f} tp_price={tp_price:.8f}")
-
-    # 1) Debug dump offene Orders vor Änderung
-    debug_dump_open_orders(symbol)
-
-    # 2) Lösche vorhandene TP Orders gezielt per orderId
-    open_orders = debug_dump_open_orders(symbol) or []
-    for o in open_orders:
-        o_type = str(o.get("type", "")).upper()
-        if "TAKE_PROFIT" in o_type and o.get("positionSide") == side:
-            oid = o.get("orderId") or o.get("order_id") or o.get("id")
-            if oid:
-                cancel_order_by_id_verbose(symbol, oid)
-                time.sleep(0.25)
-
-    # 3) Versuche TP mit erlaubten workingType Werten
-    working_types = ["MARK_PRICE", "CONTRACT_PRICE"]
-
-    # Warte kurz, falls Position gerade erst gefüllt wurde
-    time.sleep(1.2)
-
-    for wt in working_types:
-        tp_params = {
-            "symbol": symbol,
-            "side": "SELL" if side == "LONG" else "BUY",
-            "positionSide": side,
-            "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": f"{tp_price:.8f}",
-            "workingType": wt,
-            "closePosition": "true"
-        }
-        resp = api_request("POST", "/openApi/swap/v2/trade/order", tp_params)
-        log_print(f"[TP_POST] workingType={wt} params={tp_params} resp={resp}")
-
-        # Wenn API orderId zurückgibt, notiere sie
-        order_id = None
-        if resp and isinstance(resp, dict):
-            order_id = resp.get("data", {}).get("orderId") or resp.get("orderId") or resp.get("data", {}).get("order_id") or resp.get("data", {}).get("id")
-            log_print(f"[TP_POST] returned order_id={order_id}")
-
-        # kurze Wartezeit, dann offene Orders prüfen
-        time.sleep(0.9)
-        open_after = debug_dump_open_orders(symbol) or []
-        found = False
-        for o in open_after:
-            stop = safe_float(o.get("stopPrice") or o.get("price") or o.get("triggerPrice") or 0)
-            oid2 = o.get("orderId") or o.get("order_id") or o.get("id")
-            if abs(stop - tp_price) <= (tp_price * 0.0005 + 1e-10):
-                log_print(f"[TP_VERIFY] Found TP order matching stopPrice={stop} oid={oid2} workingType={o.get('workingType')}")
-                found = True
-                break
-            if order_id and oid2 and str(order_id) == str(oid2):
-                log_print(f"[TP_VERIFY] Found TP by orderId match oid={oid2}")
-                found = True
-                break
-
-        if found:
-            log_print(f"[TP] TP erfolgreich gesetzt für {symbol} mit workingType={wt} stopPrice={tp_price:.8f}")
-            return
-        else:
-            if resp and isinstance(resp, dict) and resp.get("code") is not None and resp.get("code") != 0:
-                log_print(f"[TP_ERROR] API-Antwort workingType={wt}: {resp}")
-                if str(resp.get("code")).startswith("109") or "Invalid parameters" in str(resp.get("msg", "")):
-                    log_print(f"[TP] Abbruch für workingType={wt} wegen Validierungsfehler.")
-                    continue
-            log_print(f"[TP] TP nicht gefunden nach POST mit workingType={wt}, versuche nächsten workingType")
-            time.sleep(1.0)
-
-    log_print(f"[TP] Konnte TP nicht verifizieren für {symbol}. Bitte manuell prüfen. Erwartet stopPrice={tp_price:.8f}")
-
-    # Optional: SL setzen (analog)
-    if USE_SL:
-        sl_price = avg_price * (1 - SL_PERCENT / 100) if side == "LONG" else avg_price * (1 + SL_PERCENT / 100)
-        sl_params = {
-            "symbol": symbol,
-            "side": "SELL" if side == "LONG" else "BUY",
-            "positionSide": side,
-            "type": "STOP_MARKET",
-            "stopPrice": f"{sl_price:.8f}",
-            "workingType": "MARK_PRICE",
-            "closePosition": "true"
-        }
-        resp_sl = api_request("POST", "/openApi/swap/v2/trade/order", sl_params)
-        log_print(f"[SL_POST] params={sl_params} resp={resp_sl}")
-        time.sleep(0.6)
-        debug_dump_open_orders(symbol)
-
-# --- MONITOR (DCA Check) with TP remove/wait/set flow ---
-def monitor_dca():
-    while not is_synced:
-        time.sleep(2)
-    while True:
-        try:
-            with tracker_lock:
-                keys = list(pos_tracker.keys())
-            for key in keys:
-                try:
-                    symbol, side = key.split("_")
-                except ValueError:
-                    continue
-                with tracker_lock:
-                    data = pos_tracker.get(key)
-                if not data:
+                current_price = get_price(symbol)
+                if not current_price:
                     continue
 
-                r_ticker = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-                if not r_ticker or "data" not in r_ticker:
-                    time.sleep(0.5)
-                    continue
-                curr_price = safe_float(r_ticker["data"].get("price", 0))
-                if curr_price == 0:
-                    continue
+                with dca_lock:
+                    if symbol not in active_dca:
+                        base_value = abs(amt) * float(pos["avgPrice"])
+                        active_dca[symbol] = {
+                            "side": side,
+                            "entry_static": float(pos["avgPrice"]),
+                            "entry_dynamic": float(pos["avgPrice"]),
+                            "executed": 0,
+                            "base_trade_size": base_value,
+                            "tp_percent": TP_PERCENT,
+                            "sl_percent": SL_PERCENT
+                        }
 
-                last_price = safe_float(data.get("last_price", curr_price))
-                target_price = compute_target_price(last_price, side, DCA_DEVIATION_PERCENT)
+                    d = active_dca[symbol]
 
-                trigger = (side == "LONG" and curr_price <= target_price) or (side == "SHORT" and curr_price >= target_price)
-                if not trigger:
-                    continue
-
-                if data.get("level", 0) >= DCA_COUNT:
-                    log_print(f"[DCA] Max level erreicht für {key}")
-                    continue
-
-                raw_qty = (TRADE_SIZE * (DCA_VOLUME_MULTIPLIER ** data["level"])) / curr_price
-                qty = round_qty_to_step(raw_qty, step=0.000001)
-                if qty <= 0:
-                    log_print(f"[DCA] Qty zu klein für {symbol}: {raw_qty}")
+                if d["executed"] >= DCA_COUNT:
                     continue
 
-                log_print(f"[DCA] Trigger für {symbol} {side} level={data['level']} curr={curr_price:.6f} target={target_price:.6f} qty={qty}")
+                if not should_trigger_dca(side, current_price, d["entry_static"], DCA_DEVIATION_PERCENT):
+                    continue
 
-                # DCA Market Order platzieren
-                resp = api_request("POST", "/openApi/swap/v2/trade/order", {
+                qty = calculate_dca_qty(
+                    d["base_trade_size"],
+                    d["executed"],
+                    current_price
+                )
+
+                api_request("POST", "/openApi/swap/v2/trade/order", {
                     "symbol": symbol,
                     "side": "BUY" if side == "LONG" else "SELL",
                     "positionSide": side,
                     "type": "MARKET",
-                    "quantity": str(qty)
+                    "quantity": str(qty),
+                    "timestamp": str(int(time.time() * 1000))
                 })
 
-                if not resp:
-                    log_print(f"[ERROR] Keine Antwort beim Platzieren DCA für {symbol}")
-                    continue
+                with dca_lock:
+                    d["executed"] += 1
+                    # avgPrice aktualisieren (intern, durch API Abfrage)
+                    new_entry = update_entry(symbol, side)
+                    if new_entry:
+                        d["entry_dynamic"] = new_entry
 
-                success = (resp.get("code") == 0) or (resp.get("success") is True)
-                if not success:
-                    log_print(f"[ERROR] DCA Order abgelehnt für {symbol}: {resp}")
-                    continue
+                    # Wenn mindestens 1 DCA ausgeführt wurde, BE setzen (TP = avgPrice)
+                    if d["executed"] >= 1:
+                        tp_price = d["entry_dynamic"]
+                    else:
+                        tp_price = None
 
-                # Kurz warten, dann ausgeführten Preis holen
-                time.sleep(1)
-                executed_price = get_executed_price_from_position(symbol, side) or get_order_fill_price_from_resp(resp) or curr_price
-
-                # Tracker atomar updaten
-                with tracker_lock:
-                    pos_tracker[key]["level"] = data["level"] + 1
-                    pos_tracker[key]["last_price"] = executed_price
-                    if "first_price" not in pos_tracker[key] or not pos_tracker[key]["first_price"]:
-                        pos_tracker[key]["first_price"] = executed_price
-
-                log_print(f"[DCA] Order gefüllt für {symbol} at {executed_price:.6f} new_level={pos_tracker[key]['level']}")
-
-                # --- Neuer Ablauf: 5s warten, TP entfernen, 5s warten, TP neu setzen ---
-                log_print(f"[DCA_FLOW] Warte {DCA_TP_REMOVE_WAIT}s vor Entfernen TP für {symbol}")
-                time.sleep(DCA_TP_REMOVE_WAIT)
-
-                # Entferne vorhandene TP Orders
-                removed = remove_tp_orders(symbol, side)
-
-                log_print(f"[DCA_FLOW] Warte {DCA_TP_SET_WAIT}s vor Neusetzen TP für {symbol}")
-                time.sleep(DCA_TP_SET_WAIT)
-
-                # Setze neuen TP (verifiziert in set_tp_sl)
-                set_tp_sl(symbol, side, pos_tracker[key]["level"], pos_tracker[key]["first_price"])
+                # TP/SL neu setzen: wenn tp_price gesetzt -> BE, sonst Prozent
+                reset_tp_sl(symbol, side)
+                if tp_price is not None:
+                    print(f"[DCA] {symbol} DCA#{d['executed']} executed. Set BE TP at {tp_price:.6f}")
+                    set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"], tp_price=tp_price)
+                else:
+                    set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"])
 
         except Exception as e:
-            log_print(f"[EXCEPTION] monitor_dca: {e}")
-        time.sleep(5)
+            print("[DCA ERROR]", e)
 
-# --- STRIKTER WEBHOOK FILTER ---
-@app.route("/testorder", methods=["POST"])
-def webhook():
-    data = request.get_json(silent=True) or {}
-    currency = str(data.get("currency", "")).upper()
-    direction = str(data.get("direction", "")).upper()
+        time.sleep(DCA_INTERVAL)
 
-    if currency and direction in ["LONG", "SHORT"]:
-        symbol = f"{currency}-USDT"
 
-        with tracker_lock:
-            existing_positions = [k for k in pos_tracker.keys() if k.startswith(symbol)]
+# ============================================================
+#   TP/SL WATCHER — setzt fehlende TP/SL neu
+# ============================================================
 
-        if existing_positions:
-            log_print(f"[BLOCK] Signal ignoriert für {symbol}. Position bereits im Tracker: {existing_positions}")
-            return jsonify({"status": "ignored", "message": "Symbol already active in tracker"}), 200
+def tp_sl_watcher():
+    while True:
+        try:
+            positions = get_positions()
 
-        threading.Thread(target=execute_initial_trade, args=(symbol, direction), daemon=True).start()
-        return jsonify({"status": "executing", "symbol": symbol}), 200
+            print("[TP/SL WATCHER] Prüfe Positionen...")
+            print(f"[WATCHER THREAD] ID={threading.get_ident()}")
+            print("[TP/SL WATCHER]", time.strftime("%H:%M:%S"))
 
-    return jsonify({"status": "error", "message": "invalid data"}), 400
 
-def execute_initial_trade(symbol, direction):
-    lev_resp = api_request("POST", "/openApi/swap/v2/trade/leverage", {"symbol": symbol, "leverage": str(LEVERAGE), "side": direction, "positionSide": direction})
-    if not lev_resp or not ((lev_resp.get("code") == 0) or (lev_resp.get("success") is True)):
-        log_print(f"[WARN] Leverage nicht gesetzt für {symbol}: {lev_resp}")
+            for pos in positions:
+                symbol = pos["symbol"]
+                side = pos["positionSide"]
+                amt = float(pos["positionAmt"])
 
-    r_ticker = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-    price = safe_float(r_ticker["data"].get("price", 0)) if r_ticker and "data" in r_ticker else 0
-    if price == 0:
-        log_print(f"[ERROR] Kein Tickerpreis für {symbol}")
+                if amt == 0:
+                    continue
+
+                ts = str(int(time.time() * 1000))
+                r = api_request("GET", "/openApi/swap/v2/trade/openOrders",
+                                {"symbol": symbol, "timestamp": ts})
+                orders = r.get("data", {}).get("orders", []) if r else []
+
+                has_tp = any(o.get("type") == "TAKE_PROFIT_MARKET" and o.get("positionSide") == side for o in orders)
+                has_sl = any(o.get("type") == "STOP_MARKET" and o.get("positionSide") == side for o in orders)
+
+                print(f"[TP/SL WATCHER] {symbol} {side} TP={has_tp} SL={has_sl}")
+
+                if not has_tp or not has_sl:
+                    print(f"[TP/SL WATCHER] Setze TP/SL neu für {symbol} ({side})")
+                    reset_tp_sl(symbol, side)
+                    # Versuche BE zu verwenden, falls wir DCA Daten haben
+                    with dca_lock:
+                        d = active_dca.get(symbol)
+                        if d and d.get("executed", 0) >= 1:
+                            # BE auf entry_dynamic
+                            set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"], tp_price=d["entry_dynamic"])
+                        else:
+                            set_tp_sl(symbol, side)
+
+        except Exception as e:
+            print("[TP/SL WATCHER ERROR]", e)
+
+        time.sleep(10)
+
+
+
+# ============================================================
+#   execute_trade() MIT DCA-INTEGRATION
+# ============================================================
+
+def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
+    if not symbol_exists(symbol):
+        print("[ERROR] Symbol existiert nicht:", symbol)
         return
 
-    qty = round_qty_to_step(TRADE_SIZE / price, step=0.000001)
-    if qty <= 0:
-        log_print(f"[ERROR] Berechnete Qty ungültig: {qty}")
+    positions = get_positions()
+    if any(p["symbol"] == symbol and p.get("positionSide") == direction and float(p["positionAmt"]) != 0 for p in positions):
+        print("[SKIP] Position bereits offen:", symbol, direction)
         return
 
-    resp = api_request("POST", "/openApi/swap/v2/trade/order", {
+    price = get_price(symbol)
+    if not price:
+        print("[ERROR] Kein Preis")
+        return
+
+    if not set_leverage_for_symbol(symbol, leverage, direction, "BUY" if direction == "LONG" else "SELL"):
+        print("[ERROR] Leverage Fehler")
+        return
+
+    qty = round(trade_size / price, 6)
+
+    api_request("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "side": "BUY" if direction == "LONG" else "SELL",
         "positionSide": direction,
         "type": "MARKET",
-        "quantity": str(qty)
+        "quantity": str(qty),
+        "timestamp": str(int(time.time() * 1000))
     })
 
-    if not resp:
-        log_print(f"[ERROR] Keine Antwort auf Initial Order {symbol}")
-        return
+    with dca_lock:
+        active_dca[symbol] = {
+            "side": direction,
+            "entry_static": price,
+            "entry_dynamic": price,
+            "executed": 0,
+            "base_trade_size": trade_size,
+            "tp_percent": tp_percent,
+            "sl_percent": sl_percent
+        }
 
-    success = (resp.get("code") == 0) or (resp.get("success") is True)
-    if not success:
-        log_print(f"[ERROR] Initial Order abgelehnt für {symbol}: {resp}")
-        return
-
-    time.sleep(1)
-    executed_price = get_executed_price_from_position(symbol, direction) or get_order_fill_price_from_resp(resp) or price
-
-    with tracker_lock:
-        pos_tracker[f"{symbol}_{direction}"] = {"level": 1, "last_price": executed_price, "first_price": executed_price}
-    log_print(f"[SUCCESS] Erste Order für {symbol} platziert at {executed_price:.6f}.")
     time.sleep(2)
-    set_tp_sl(symbol, direction, 1, executed_price)
+    reset_tp_sl(symbol, direction)
+    # Initial TP/SL per Prozent (erst nach DCA wird BE gesetzt)
+    set_tp_sl(symbol, direction, tp_percent, sl_percent)
+
+
+# ============================================================
+#   FLASK + THREADS
+# ============================================================
+
+@app.route("/testorder", methods=["POST"])
+def webhook():
+    data = request.get_json(silent=True) or {}
+
+    currency = str(data.get("currency", "")).upper()
+    direction = str(data.get("direction", "")).upper()
+    if not currency or direction not in ("LONG", "SHORT"):
+        return jsonify({"status": "ignored"}), 200
+
+    symbol = f"{currency}-USDT"
+    leverage = int(data.get("leverage", LEVERAGE))
+    trade_size = float(data.get("trade_size", TRADE_SIZE))
+    tp_percent = float(data.get("tp_percent", TP_PERCENT))
+    sl_percent = float(data.get("sl_percent", SL_PERCENT))
+
+    threading.Thread(
+        target=execute_trade,
+        args=(symbol, direction, leverage, trade_size, tp_percent, sl_percent)
+    ).start()
+
+    return jsonify({"status": "processing"}), 200
+
 
 @app.route("/ping")
-@app.route("/")
-def health():
-    return "BOT_V1.9.1_STRICT", 200
+def ping():
+    return "pong", 200
+
+
+def keep_alive():
+    url = os.getenv("SELF_PING_URL")
+    if not url:
+        print("[KEEPALIVE] Kein SELF_PING_URL gesetzt")
+        return
+    while True:
+        try:
+            requests.get(url, timeout=5)
+        except:
+            pass
+        time.sleep(240)
+
+
+def start_dca_thread():
+    while True:
+        try:
+            monitor_dca()
+        except Exception as e:
+            print("[DCA CRASH]", e)
+            time.sleep(3)
+
+
+def dca_watchdog():
+    global last_dca_heartbeat
+    while True:
+        if time.time() - last_dca_heartbeat > 15:
+            print("[WATCHDOG] DCA Thread hängt → Neustart")
+            threading.Thread(target=start_dca_thread, daemon=True).start()
+            last_dca_heartbeat = time.time()
+        time.sleep(5)
+
 
 if __name__ == "__main__":
-    log_print("Starting bot (LIVE ORDERS enabled)")
-    sync_with_bingx()
-    threading.Thread(target=monitor_dca, daemon=True).start()
-    threading.Thread(target=minute_sync_task, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    if not API_KEY or not API_SECRET:
+        print("FEHLER: API Keys fehlen")
+    else:
+        threading.Thread(target=start_dca_thread, daemon=True).start()
+        threading.Thread(target=dca_watchdog, daemon=True).start()
+        threading.Thread(target=keep_alive, daemon=True).start()
+        threading.Thread(target=tp_sl_watcher, daemon=True).start()
+
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
