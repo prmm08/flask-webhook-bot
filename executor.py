@@ -72,6 +72,13 @@ def ping():
 
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook():
+    # ganz oben in webhook()
+    raw = request.get_data(as_text=True)
+    json_payload = request.get_json(silent=True)
+    print("[WEBHOOK DEBUG] HEADERS:", dict(request.headers))
+    print("[WEBHOOK DEBUG] RAW BODY:", raw)
+    print("[WEBHOOK DEBUG] PARSED JSON:", json_payload)
+
     data = request.get_json(silent=True) or {}
     if not data:
         logger.warning("Webhook: no JSON payload")
