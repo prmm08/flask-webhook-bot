@@ -56,7 +56,7 @@ def usd_to_qty(usd_amount: float, price: float, leverage: int = 1) -> float:
     return float(qty)
 
 
-def _mock_place_order(symbol: str, side: str, qty: float, leverage: int):
+def place_market_order(symbol: str, side: str, qty: float, leverage: int):
     """
     Fallback mock order placement. Returns dict with entry_price and order_id.
     """
@@ -139,7 +139,7 @@ def webhook():
             entry_price = float(resp.get("filledPrice") or resp.get("avgPrice") or resp.get("data", {}).get("price", 0.0) or 0.0)
             order_id = resp.get("orderId") or resp.get("data", {}).get("orderId") or None
         else:
-            resp = _mock_place_order(currency, side, trade_qty, leverage)
+            resp = place_market_order(currency, side, trade_qty, leverage)
             entry_price = float(resp.get("entry_price", 0.0))
             order_id = resp.get("order_id")
     except Exception as e:
