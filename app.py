@@ -1,4 +1,4 @@
-#----------------- Working Skript WATCHER TP, SL, DCA mit BE, Telegram, Max Open Positions, Race-Fix und Internal Auto-Close -------------------#
+#----------------- Full Skript: WATCHER TP, SL, DCA mit lokalem BE, Telegram, Max Open Positions und Race-Fix -------------------#
 
 import hmac
 import hashlib
@@ -29,17 +29,18 @@ SL_PERCENT = 40
 # --- DCA SETTINGS ---
 DCA_INTERVAL = 5                # Sekunden zwischen DCA-Checks
 DCA_COUNT = 5
-DCA_DEVIATION_PERCENT = 5       # Prozent Abweichung vom entry_static für DCA-Trigger
+DCA_DEVIATION_PERCENT = 2.5       # Prozent Abweichung vom Initial-Entry für DCA-Trigger (z.B. 5%)
 DCA_VOLUME_MULTIPLIER = 2
 
 # --- RISK / LIMITS ---
-MAX_OPEN_POSITIONS = 20         # Maximale Anzahl gleichzeitig offener Positionen beim Exchange
+MAX_OPEN_POSITIONS = 15         # Maximale Anzahl gleichzeitig offener Positionen beim Exchange
 
 # --- AUTO-CLOSE SETTINGS ---
 AUTO_CLOSE_FROM_DCA = 1        # Ab welcher DCA-Stufe intern auf BE überwacht und per Market geschlossen wird
 AUTO_CLOSE_BUFFER = 0.0        # optionaler Puffer (z.B. 0.001 = 0.1%) für BE (Slippage/Gebühren)
 
-active_dca = {}
+# --- INTERNAL STATE ---
+active_dca = {}                # Struktur pro Symbol: lokale Fills, local_avg, executed, flags...
 dca_lock = threading.Lock()
 last_dca_heartbeat = time.time()
 
@@ -50,6 +51,10 @@ app = Flask(__name__)
 
 # --- TELEGRAM HELPERS ---
 def send_telegram(message):
+    """
+    Sendet eine Textnachricht an den konfigurierten Telegram-Chat.
+    Wenn TELEGRAM_BOT_TOKEN oder TELEGRAM_CHAT_ID nicht gesetzt sind, passiert nichts.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     try:
@@ -176,6 +181,11 @@ def cancel_all_tp_orders(symbol, position_side):
 
 
 def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT, tp_price=None):
+    """
+    Setzt TP und SL für eine Position.
+    - Wenn tp_price gesetzt ist, wird TP exakt auf diesen Preis gesetzt (BE-Logik).
+    - Ansonsten wird TP aus tp_percent relativ zum Entry berechnet.
+    """
     pos = None
     for _ in range(8):
         positions = get_positions()
@@ -250,83 +260,95 @@ def close_position_market(symbol, side):
 
 
 # ============================================================
-#   DCA ENGINE — STABILE VERSION MIT BE-LOGIK, TELEGRAM, RACE-FIXES UND AUTO-CLOSE
+#   LOCAL AVERAGE / FILL MANAGEMENT
 # ============================================================
+def recalc_local_avg(d):
+    """
+    d ist das active_dca[symbol] dict.
+    Berechnet local_avg aus d['fills'].
+    """
+    total_qty = 0.0
+    total_value = 0.0
+    for f in d.get("fills", []):
+        q = float(f.get("qty", 0))
+        p = float(f.get("price", 0))
+        total_qty += q
+        total_value += q * p
+    if total_qty == 0:
+        return None
+    return total_value / total_qty
 
-def update_entry(symbol, side):
-    positions = get_positions()
-    pos = next((p for p in positions
-                if p["symbol"] == symbol and p["positionSide"] == side), None)
-    if pos:
-        return float(pos["avgPrice"])
-    return None
 
-
+# ============================================================
+#   DCA ENGINE — NUR AUF BASIS VON INITIAL-ENTRY UND LOKALEN FILLS
+# ============================================================
 def calculate_dca_qty(base_trade_size, executed, current_price):
     multiplier = DCA_VOLUME_MULTIPLIER ** (executed + 1)
     return round((base_trade_size * multiplier) / current_price, 6)
 
 
-def should_trigger_dca(side, current, entry_static, deviation_percent):
-    if side == "LONG":
-        return current <= entry_static * (1 - deviation_percent / 100)
-    else:
-        return current >= entry_static * (1 + deviation_percent / 100)
+def should_trigger_dca_from_initial(entry_static, current, deviation_percent):
+    """
+    Trigger relativ zum initial-entry price (entry_static).
+    Für LONG: trigger wenn current <= entry_static * (1 - deviation%)
+    Für SHORT: trigger wenn current >= entry_static * (1 + deviation%)
+    """
+    return current <= entry_static * (1 - deviation_percent / 100)
 
 
 def monitor_dca():
+    """
+    Wichtig: monitor_dca arbeitet NUR für Symbole, die im active_dca vorhanden sind.
+    active_dca wird beim execute_trade initialisiert. Dadurch vermeiden wir Abhängigkeit
+    von avgPrice der Exchange für DCA/BE-Berechnungen.
+    """
     global last_dca_heartbeat
 
     while True:
         last_dca_heartbeat = time.time()
 
         try:
-            positions = get_positions()
+            # Kopiere Schlüssel, um Lock-Zeit zu minimieren
+            with dca_lock:
+                symbols = list(active_dca.keys())
 
-            for pos in positions:
-                symbol = pos["symbol"]
-                side = pos["positionSide"]
-                amt = float(pos["positionAmt"])
-                if amt == 0:
-                    continue
-
-                current_price = get_price(symbol)
-                if not current_price:
-                    continue
-
-                # ensure active_dca entry exists
+            for symbol in symbols:
                 with dca_lock:
-                    if symbol not in active_dca:
-                        base_value = abs(amt) * float(pos["avgPrice"])
-                        active_dca[symbol] = {
-                            "side": side,
-                            "entry_static": float(pos["avgPrice"]),
-                            "entry_dynamic": float(pos["avgPrice"]),
-                            "executed": 0,
-                            "base_trade_size": base_value,
-                            "tp_percent": TP_PERCENT,
-                            "sl_percent": SL_PERCENT,
-                            "placing": False,
-                            "closing": False,
-                            "auto_close_enabled": False,
-                            "last_dca_ts": 0.0
-                        }
+                    d = active_dca.get(symbol)
+                    if not d:
+                        continue
+                    side = d["side"]
+                    entry_static = d["entry_static"]
+                    executed = d["executed"]
+                    placing = d.get("placing", False)
+                    last_ts = d.get("last_dca_ts", 0.0)
 
-                    d = active_dca[symbol]
+                # Hole aktuellen Marktpreis
+                current_price = get_price(symbol)
+                if current_price is None:
+                    continue
 
-                # skip if already maxed
+                # Skip conditions
                 with dca_lock:
                     if d["executed"] >= DCA_COUNT:
                         continue
-                    if time.time() - d.get("last_dca_ts", 0) < 2:
+                    if time.time() - last_ts < 2:
                         continue
-                    if d.get("placing"):
+                    if placing:
                         continue
 
-                # check trigger against entry_static
-                if not should_trigger_dca(side, current_price, d["entry_static"], DCA_DEVIATION_PERCENT):
+                # Trigger prüfen relativ zum initial-entry (entry_static)
+                # Für SHORTs invertiere die Logik
+                trigger = False
+                if side == "LONG":
+                    trigger = current_price <= entry_static * (1 - DCA_DEVIATION_PERCENT / 100)
+                else:
+                    trigger = current_price >= entry_static * (1 + DCA_DEVIATION_PERCENT / 100)
+
+                if not trigger:
                     continue
 
+                # qty berechnen
                 qty = calculate_dca_qty(
                     d["base_trade_size"],
                     d["executed"],
@@ -362,25 +384,32 @@ def monitor_dca():
                     print("[API ORDER ERROR]", e)
                     resp = None
 
-                # Post-placement handling
+                # Post-placement handling: lokale Fill-Annahme (current_price)
                 with dca_lock:
                     try:
-                        new_entry = update_entry(symbol, side)
-                        if new_entry:
-                            d["entry_dynamic"] = new_entry
-                            # set entry_static to new avg to avoid repeated triggers on old baseline
-                            d["entry_static"] = new_entry
+                        fill_price = current_price
+                        fill_qty = qty
+
+                        # Append local fill
+                        d.setdefault("fills", []).append({"qty": fill_qty, "price": fill_price})
+
+                        # Recalculate local average
+                        local_avg = recalc_local_avg(d)
+                        if local_avg:
+                            d["local_avg"] = local_avg
+                            d["entry_dynamic"] = local_avg  # kompatibel mit bisherigen Feldern
 
                         # Wenn executed >= AUTO_CLOSE_FROM_DCA, aktiviere internen Auto-Close
                         if d["executed"] >= AUTO_CLOSE_FROM_DCA:
                             d["auto_close_enabled"] = True
 
-                        tp_price = d["entry_dynamic"] if d["executed"] >= 1 else None
+                        # TP/SL neu setzen auf Basis local_avg (BE) falls vorhanden
+                        tp_price = d.get("local_avg") if d.get("executed", 0) >= 1 else None
 
-                        # TP/SL neu setzen (Exchange) wie bisher
+                        # Exchange TP/SL wie bisher setzen (optional, wird aber später intern geschlossen)
                         reset_tp_sl(symbol, side)
                         if tp_price is not None:
-                            print(f"[DCA] {symbol} DCA#{d['executed']} executed. Set BE TP at {tp_price:.6f}")
+                            print(f"[DCA] {symbol} DCA#{d['executed']} executed. Local BE at {tp_price:.6f}")
                             set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"], tp_price=tp_price)
                         else:
                             set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"])
@@ -389,13 +418,12 @@ def monitor_dca():
                         try:
                             if resp is None:
                                 msg = (f"⚠️ DCA Fehler für {symbol}\n"
-                                       f"DCA#{d['executed']} qty={qty} price={current_price:.6f}\n"
-                                       f"TP(BE)={'n/a' if tp_price is None else f'{tp_price:.6f}'}\n"
-                                       f"API response: None or error")
+                                       f"DCA#{d['executed']} qty={fill_qty} price={fill_price:.6f}\n"
+                                       f"Local BE={'n/a' if tp_price is None else f'{tp_price:.6f}'}")
                             else:
                                 msg = (f"✅ DCA ausgeführt für {symbol}\n"
-                                       f"DCA#{d['executed']} qty={qty} price={current_price:.6f}\n"
-                                       f"TP(BE)={'n/a' if tp_price is None else f'{tp_price:.6f}'}")
+                                       f"DCA#{d['executed']} qty={fill_qty} price={fill_price:.6f}\n"
+                                       f"Local BE={'n/a' if tp_price is None else f'{tp_price:.6f}'}")
                             send_telegram(msg)
                         except Exception as e:
                             print("[TELEGRAM SEND ERROR]", e)
@@ -421,7 +449,7 @@ def monitor_dca():
 def auto_close_watcher():
     """
     Überwacht active_dca Einträge mit auto_close_enabled == True.
-    Wenn current_price die BE (entry_dynamic) erreicht (mit optionalem Puffer),
+    Wenn current_price die lokale BE (local_avg) erreicht (mit optionalem Puffer),
     dann:
       - lösche Exchange TP Orders (cancel_all_tp_orders)
       - sende Market Order zum Schließen (close_position_market)
@@ -443,7 +471,7 @@ def auto_close_watcher():
                     if d.get("closing"):
                         continue
                     side = d["side"]
-                    be_price = d.get("entry_dynamic")
+                    be_price = d.get("local_avg")
                     if be_price is None:
                         continue
 
@@ -451,7 +479,7 @@ def auto_close_watcher():
                 if current_price is None:
                     continue
 
-                # apply buffer: for LONG we require price >= be_price * (1 + buffer)
+                # apply buffer: for LONG require price >= be_price * (1 + buffer)
                 buffer = AUTO_CLOSE_BUFFER
                 if side == "LONG":
                     threshold = be_price * (1 + buffer)
@@ -461,9 +489,7 @@ def auto_close_watcher():
                     reached = current_price <= threshold
 
                 if reached:
-                    # begin closing sequence
                     with dca_lock:
-                        # mark as closing to avoid races
                         d["closing"] = True
 
                     try:
@@ -485,11 +511,9 @@ def auto_close_watcher():
                         send_telegram(f"⚠️ AUTO-CLOSE Exception für {symbol}: {e}")
 
                     finally:
-                        # cleanup active_dca
                         with dca_lock:
                             active_dca.pop(symbol, None)
 
-                # tiny sleep between symbols
                 time.sleep(0.02)
 
         except Exception as e:
@@ -501,7 +525,6 @@ def auto_close_watcher():
 # ============================================================
 #   TP/SL WATCHER — setzt fehlende TP/SL neu
 # ============================================================
-
 def tp_sl_watcher():
     while True:
         try:
@@ -535,7 +558,8 @@ def tp_sl_watcher():
                     with dca_lock:
                         d = active_dca.get(symbol)
                         if d and d.get("executed", 0) >= 1:
-                            set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"], tp_price=d["entry_dynamic"])
+                            # Verwende lokale BE falls vorhanden
+                            set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"], tp_price=d.get("local_avg"))
                         else:
                             set_tp_sl(symbol, side)
 
@@ -548,7 +572,6 @@ def tp_sl_watcher():
 # ============================================================
 #   execute_trade() MIT DCA-INTEGRATION UND MAX OPEN POSITIONS CHECK
 # ============================================================
-
 def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
     # Prüfe Anzahl offener Positionen insgesamt
     positions = get_positions()
@@ -594,10 +617,15 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
         "timestamp": str(int(time.time() * 1000))
     })
 
+    # Initiale lokale Fill-Informationen speichern (wir verlassen uns nicht auf avgPrice der Exchange)
     with dca_lock:
         active_dca[symbol] = {
             "side": direction,
-            "entry_static": price,
+            "entry_static": price,        # initial-entry price (Basis für Trigger)
+            "initial_price": price,
+            "initial_qty": qty,
+            "fills": [ {"qty": qty, "price": price} ],  # lokale Fill-Historie
+            "local_avg": price,           # lokal berechneter avg (BE)
             "entry_dynamic": price,
             "executed": 0,
             "base_trade_size": trade_size,
@@ -611,14 +639,13 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
 
     time.sleep(2)
     reset_tp_sl(symbol, direction)
-    # Initial TP/SL per Prozent (erst nach DCA wird BE gesetzt)
+    # Initial TP/SL per Prozent (erst nach DCA wird BE intern überwacht)
     set_tp_sl(symbol, direction, tp_percent, sl_percent)
 
 
 # ============================================================
 #   FLASK + THREADS
 # ============================================================
-
 @app.route("/testorder", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
