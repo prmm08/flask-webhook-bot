@@ -199,13 +199,30 @@ def webhook():
     data = request.get_json(silent=True) or {}
     symbol = f"{str(data.get('currency', '')).upper()}-USDT"
     direction = str(data.get("direction", "")).upper()
+    
     if direction in ("LONG", "SHORT"):
-        threading.Thread(target=execute_trade, args=(symbol, direction, int(data.get("leverage", LEVERAGE)), 
-                         float(data.get("trade_size", TRADE_SIZE)), float(data.get("tp_percent", TP_PERCENT)), 
-                         float(data.get("sl_percent", SL_PERCENT))).start()
+        # Korrektur der Klammern:
+        threading.Thread(
+            target=execute_trade, 
+            args=(
+                symbol, 
+                direction, 
+                int(data.get("leverage", LEVERAGE)), 
+                float(data.get("trade_size", TRADE_SIZE)), 
+                float(data.get("tp_percent", TP_PERCENT)), 
+                float(data.get("sl_percent", SL_PERCENT))
+            )
+        ).start()
+        
     return jsonify({"status": "processing"}), 200
 
 if __name__ == "__main__":
-    load_dca_data()
-    threading.Thread(target=monitor_worker, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    if not API_KEY or not API_SECRET:
+        print("FEHLER: API Keys fehlen in den Environment Variables!")
+    else:
+        load_dca_data()
+        # Der Worker übernimmt jetzt DCA und Break-Even Monitoring
+        threading.Thread(target=monitor_worker, daemon=True).start()
+        
+        print("Bot gestartet. Warte auf Webhooks...")
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
