@@ -1,4 +1,4 @@
-#----------------- Working Skript WATCHER TP, SL, DCA mit BE, Telegram und Max Open Positions -------------------#
+#----------------- Working Skript WATCHER TP, SL, DCA mit BE, Telegram, Max Open Positions und Race-Condition Fixes -------------------#
 
 import hmac
 import hashlib
@@ -28,12 +28,12 @@ SL_PERCENT = 40
 
 # --- DCA SETTINGS ---
 DCA_INTERVAL = 5                # Sekunden zwischen DCA-Checks
-DCA_COUNT = 4
+DCA_COUNT = 5
 DCA_DEVIATION_PERCENT = 5       # Prozent Abweichung vom entry_static für DCA-Trigger
 DCA_VOLUME_MULTIPLIER = 2
 
 # --- RISK / LIMITS ---
-MAX_OPEN_POSITIONS = 20         # Maximale Anzahl gleichzeitig offener Positionen beim Exchange
+MAX_OPEN_POSITIONS = 25         # Maximale Anzahl gleichzeitig offener Positionen beim Exchange
 
 active_dca = {}
 dca_lock = threading.Lock()
@@ -220,7 +220,7 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
 
 
 # ============================================================
-#   DCA ENGINE — STABILE VERSION MIT BE-LOGIK UND TELEGRAM
+#   DCA ENGINE — STABILE VERSION MIT BE-LOGIK, TELEGRAM UND RACE-FIXES
 # ============================================================
 
 def update_entry(symbol, side):
@@ -264,6 +264,7 @@ def monitor_dca():
                 if not current_price:
                     continue
 
+                # ensure active_dca entry exists
                 with dca_lock:
                     if symbol not in active_dca:
                         base_value = abs(amt) * float(pos["avgPrice"])
@@ -274,66 +275,115 @@ def monitor_dca():
                             "executed": 0,
                             "base_trade_size": base_value,
                             "tp_percent": TP_PERCENT,
-                            "sl_percent": SL_PERCENT
+                            "sl_percent": SL_PERCENT,
+                            "placing": False,            # neu: Order in Arbeit
+                            "last_dca_ts": 0.0           # neu: cooldown timestamp
                         }
 
                     d = active_dca[symbol]
 
-                if d["executed"] >= DCA_COUNT:
-                    continue
+                # skip if already maxed
+                with dca_lock:
+                    if d["executed"] >= DCA_COUNT:
+                        continue
+                    # cooldown prüfen (z.B. 2 Sekunden)
+                    if time.time() - d.get("last_dca_ts", 0) < 2:
+                        continue
+                    # falls bereits eine Platzierung läuft, skip
+                    if d.get("placing"):
+                        continue
 
+                # check trigger against entry_static
                 if not should_trigger_dca(side, current_price, d["entry_static"], DCA_DEVIATION_PERCENT):
                     continue
 
+                # calculate qty before reserving executed
                 qty = calculate_dca_qty(
                     d["base_trade_size"],
                     d["executed"],
                     current_price
                 )
 
-                # Platzieren der Market-Order
-                resp = api_request("POST", "/openApi/swap/v2/trade/order", {
-                    "symbol": symbol,
-                    "side": "BUY" if side == "LONG" else "SELL",
-                    "positionSide": side,
-                    "type": "MARKET",
-                    "quantity": str(qty),
-                    "timestamp": str(int(time.time() * 1000))
-                })
-
+                # Reserve the DCA slot atomically
+                reserved = False
                 with dca_lock:
-                    d["executed"] += 1
-                    new_entry = update_entry(symbol, side)
-                    if new_entry:
-                        d["entry_dynamic"] = new_entry
-
-                    if d["executed"] >= 1:
-                        tp_price = d["entry_dynamic"]
+                    # double-check conditions inside lock to avoid race
+                    if not d.get("placing") and (time.time() - d.get("last_dca_ts", 0) >= 2) and d["executed"] < DCA_COUNT:
+                        d["placing"] = True
+                        d["executed"] += 1
+                        d["last_dca_ts"] = time.time()
+                        reserved = True
+                        current_executed = d["executed"]
                     else:
-                        tp_price = None
+                        reserved = False
 
-                # TP/SL neu setzen
-                reset_tp_sl(symbol, side)
-                if tp_price is not None:
-                    print(f"[DCA] {symbol} DCA#{d['executed']} executed. Set BE TP at {tp_price:.6f}")
-                    set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"], tp_price=tp_price)
-                else:
-                    set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"])
+                if not reserved:
+                    # another thread reserved it; skip this loop
+                    continue
 
-                # Telegram Nachricht: nur wenn Order-Platzierung versucht wurde
+                # Platzieren der Market-Order (outside lock)
+                resp = None
+                api_error = None
                 try:
-                    if resp is None:
-                        msg = (f"⚠️ DCA Fehler für {symbol}\n"
-                               f"DCA#{d['executed']} qty={qty} price={current_price:.6f}\n"
-                               f"TP(BE)={'n/a' if tp_price is None else f'{tp_price:.6f}'}\n"
-                               f"API response: None or error")
-                    else:
-                        msg = (f"✅ DCA ausgeführt für {symbol}\n"
-                               f"DCA#{d['executed']} qty={qty} price={current_price:.6f}\n"
-                               f"TP(BE)={'n/a' if tp_price is None else f'{tp_price:.6f}'}")
-                    send_telegram(msg)
+                    resp = api_request("POST", "/openApi/swap/v2/trade/order", {
+                        "symbol": symbol,
+                        "side": "BUY" if side == "LONG" else "SELL",
+                        "positionSide": side,
+                        "type": "MARKET",
+                        "quantity": str(qty),
+                        "timestamp": str(int(time.time() * 1000))
+                    })
                 except Exception as e:
-                    print("[TELEGRAM SEND ERROR]", e)
+                    api_error = e
+                    resp = None
+
+                # Post-placement handling
+                with dca_lock:
+                    try:
+                        # update avgPrice / entry_dynamic
+                        new_entry = update_entry(symbol, side)
+                        if new_entry:
+                            d["entry_dynamic"] = new_entry
+                            # optional: set entry_static to new avg to avoid repeated triggers on old baseline
+                            d["entry_static"] = new_entry
+
+                        # BE-TP setzen falls executed >= 1
+                        tp_price = d["entry_dynamic"] if d["executed"] >= 1 else None
+
+                        # TP/SL neu setzen
+                        reset_tp_sl(symbol, side)
+                        if tp_price is not None:
+                            print(f"[DCA] {symbol} DCA#{d['executed']} executed. Set BE TP at {tp_price:.6f}")
+                            set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"], tp_price=tp_price)
+                        else:
+                            set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"])
+
+                        # Telegram Nachricht: nur wenn Order-Platzierung versucht wurde
+                        try:
+                            if resp is None:
+                                msg = (f"⚠️ DCA Fehler für {symbol}\n"
+                                       f"DCA#{d['executed']} qty={qty} price={current_price:.6f}\n"
+                                       f"TP(BE)={'n/a' if tp_price is None else f'{tp_price:.6f}'}\n"
+                                       f"API response: None or error")
+                            else:
+                                msg = (f"✅ DCA ausgeführt für {symbol}\n"
+                                       f"DCA#{d['executed']} qty={qty} price={current_price:.6f}\n"
+                                       f"TP(BE)={'n/a' if tp_price is None else f'{tp_price:.6f}'}")
+                            send_telegram(msg)
+                        except Exception as e:
+                            print("[TELEGRAM SEND ERROR]", e)
+
+                    except Exception as e:
+                        # Falls etwas schief geht, rolle executed zurück
+                        d["executed"] = max(0, d["executed"] - 1)
+                        print("[DCA POST ERROR]", e)
+                    finally:
+                        # Platzierung abgeschlossen
+                        d["placing"] = False
+                        d["last_dca_ts"] = time.time()
+
+                # small sleep to avoid hammering in same loop
+                time.sleep(0.05)
 
         except Exception as e:
             print("[DCA ERROR]", e)
@@ -445,7 +495,9 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
             "executed": 0,
             "base_trade_size": trade_size,
             "tp_percent": tp_percent,
-            "sl_percent": sl_percent
+            "sl_percent": sl_percent,
+            "placing": False,
+            "last_dca_ts": 0.0
         }
 
     time.sleep(2)
