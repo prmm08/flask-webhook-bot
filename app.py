@@ -24,7 +24,7 @@ log.setLevel(logging.ERROR)
 
 app = Flask(__name__)
 
-# Standard-Werte
+# Standard-Werte (werden durch Webhook überschrieben falls mitgesendet)
 LEVERAGE = 20
 TRADE_SIZE = 100
 TP_PERCENT = 1.0
@@ -32,8 +32,8 @@ SL_PERCENT = 40.0
 DCA_DEVIATION_PERCENT = 5.0 
 DCA_VOLUME_MULTIPLIER = 2
 DCA_MAX_STEPS = 5
-DCA_TP_PERCENT = 1.2
-DCA_SL_PERCENT = 20.0
+DCA_TP_PERCENT = 1.0
+DCA_SL_PERCENT = 40.0
 DCA_SAVE_FILE = "active_dca.json"
 
 active_dca = {}
@@ -42,8 +42,24 @@ dca_lock = threading.Lock()
 symbol_info_cache = {}
 
 # ============================================================
-#   CORE HELPERS
+#   PERSISTENCE & HELPERS
 # ============================================================
+
+def save_dca_data():
+    with dca_lock:
+        try:
+            with open(DCA_SAVE_FILE, "w") as f:
+                json.dump(active_dca, f, indent=4)
+        except Exception as e: logging.error(f"Save Error: {e}")
+
+def load_dca_data():
+    global active_dca
+    if os.path.exists(DCA_SAVE_FILE):
+        try:
+            with open(DCA_SAVE_FILE, "r") as f:
+                active_dca = json.load(f)
+            logging.info(f"DCA Daten geladen: {len(active_dca)} Positionen.")
+        except Exception as e: logging.error(f"Load Error: {e}")
 
 def api_request(method, endpoint, params=None):
     url = f"{BINGX_BASE}{endpoint}"
@@ -54,10 +70,7 @@ def api_request(method, endpoint, params=None):
     full_url = f"{url}?{query_string}&signature={sig}"
     headers = {"X-BX-APIKEY": API_KEY}
     try:
-        if method == "GET":
-            resp = requests.get(full_url, headers=headers, timeout=10)
-        else:
-            resp = requests.post(full_url, headers=headers, timeout=10)
+        resp = requests.get(full_url, headers=headers, timeout=10) if method == "GET" else requests.post(full_url, headers=headers, timeout=10)
         return resp.json()
     except Exception as e:
         logging.error(f"API Error: {e}")
@@ -78,6 +91,7 @@ def get_symbol_precision(symbol):
 def round_step(value, step):
     if not step or step == 0: return value
     inv = 1.0 / step
+    # Kleiner Offset gegen Floating Point Fehler
     return round(floor(value * inv + 0.0000000001) / inv, 10)
 
 def get_price(symbol):
@@ -85,24 +99,21 @@ def get_price(symbol):
     return float(r["data"]["price"]) if r and "data" in r else None
 
 # ============================================================
-#   TRADING LOGIK (DIE FIXES)
+#   TRADING LOGIC
 # ============================================================
 
 def set_exchange_tp_sl(symbol, side, entry, tp_p, sl_p, quantity):
-    """Setzt TP/SL mit Force-Protokoll für Hedge Mode"""
-    # 1. Wartezeit erhöhen (BingX braucht Zeit für Positions-Update)
-    logging.info(f"[WAIT] Warte 5s vor TP/SL Setzung für {symbol}...")
+    """Setzt TP/SL optimiert für Hedge Mode & Altcoins"""
+    logging.info(f"[WAIT] 5s Pause für Positions-Sync {symbol}...")
     time.sleep(5)
 
     prec = get_symbol_precision(symbol)
     tp_price = round_step(entry * (1 + tp_p/100 if side == "LONG" else 1 - tp_p/100), prec["price_step"])
     sl_price = round_step(entry * (1 - sl_p/100 if side == "LONG" else 1 + sl_p/100), prec["price_step"])
-    
-    # Im Hedge Mode: Schließen erfordert Gegenseite
     order_side = "SELL" if side == "LONG" else "BUY"
 
     for o_type, price in [("TAKE_PROFIT_MARKET", tp_price), ("STOP_MARKET", sl_price)]:
-        # Strategie A: closePosition=true
+        # Wir senden jetzt direkt die 'sichere' Kombination: closePosition + quantity
         payload = {
             "symbol": symbol,
             "side": order_side,
@@ -110,44 +121,42 @@ def set_exchange_tp_sl(symbol, side, entry, tp_p, sl_p, quantity):
             "type": o_type,
             "stopPrice": str(price),
             "workingType": "MARK_PRICE",
+            "quantity": str(quantity),
             "closePosition": "true"
         }
         
         res = api_request("POST", "/openApi/swap/v2/trade/order", payload)
         
-        # Strategie B: Falls A scheitert, explizite Menge nutzen
-        if not res or res.get("code") != 0:
-            logging.warning(f"[RETRY] Methode A fehlgeschlagen ({o_type}): {res}. Versuche Methode B...")
-            payload.pop("closePosition")
-            payload["quantity"] = str(quantity)
-            res = api_request("POST", "/openApi/swap/v2/trade/order", payload)
-
         if res and res.get("code") == 0:
-            logging.info(f"[SUCCESS] {o_type} gesetzt auf {price}")
+            logging.info(f"[SUCCESS] {o_type} für {symbol} gesetzt bei {price}")
         else:
-            logging.error(f"[FATAL] {o_type} konnte nicht gesetzt werden! Antwort: {res}")
+            # Letzter Rettungsversuch ohne closePosition falls die API meckert
+            payload.pop("closePosition")
+            res = api_request("POST", "/openApi/swap/v2/trade/order", payload)
+            if res and res.get("code") == 0:
+                logging.info(f"[SUCCESS] {o_type} via Methode B gesetzt.")
+            else:
+                logging.error(f"[FATAL] TP/SL fehlgeschlagen für {symbol}: {res}")
 
 def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
     if symbol in processing_symbols: return
     processing_symbols.add(symbol)
     try:
-        # Check ob Position schon offen
-        pos_res = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
-        if pos_res and any(float(p["positionAmt"]) != 0 for p in pos_res.get("data", [])):
-            logging.info(f"[SKIP] {symbol} Position bereits aktiv.")
+        # Check Positions
+        pos_data = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
+        if pos_data and any(float(p["positionAmt"]) != 0 for p in pos_data.get("data", [])):
             return
 
         price = get_price(symbol)
         if not price: return
 
-        # 1. Hebel anpassen
+        # Leverage & Order
         api_request("POST", "/openApi/swap/v2/trade/leverage", {"symbol": symbol, "leverage": leverage, "side": direction})
         
-        # 2. Market Order ausführen
         prec = get_symbol_precision(symbol)
         qty = round_step(trade_size / price, prec["qty_step"])
         
-        logging.info(f"[EXEC] Öffne {direction} {symbol} | Qty: {qty} | Preis: {price}")
+        logging.info(f"[EXEC] {direction} {symbol} | Qty: {qty}")
         res = api_request("POST", "/openApi/swap/v2/trade/order", {
             "symbol": symbol, "side": "BUY" if direction == "LONG" else "SELL",
             "positionSide": direction, "type": "MARKET", "quantity": str(qty)
@@ -159,29 +168,28 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
                     "side": direction, "entry_static": price, "entry_dynamic": price,
                     "executed": 0, "base_trade_size": trade_size, "qty": qty
                 }
-            # 3. TP/SL setzen (in eigenem Thread, um Webhook nicht zu blockieren)
+                save_dca_data()
+            # TP/SL in Hintergrund-Thread
             threading.Thread(target=set_exchange_tp_sl, args=(symbol, direction, price, tp_percent, sl_percent, qty)).start()
-        else:
-            logging.error(f"[ERROR] Market Order fehlgeschlagen: {res}")
-            
     finally:
         time.sleep(2)
         processing_symbols.discard(symbol)
 
 # ============================================================
-#   WORKER & FLASK
+#   WATCHER & FLASK
 # ============================================================
 
 def monitor_worker():
     while True:
         try:
-            pos_data = api_request("GET", "/openApi/swap/v2/user/positions")
-            active_on_exchange = {p["symbol"]: p for p in pos_data.get("data", []) if float(p["positionAmt"]) != 0} if pos_data else {}
-            
+            pos_res = api_request("GET", "/openApi/swap/v2/user/positions")
+            active_list = {p["symbol"]: p for p in pos_res.get("data", []) if float(p["positionAmt"]) != 0} if pos_res else {}
+
             with dca_lock:
-                to_delete = [s for s in active_dca if s not in active_on_exchange]
+                to_delete = [s for s in active_dca if s not in active_list]
                 for s in to_delete: del active_dca[s]
-            
+                if to_delete: save_dca_data()
+
             for symbol in list(active_dca.keys()):
                 d = active_dca[symbol]
                 curr = get_price(symbol)
@@ -189,12 +197,12 @@ def monitor_worker():
 
                 # DCA Logik
                 if d["executed"] < DCA_MAX_STEPS:
-                    req_change = DCA_DEVIATION_PERCENT * (d["executed"] + 1)
-                    triggered = (d["side"] == "LONG" and curr <= d["entry_static"] * (1 - req_change/100)) or \
-                                (d["side"] == "SHORT" and curr >= d["entry_static"] * (1 + req_change/100))
+                    req_drop = DCA_DEVIATION_PERCENT * (d["executed"] + 1)
+                    triggered = (d["side"] == "LONG" and curr <= d["entry_static"] * (1 - req_drop/100)) or \
+                                (d["side"] == "SHORT" and curr >= d["entry_static"] * (1 + req_drop/100))
                     
                     if triggered:
-                        # Cancel Orders & Nachkauf... (wie vorher)
+                        logging.info(f"[DCA] Trigger {symbol}. Lösche Exchange-Orders...")
                         ords = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
                         if ords and ords.get("data"):
                             for o in ords["data"].get("orders", []):
@@ -207,11 +215,29 @@ def monitor_worker():
                             "positionSide": d["side"], "type": "MARKET", "quantity": str(new_qty)
                         })
                         time.sleep(3)
-                        p_res = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
-                        if p_res and p_res.get("data"):
+                        p_now = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
+                        if p_now and p_now.get("data"):
                             with dca_lock:
                                 d["executed"] += 1
-                                d["entry_dynamic"] = float(p_res["data"][0]["avgPrice"])
+                                d["entry_dynamic"] = float(p_now["data"][0]["avgPrice"])
+                                save_dca_data()
+
+                # Virtual Exit (Nur nach DCA)
+                if d["executed"] > 0:
+                    exit_reason = None
+                    if d["side"] == "LONG":
+                        if curr >= d["entry_dynamic"] * (1 + DCA_TP_PERCENT/100): exit_reason = "VIRTUAL_TP"
+                        elif curr <= d["entry_dynamic"] * (1 - DCA_SL_PERCENT/100): exit_reason = "VIRTUAL_SL"
+                    else:
+                        if curr <= d["entry_dynamic"] * (1 - DCA_TP_PERCENT/100): exit_reason = "VIRTUAL_TP"
+                        elif curr >= d["entry_dynamic"] * (1 + DCA_SL_PERCENT/100): exit_reason = "VIRTUAL_SL"
+
+                    if exit_reason:
+                        logging.info(f"[{exit_reason}] Schließe {symbol} via Market.")
+                        api_request("POST", "/openApi/swap/v2/trade/order", {
+                            "symbol": symbol, "side": "SELL" if d["side"] == "LONG" else "BUY",
+                            "positionSide": d["side"], "type": "MARKET", "closePosition": "true"
+                        })
         except: pass
         time.sleep(10)
 
@@ -232,5 +258,6 @@ def webhook():
     return jsonify({"status": "received"}), 200
 
 if __name__ == "__main__":
+    load_dca_data()
     threading.Thread(target=monitor_worker, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
