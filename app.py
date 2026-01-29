@@ -1,5 +1,3 @@
-# --------        TP based on last Order    ------------
-
 import hmac
 import hashlib
 import requests
@@ -7,227 +5,281 @@ import os
 import urllib.parse
 import threading
 import time
+import json
+import logging
 from flask import Flask, request, jsonify
 
-# --- CONFIG ---
+# --- API ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
-# --- STRATEGIE EINSTELLUNGEN ---
-USE_SL = False
-SL_PERCENT = 40
-TP_PERCENT = 1
-
-DCA_COUNT = 4     
-DCA_DEVIATION_PERCENT = 5
-DCA_VOLUME_MULTIPLIER = 2
-MIN_ORDER_INTERVAL = 30
-TRADE_SIZE = 200
+# --- DEFAULT SETTINGS ---
 LEVERAGE = 20
+TRADE_SIZE = 100
+TP_PERCENT = 1
+SL_PERCENT = 40
+
+# --- DCA SETTINGS ---
+DCA_INTERVAL = 5
+DCA_COUNT = 4
+DCA_DEVIATION_PERCENT = 5.0
+DCA_VOLUME_MULTIPLIER = 2
+DCA_SAVE_FILE = "active_dca.json"
 
 active_dca = {}
 dca_lock = threading.Lock()
+last_dca_heartbeat = time.time()
 
-def dca_key(symbol, side):
-    return f"{symbol}:{side}"
+# ============================================================
+#   PERSISTENCE (SPEICHER-FUNKTION)
+# ============================================================
 
-# --- API CORE ---
+def save_dca_data():
+    with dca_lock:
+        try:
+            with open(DCA_SAVE_FILE, "w") as f:
+                json.dump(active_dca, f)
+        except Exception as e:
+            print("[SAVE ERROR]", e)
+
+def load_dca_data():
+    global active_dca
+    if os.path.exists(DCA_SAVE_FILE):
+        try:
+            with open(DCA_SAVE_FILE, "r") as f:
+                active_dca = json.load(f)
+            print(f"[LOAD] {len(active_dca)} Positionen geladen.")
+        except Exception as e:
+            print("[LOAD ERROR]", e)
+
+# ============================================================
+#   BINGX API HELPERS
+# ============================================================
+
 def sign_bingx(params):
-    items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
-    query_string = urllib.parse.urlencode(items)
+    if not params:
+        query_string = ""
+    else:
+        items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
+        query_string = urllib.parse.urlencode(items)
     return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
 def api_request(method, endpoint, params=None):
     url = f"{BINGX_BASE}{endpoint}"
     headers = {"X-BX-APIKEY": API_KEY}
-    params = dict(params) if params else {}
-    params["timestamp"] = str(int(time.time() * 1000))
-    
-    query_string = urllib.parse.urlencode(sorted(params.items()))
-    signature = sign_bingx(params)
-    full_url = f"{url}?{query_string}&signature={signature}"
+    params = {} if params is None else dict(params)
+    timeout = (5, 10)
 
-    try:
-        if method == "POST":
-            response = requests.post(full_url, headers=headers, timeout=10)
-        elif method == "GET":
-            response = requests.get(full_url, headers=headers, timeout=10)
-        elif method == "DELETE":
-            response = requests.delete(full_url, headers=headers, timeout=10)
-        
-        res = response.json()
-        if res.get("code") != 0 and res.get("code") != 80001:
-            print(f"[API ERROR] {endpoint}: {res}")
-        return res
-    except Exception as e:
-        print(f"[NETWORK ERROR] {e}")
-        return None
+    if method == "GET":
+        try:
+            params_for_sign = dict(params)
+            signature = sign_bingx(params_for_sign)
+            params_for_sign["signature"] = signature
+            query = urllib.parse.urlencode(params_for_sign)
+            response = requests.get(f"{url}?{query}", headers=headers, timeout=timeout)
+            return response.json()
+        except Exception as e:
+            print("[API ERROR GET]", e)
+            return None
 
-# --- HELPERS ---
+    if method == "POST":
+        try:
+            params_for_sign = dict(params)
+            if "timestamp" not in params_for_sign:
+                params_for_sign["timestamp"] = str(int(time.time() * 1000))
+            query = urllib.parse.urlencode(sorted((k, str(v)) for k, v in params_for_sign.items()))
+            signature = sign_bingx(params_for_sign)
+            response = requests.post(f"{url}?{query}&signature={signature}", headers=headers, timeout=timeout)
+            return response.json()
+        except Exception as e:
+            print("[API ERROR POST]", e)
+            return None
+
 def get_price(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-    return float(r["data"]["price"]) if r and "data" in r else None
+    try: return float(r["data"]["price"])
+    except: return None
 
-def get_last_fill_price(symbol, side):
-    try:
-        r = api_request("GET", "/openApi/swap/v2/trade/allOrders", {"symbol": symbol, "limit": 20})
-        orders = r.get("data", {}).get("orders", []) if r else []
-        target_side = "BUY" if side == "LONG" else "SELL"
-        filled = [o for o in orders if o["status"] == "FILLED" and o["positionSide"] == side and o["side"] == target_side]
-        if not filled: return None, 0
-        filled.sort(key=lambda x: x["updateTime"], reverse=True)
-        return float(filled[0]["avgFilledPrice"]), len(filled)
-    except: return None, 0
+def get_positions():
+    ts = str(int(time.time() * 1000))
+    r = api_request("GET", "/openApi/swap/v2/user/positions", {"timestamp": ts})
+    return r.get("data", []) if r else []
 
-# --- TP & SL LOGIK (BREAK-EVEN BASIERT) ---
-def set_tp_sl(symbol, side, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT):
-    r_pos = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
-    positions = r_pos.get("data", []) if r_pos else []
-    pos = next((p for p in positions if p["positionSide"] == side and float(p["positionAmt"]) != 0), None)
-    
+def symbol_exists(symbol):
+    r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
+    return r and "data" in r and "price" in r["data"]
+
+def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
+    ts = str(int(time.time() * 1000))
+    params = {"symbol": symbol, "leverage": str(leverage), "timestamp": ts}
+    if position_side: params["positionSide"] = position_side
+    if side: params["side"] = side
+    r = api_request("POST", "/openApi/swap/v2/trade/leverage", params)
+    return bool(r)
+
+# ============================================================
+#   TP / SL LOGIC
+# ============================================================
+
+def reset_tp_sl(symbol, position_side=None):
+    ts = str(int(time.time() * 1000))
+    r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "timestamp": ts})
+    orders = r.get("data", {}).get("orders", []) if r else []
+    for order in orders:
+        pos_side = order.get("positionSide") or order.get("position")
+        if position_side and pos_side != position_side: continue
+        oid = order.get("orderId")
+        if oid:
+            api_request("POST", "/openApi/swap/v2/trade/cancelOrder",
+                        {"orderId": oid, "symbol": symbol, "timestamp": str(int(time.time() * 1000))})
+
+def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT):
+    pos = None
+    for _ in range(8):
+        positions = get_positions()
+        pos = next((p for p in positions if p["symbol"] == symbol and float(p.get("positionAmt", 0)) != 0
+                    and (desired_side is None or p.get("positionSide") == desired_side)), None)
+        if pos: break
+        time.sleep(1)
     if not pos: return
 
-    break_even = float(pos["avgPrice"])
-    tp_price = break_even * (1 + tp_percent/100) if side == "LONG" else break_even * (1 - tp_percent/100)
-
-    # Alte löschen
-    r_orders = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
-    orders = r_orders.get("data", {}).get("orders", []) if r_orders else []
-    for o in orders:
-        if o.get("positionSide") == side and o.get("type") in ["TAKE_PROFIT_MARKET", "STOP_MARKET"]:
-            api_request("DELETE", "/openApi/swap/v2/trade/order", {"symbol": symbol, "orderId": o["orderId"]})
-
-    # Neue setzen
-    api_request("POST", "/openApi/swap/v2/trade/order", {
-        "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", "positionSide": side,
-        "type": "TAKE_PROFIT_MARKET", "stopPrice": f"{tp_price:.6f}", "workingType": "MARK_PRICE", "closePosition": "true"
-    })
-
-    if USE_SL:
-        sl_price = break_even * (1 - sl_percent/100) if side == "LONG" else break_even * (1 + sl_percent/100)
+    side = pos["positionSide"]
+    entry = float(pos["avgPrice"])
+    tp = entry * (1 + tp_percent / 100) if side == "LONG" else entry * (1 - tp_percent / 100)
+    sl = entry * (1 - sl_percent / 100) if side == "LONG" else entry * (1 + sl_percent / 100)
+    
+    reset_tp_sl(symbol, side)
+    for price, otype in [(tp, "TAKE_PROFIT_MARKET"), (sl, "STOP_MARKET")]:
         api_request("POST", "/openApi/swap/v2/trade/order", {
-            "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", "positionSide": side,
-            "type": "STOP_MARKET", "stopPrice": f"{sl_price:.6f}", "workingType": "MARK_PRICE", "closePosition": "true"
+            "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY",
+            "positionSide": side, "type": otype, "stopPrice": f"{price:.6f}",
+            "workingType": "MARK_PRICE", "closePosition": "true", "timestamp": str(int(time.time() * 1000))
         })
 
-# --- DCA MONITOR ---
+# ============================================================
+#   DCA ENGINE
+# ============================================================
+
 def monitor_dca():
+    global last_dca_heartbeat
     while True:
+        last_dca_heartbeat = time.time()
         try:
-            r_pos = api_request("GET", "/openApi/swap/v2/user/positions")
-            positions = r_pos.get("data", []) if r_pos else []
-            
-            current_keys = [dca_key(p["symbol"], p["positionSide"]) for p in positions if float(p["positionAmt"]) != 0]
+            positions = get_positions()
+            active_symbols_in_api = [p["symbol"] for p in positions if float(p["positionAmt"]) != 0]
+
+            # Cleanup local data
             with dca_lock:
-                for key in list(active_dca.keys()):
-                    if key not in current_keys and not active_dca[key].get("placing"):
-                        del active_dca[key]
+                to_delete = [s for s in active_dca if s not in active_symbols_in_api]
+                for s in to_delete: del active_dca[s]
+                if to_delete: save_dca_data()
 
             for pos in positions:
-                symbol, side = pos["symbol"], pos["positionSide"]
-                if float(pos["positionAmt"]) == 0: continue
-                
-                key = dca_key(symbol, side)
-                curr_price = get_price(symbol)
-                if not curr_price: continue
+                symbol, side, amt = pos["symbol"], pos["positionSide"], float(pos["positionAmt"])
+                if amt == 0: continue
+                current_price = get_price(symbol)
+                if not current_price: continue
 
                 with dca_lock:
-                    if key not in active_dca:
-                        last_p, count = get_last_fill_price(symbol, side)
-                        active_dca[key] = {
-                            "symbol": symbol, "side": side, "executed": count if count > 0 else 1,
-                            "last_order_price": last_p if last_p else float(pos["avgPrice"]),
-                            "next_allowed_time": time.monotonic() + 10, "placing": False
+                    if symbol not in active_dca:
+                        active_dca[symbol] = {
+                            "side": side, "entry_static": float(pos["avgPrice"]),
+                            "entry_dynamic": float(pos["avgPrice"]), "executed": 0,
+                            "base_trade_size": abs(amt) * float(pos["avgPrice"]),
+                            "tp_percent": TP_PERCENT, "sl_percent": SL_PERCENT
                         }
+                    d = active_dca[symbol]
+
+                if d["executed"] < DCA_COUNT:
+                    triggered = (side == "LONG" and current_price <= d["entry_static"] * (1 - DCA_DEVIATION_PERCENT/100)) or \
+                                (side == "SHORT" and current_price >= d["entry_static"] * (1 + DCA_DEVIATION_PERCENT/100))
                     
-                    d = active_dca[key]
-                    if d["placing"] or time.monotonic() < d["next_allowed_time"]: continue
-
-                    trigger = False
-                    if side == "LONG":
-                        trigger = curr_price <= d["last_order_price"] * (1 - DCA_DEVIATION_PERCENT/100)
-                    else:
-                        trigger = curr_price >= d["last_order_price"] * (1 + DCA_DEVIATION_PERCENT/100)
-
-                    if trigger and d["executed"] < DCA_COUNT:
-                        d["placing"] = True
-                        qty = (TRADE_SIZE * (DCA_VOLUME_MULTIPLIER ** d["executed"])) / curr_price
-                        resp = api_request("POST", "/openApi/swap/v2/trade/order", {
+                    if triggered:
+                        qty = round((d["base_trade_size"] * (DCA_VOLUME_MULTIPLIER ** (d["executed"] + 1))) / current_price, 6)
+                        api_request("POST", "/openApi/swap/v2/trade/order", {
                             "symbol": symbol, "side": "BUY" if side == "LONG" else "SELL",
-                            "positionSide": side, "type": "MARKET", "quantity": str(round(qty, 6))
+                            "positionSide": side, "type": "MARKET", "quantity": str(qty)
                         })
-                        if resp and resp.get("code") == 0:
+                        with dca_lock:
                             d["executed"] += 1
-                            d["last_order_price"] = curr_price
-                            d["next_allowed_time"] = time.monotonic() + MIN_ORDER_INTERVAL
-                            time.sleep(3)
-                            set_tp_sl(symbol, side)
-                        d["placing"] = False
-        except: pass
-        time.sleep(10)
+                            time.sleep(1)
+                            new_pos = next((p for p in get_positions() if p["symbol"] == symbol and p["positionSide"] == side), None)
+                            if new_pos: d["entry_dynamic"] = float(new_pos["avgPrice"])
+                            save_dca_data()
+                        set_tp_sl(symbol, side, d["tp_percent"], d["sl_percent"])
 
-# --- EXECUTION ---
-def execute_trade(symbol, direction, leverage, trade_size):
-    key = dca_key(symbol, direction)
-    with dca_lock:
-        if key in active_dca: return
+        except Exception as e: print("[DCA ERROR]", e)
+        time.sleep(DCA_INTERVAL)
 
-    api_request("POST", "/openApi/swap/v2/trade/leverage", {
-        "symbol": symbol, "leverage": str(leverage), 
-        "side": "BUY" if direction == "LONG" else "SELL", "positionSide": direction
-    })
+# ============================================================
+#   BREAK EVEN WATCHER (NEW)
+# ============================================================
 
+def break_even_watcher():
+    while True:
+        try:
+            with dca_lock:
+                items = list(active_dca.items())
+            for symbol, data in items:
+                if data["executed"] > 0:
+                    curr = get_price(symbol)
+                    if not curr: continue
+                    be = data["entry_dynamic"]
+                    if (data["side"] == "LONG" and curr >= be) or (data["side"] == "SHORT" and curr <= be):
+                        print(f"[BE EXIT] {symbol} erreicht.")
+                        api_request("POST", "/openApi/swap/v2/trade/order", {
+                            "symbol": symbol, "side": "SELL" if data["side"] == "LONG" else "BUY",
+                            "positionSide": data["side"], "type": "MARKET", "closePosition": "true"
+                        })
+                        with dca_lock:
+                            if symbol in active_dca: del active_dca[symbol]
+                            save_dca_data()
+        except Exception as e: print("[BE ERROR]", e)
+        time.sleep(2)
+
+# ============================================================
+#   TRADING & FLASK
+# ============================================================
+
+def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
+    if not symbol_exists(symbol): return
     price = get_price(symbol)
-    if not price: return
-
-    with dca_lock:
-        active_dca[key] = {"placing": True, "next_allowed_time": time.monotonic() + 60}
-
+    if not price or not set_leverage_for_symbol(symbol, leverage, direction, "BUY" if direction == "LONG" else "SELL"): return
+    
     qty = round(trade_size / price, 6)
-    resp = api_request("POST", "/openApi/swap/v2/trade/order", {
+    api_request("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol, "side": "BUY" if direction == "LONG" else "SELL",
         "positionSide": direction, "type": "MARKET", "quantity": str(qty)
     })
-
-    if resp and resp.get("code") == 0:
-        with dca_lock:
-            active_dca[key] = {
-                "symbol": symbol, "side": direction, "executed": 1,
-                "last_order_price": price, "placing": False,
-                "next_allowed_time": time.monotonic() + MIN_ORDER_INTERVAL
-            }
-        time.sleep(3)
-        set_tp_sl(symbol, direction)
-    else:
-        with dca_lock: 
-            if key in active_dca: del active_dca[key]
-
-# --- FLASK ENDPOINTS ---
-@app.route("/ping")
-@app.route("/")
-def health_check():
-    return "OK", 200
+    with dca_lock:
+        active_dca[symbol] = {
+            "side": direction, "entry_static": price, "entry_dynamic": price,
+            "executed": 0, "base_trade_size": trade_size, "tp_percent": tp_percent, "sl_percent": sl_percent
+        }
+        save_dca_data()
+    set_tp_sl(symbol, direction, tp_percent, sl_percent)
 
 @app.route("/testorder", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
-    currency = str(data.get("currency", "")).upper()
+    symbol = f"{str(data.get('currency', '')).upper()}-USDT"
     direction = str(data.get("direction", "")).upper()
-    if currency and direction:
-        threading.Thread(target=execute_trade, args=(f"{currency}-USDT", direction, LEVERAGE, TRADE_SIZE), daemon=True).start()
-    return jsonify({"status": "ok"}), 200
+    if direction in ("LONG", "SHORT"):
+        threading.Thread(target=execute_trade, args=(symbol, direction, 
+                        int(data.get("leverage", LEVERAGE)), float(data.get("trade_size", TRADE_SIZE)),
+                        float(data.get("tp_percent", TP_PERCENT)), float(data.get("sl_percent", SL_PERCENT))).start()
+    return jsonify({"status": "processing"}), 200
+
+@app.route("/ping")
+def ping(): return "pong", 200
 
 if __name__ == "__main__":
-    # 1. API Keys prüfen
-    if not API_KEY or not API_SECRET:
-        print("[CRITICAL] API Keys fehlen!")
-    
-    # 2. Monitor Thread starten
+    load_dca_data()
     threading.Thread(target=monitor_dca, daemon=True).start()
-    
-    # 3. Flask Server starten (Render-konform)
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    threading.Thread(target=break_even_watcher, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
