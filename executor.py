@@ -80,7 +80,7 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
 # ---------------------------------------------------------
 #   WEBHOOK ENDPOINT
 # ---------------------------------------------------------
-@app.route("/webhook", methods=["POST"])
+@app.route("/testorder", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
 
