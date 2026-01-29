@@ -317,6 +317,18 @@ def monitor_worker():
         
         time.sleep(5)
 
+
+
+# ============================================================
+#   HEALTH CHECK (WICHTIG FÜR RENDER)
+# ============================================================
+
+@app.route("/")
+@app.route("/ping")
+def health_check():
+    # Einfacher Ping, damit Render weiß, dass der Bot läuft
+    return "OK", 200
+    
 # ============================================================
 #   FLASK
 # ============================================================
