@@ -25,7 +25,7 @@ DEFAULT_TRADE_USD = float(os.getenv("DEFAULT_TRADE_USD", "1.0"))  # $ amount for
 
 # --- DCA SETTINGS ---
 DCA_COUNT = int(os.getenv("DCA_COUNT", "4"))
-DCA_DEVIATION_PERCENT = Decimal(os.getenv("DCA_DEVIATION_PERCENT", "5"))
+DCA_DEVIATION_PERCENT = Decimal(os.getenv("DCA_DEVIATION_PERCENT", "5"))  # percent
 DCA_VOLUME_MULTIPLIER = Decimal(os.getenv("DCA_VOLUME_MULTIPLIER", "2"))
 
 # --- AUTO CLOSE ---
@@ -38,7 +38,7 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
 # --- WEB / EXECUTOR ---
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "5000"))
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/testorder")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 
 # --- WORKER INTERVALS & LOGGING ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

@@ -1,5 +1,4 @@
 # db.py
-import os
 import json
 import time
 import psycopg
@@ -10,7 +9,6 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
 def get_conn():
-    # psycopg.connect supports context manager
     return psycopg.connect(DATABASE_URL, autocommit=False, sslmode="require")
 
 def _recalc_local_avg_from_fills(fills):
@@ -25,24 +23,27 @@ def _recalc_local_avg_from_fills(fills):
         return None
     return total_value / total_qty
 
-def create_position(symbol, side, entry_price, qty, tp_percent, sl_percent):
+def create_position(symbol, side, entry_price, qty, tp_percent, sl_percent,
+                    dca_count=None, dca_deviation_percent=None, dca_volume_multiplier=None):
     fills = [{"qty": qty, "price": entry_price}]
     local_avg = entry_price
     last_dca_ts = time.time()
+    # use provided dca values or defaults in DB schema
     sql = """
         INSERT INTO positions (
             symbol, side, entry_static, fills, local_avg,
             executed, tp_percent, sl_percent, auto_close_enabled,
-            last_dca_ts, status, created_at, updated_at
+            last_dca_ts, status, dca_count, dca_deviation_percent, dca_volume_multiplier, created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, 'active', NOW(), NOW())
+        VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, NOW(), NOW())
         RETURNING id;
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (
                 symbol, side, entry_price, json.dumps(fills),
-                local_avg, 0, float(tp_percent), float(sl_percent), False, last_dca_ts
+                local_avg, 0, float(tp_percent), float(sl_percent), False, last_dca_ts,
+                dca_count, dca_deviation_percent, dca_volume_multiplier
             ))
             new_id = cur.fetchone()[0]
         conn.commit()

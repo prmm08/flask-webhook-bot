@@ -3,7 +3,10 @@ import time
 import logging
 import signal
 from decimal import Decimal
-from config import DCA_CHECK_INTERVAL, MIN_SECONDS_BETWEEN_DCA, DCA_PERCENT_STEP, DCA_QTY_FACTOR, LOG_LEVEL
+from config import (
+    DCA_CHECK_INTERVAL, MIN_SECONDS_BETWEEN_DCA,
+    DCA_DEVIATION_PERCENT, DCA_VOLUME_MULTIPLIER, LOG_LEVEL
+)
 from db import load_active_positions, add_fill, update_last_dca_ts
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [DCA] %(levelname)s %(message)s")
@@ -20,8 +23,7 @@ signal.signal(signal.SIGINT, graceful_shutdown)
 signal.signal(signal.SIGTERM, graceful_shutdown)
 
 def get_market_price(symbol: str) -> Decimal:
-    # Replace with real price feed
-    return Decimal("30000.0") if symbol.upper() == "BTC" else Decimal("100.0")
+    return Decimal("30000.0") if symbol and symbol.upper().startswith("BTC") else Decimal("100.0")
 
 def should_do_dca(pos):
     try:
@@ -31,18 +33,25 @@ def should_do_dca(pos):
         now = time.time()
         if now - last_ts < MIN_SECONDS_BETWEEN_DCA:
             return False
+
         symbol = pos.get("symbol")
         side = pos.get("side", "").upper()
         local_avg = Decimal(str(pos.get("local_avg", 0)))
         if local_avg == 0:
             return False
+
+        # per-position override or global default
+        dca_dev = Decimal(str(pos.get("dca_deviation_percent") or DCA_DEVIATION_PERCENT))
         price = get_market_price(symbol)
         change_pct = (price - local_avg) / local_avg * Decimal("100")
         if side == "SHORT":
             change_pct = -change_pct
-        if side == "LONG" and change_pct <= -DCA_PERCENT_STEP:
+
+        logger.debug("Pos %s: price=%s local_avg=%s change_pct=%s dca_dev=%s", pos.get("id"), price, local_avg, round(change_pct,4), dca_dev)
+
+        if side == "LONG" and change_pct <= -dca_dev:
             return True
-        if side == "SHORT" and change_pct >= DCA_PERCENT_STEP:
+        if side == "SHORT" and change_pct >= dca_dev:
             return True
         return False
     except Exception as e:
@@ -58,7 +67,11 @@ def perform_dca(pos):
             fills = json.loads(fills)
         total_qty = sum(float(f.get("qty", 0)) for f in fills) if fills else 0.0
         base_qty = Decimal(str(total_qty)) if total_qty > 0 else Decimal("1.0")
-        add_qty = (base_qty * DCA_QTY_FACTOR).quantize(Decimal("0.00000001"))
+
+        # per-position override or global default
+        dca_mult = Decimal(str(pos.get("dca_volume_multiplier") or DCA_VOLUME_MULTIPLIER))
+        add_qty = (base_qty * dca_mult).quantize(Decimal("0.00000001"))
+
         symbol = pos.get("symbol")
         price = get_market_price(symbol)
         logger.info("DCA for pos %s: adding qty=%s at price=%s", pos_id, add_qty, price)
@@ -70,7 +83,7 @@ def perform_dca(pos):
         return False
 
 def main_loop():
-    logger.info("DCA Worker started, interval=%ss, step=%s%%", DCA_CHECK_INTERVAL, DCA_PERCENT_STEP)
+    logger.info("DCA Worker started, interval=%ss, deviation=%s%%", DCA_CHECK_INTERVAL, DCA_DEVIATION_PERCENT)
     while running:
         try:
             positions = load_active_positions()

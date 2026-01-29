@@ -20,8 +20,7 @@ signal.signal(signal.SIGINT, graceful_shutdown)
 signal.signal(signal.SIGTERM, graceful_shutdown)
 
 def get_market_price(symbol: str) -> Decimal:
-    # Replace with real price feed
-    return Decimal("30000.0") if symbol.upper() == "BTC" else Decimal("100.0")
+    return Decimal("30000.0") if symbol and symbol.upper().startswith("BTC") else Decimal("100.0")
 
 def check_tp_sl_for_position(pos):
     try:
