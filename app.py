@@ -269,11 +269,23 @@ def webhook():
     data = request.get_json(silent=True) or {}
     symbol = f"{str(data.get('currency', '')).upper()}-USDT"
     direction = str(data.get("direction", "")).upper()
+    
     if direction in ("LONG", "SHORT"):
-        threading.Thread(target=execute_trade, args=(symbol, direction, 
-                        int(data.get("leverage", LEVERAGE)), float(data.get("trade_size", TRADE_SIZE)),
-                        float(data.get("tp_percent", TP_PERCENT)), float(data.get("sl_percent", SL_PERCENT))).start()
+        # Hier war der Klammerfehler:
+        threading.Thread(
+            target=execute_trade, 
+            args=(
+                symbol, 
+                direction, 
+                int(data.get("leverage", LEVERAGE)), 
+                float(data.get("trade_size", TRADE_SIZE)),
+                float(data.get("tp_percent", TP_PERCENT)), 
+                float(data.get("sl_percent", SL_PERCENT))
+            )
+        ).start() # Diese Klammern haben gefehlt
+        
     return jsonify({"status": "processing"}), 200
+
 
 @app.route("/ping")
 def ping(): return "pong", 200
