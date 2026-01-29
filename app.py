@@ -1,4 +1,4 @@
-#----------------- Working Skript WATCHER TP, SL, DCA mit BE, Telegram, Max Open Positions und Race-Condition Fixes -------------------#
+#----------------- Working Skript WATCHER TP, SL, DCA mit BE, Telegram, Max Open Positions, Race-Fix und Internal Auto-Close -------------------#
 
 import hmac
 import hashlib
@@ -28,12 +28,16 @@ SL_PERCENT = 40
 
 # --- DCA SETTINGS ---
 DCA_INTERVAL = 5                # Sekunden zwischen DCA-Checks
-DCA_COUNT = 5
-DCA_DEVIATION_PERCENT = 5       # Prozent Abweichung vom entry_static für DCA-Trigger
+DCA_COUNT = 4
+DCA_DEVIATION_PERCENT = 5     # Prozent Abweichung vom entry_static für DCA-Trigger
 DCA_VOLUME_MULTIPLIER = 2
 
 # --- RISK / LIMITS ---
-MAX_OPEN_POSITIONS = 25         # Maximale Anzahl gleichzeitig offener Positionen beim Exchange
+MAX_OPEN_POSITIONS = 15         # Maximale Anzahl gleichzeitig offener Positionen beim Exchange
+
+# --- AUTO-CLOSE SETTINGS ---
+AUTO_CLOSE_FROM_DCA = 1        # Ab welcher DCA-Stufe intern auf BE überwacht und per Market geschlossen wird
+AUTO_CLOSE_BUFFER = 0.0        # optionaler Puffer (z.B. 0.001 = 0.1%) für BE (Slippage/Gebühren)
 
 active_dca = {}
 dca_lock = threading.Lock()
@@ -46,10 +50,6 @@ app = Flask(__name__)
 
 # --- TELEGRAM HELPERS ---
 def send_telegram(message):
-    """
-    Sendet eine Textnachricht an den konfigurierten Telegram-Chat.
-    Wenn TELEGRAM_BOT_TOKEN oder TELEGRAM_CHAT_ID nicht gesetzt sind, passiert nichts.
-    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     try:
@@ -143,7 +143,7 @@ def set_leverage_for_symbol(symbol, leverage, position_side=None, side=None):
     return bool(r)
 
 
-# --- TP/SL ---
+# --- ORDER / POSITION HELPERS ---
 def reset_tp_sl(symbol, position_side=None):
     ts = str(int(time.time() * 1000))
     r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "timestamp": ts})
@@ -160,12 +160,22 @@ def reset_tp_sl(symbol, position_side=None):
                     {"orderId": oid, "symbol": symbol, "timestamp": str(int(time.time() * 1000))})
 
 
+def cancel_all_tp_orders(symbol, position_side):
+    """
+    Löscht TAKE_PROFIT_MARKET Orders für das Symbol+Side, um Doppel-Schließungen zu vermeiden.
+    """
+    ts = str(int(time.time() * 1000))
+    r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol, "timestamp": ts})
+    orders = r.get("data", {}).get("orders", []) if r else []
+    for order in orders:
+        if order.get("type") == "TAKE_PROFIT_MARKET" and order.get("positionSide") == position_side:
+            oid = order.get("orderId")
+            if oid:
+                api_request("POST", "/openApi/swap/v2/trade/cancelOrder",
+                            {"orderId": oid, "symbol": symbol, "timestamp": str(int(time.time() * 1000))})
+
+
 def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PERCENT, tp_price=None):
-    """
-    Setzt TP und SL für eine Position.
-    - Wenn tp_price gesetzt ist, wird TP exakt auf diesen Preis gesetzt (BE-Logik).
-    - Ansonsten wird TP aus tp_percent relativ zum Entry berechnet.
-    """
     pos = None
     for _ in range(8):
         positions = get_positions()
@@ -193,7 +203,6 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
             entry = float(new_pos["avgPrice"])
             break
 
-    # Wenn tp_price übergeben wurde, verwende diesen als TP (BE)
     if tp_price is not None:
         tp = float(tp_price)
     else:
@@ -219,8 +228,29 @@ def set_tp_sl(symbol, desired_side=None, tp_percent=TP_PERCENT, sl_percent=SL_PE
     place(sl, "STOP_MARKET")
 
 
+def close_position_market(symbol, side):
+    """
+    Schließt die Position sofort per Market Order (closePosition=true).
+    side: 'LONG' oder 'SHORT' (PositionSide)
+    """
+    try:
+        close_side = "SELL" if side == "LONG" else "BUY"
+        resp = api_request("POST", "/openApi/swap/v2/trade/order", {
+            "symbol": symbol,
+            "side": close_side,
+            "positionSide": side,
+            "type": "MARKET",
+            "closePosition": "true",
+            "timestamp": str(int(time.time() * 1000))
+        })
+        return resp
+    except Exception as e:
+        print("[CLOSE ERROR]", e)
+        return None
+
+
 # ============================================================
-#   DCA ENGINE — STABILE VERSION MIT BE-LOGIK, TELEGRAM UND RACE-FIXES
+#   DCA ENGINE — STABILE VERSION MIT BE-LOGIK, TELEGRAM, RACE-FIXES UND AUTO-CLOSE
 # ============================================================
 
 def update_entry(symbol, side):
@@ -276,8 +306,10 @@ def monitor_dca():
                             "base_trade_size": base_value,
                             "tp_percent": TP_PERCENT,
                             "sl_percent": SL_PERCENT,
-                            "placing": False,            # neu: Order in Arbeit
-                            "last_dca_ts": 0.0           # neu: cooldown timestamp
+                            "placing": False,
+                            "closing": False,
+                            "auto_close_enabled": False,
+                            "last_dca_ts": 0.0
                         }
 
                     d = active_dca[symbol]
@@ -286,10 +318,8 @@ def monitor_dca():
                 with dca_lock:
                     if d["executed"] >= DCA_COUNT:
                         continue
-                    # cooldown prüfen (z.B. 2 Sekunden)
                     if time.time() - d.get("last_dca_ts", 0) < 2:
                         continue
-                    # falls bereits eine Platzierung läuft, skip
                     if d.get("placing"):
                         continue
 
@@ -297,7 +327,6 @@ def monitor_dca():
                 if not should_trigger_dca(side, current_price, d["entry_static"], DCA_DEVIATION_PERCENT):
                     continue
 
-                # calculate qty before reserving executed
                 qty = calculate_dca_qty(
                     d["base_trade_size"],
                     d["executed"],
@@ -307,23 +336,19 @@ def monitor_dca():
                 # Reserve the DCA slot atomically
                 reserved = False
                 with dca_lock:
-                    # double-check conditions inside lock to avoid race
                     if not d.get("placing") and (time.time() - d.get("last_dca_ts", 0) >= 2) and d["executed"] < DCA_COUNT:
                         d["placing"] = True
                         d["executed"] += 1
                         d["last_dca_ts"] = time.time()
                         reserved = True
-                        current_executed = d["executed"]
                     else:
                         reserved = False
 
                 if not reserved:
-                    # another thread reserved it; skip this loop
                     continue
 
                 # Platzieren der Market-Order (outside lock)
                 resp = None
-                api_error = None
                 try:
                     resp = api_request("POST", "/openApi/swap/v2/trade/order", {
                         "symbol": symbol,
@@ -334,23 +359,25 @@ def monitor_dca():
                         "timestamp": str(int(time.time() * 1000))
                     })
                 except Exception as e:
-                    api_error = e
+                    print("[API ORDER ERROR]", e)
                     resp = None
 
                 # Post-placement handling
                 with dca_lock:
                     try:
-                        # update avgPrice / entry_dynamic
                         new_entry = update_entry(symbol, side)
                         if new_entry:
                             d["entry_dynamic"] = new_entry
-                            # optional: set entry_static to new avg to avoid repeated triggers on old baseline
+                            # set entry_static to new avg to avoid repeated triggers on old baseline
                             d["entry_static"] = new_entry
 
-                        # BE-TP setzen falls executed >= 1
+                        # Wenn executed >= AUTO_CLOSE_FROM_DCA, aktiviere internen Auto-Close
+                        if d["executed"] >= AUTO_CLOSE_FROM_DCA:
+                            d["auto_close_enabled"] = True
+
                         tp_price = d["entry_dynamic"] if d["executed"] >= 1 else None
 
-                        # TP/SL neu setzen
+                        # TP/SL neu setzen (Exchange) wie bisher
                         reset_tp_sl(symbol, side)
                         if tp_price is not None:
                             print(f"[DCA] {symbol} DCA#{d['executed']} executed. Set BE TP at {tp_price:.6f}")
@@ -358,7 +385,7 @@ def monitor_dca():
                         else:
                             set_tp_sl(symbol, side, tp_percent=d["tp_percent"], sl_percent=d["sl_percent"])
 
-                        # Telegram Nachricht: nur wenn Order-Platzierung versucht wurde
+                        # Telegram Nachricht
                         try:
                             if resp is None:
                                 msg = (f"⚠️ DCA Fehler für {symbol}\n"
@@ -374,21 +401,101 @@ def monitor_dca():
                             print("[TELEGRAM SEND ERROR]", e)
 
                     except Exception as e:
-                        # Falls etwas schief geht, rolle executed zurück
                         d["executed"] = max(0, d["executed"] - 1)
                         print("[DCA POST ERROR]", e)
                     finally:
-                        # Platzierung abgeschlossen
                         d["placing"] = False
                         d["last_dca_ts"] = time.time()
 
-                # small sleep to avoid hammering in same loop
                 time.sleep(0.05)
 
         except Exception as e:
             print("[DCA ERROR]", e)
 
         time.sleep(DCA_INTERVAL)
+
+
+# ============================================================
+#   AUTO-CLOSE WATCHER — überwacht intern BE und schließt per Market
+# ============================================================
+def auto_close_watcher():
+    """
+    Überwacht active_dca Einträge mit auto_close_enabled == True.
+    Wenn current_price die BE (entry_dynamic) erreicht (mit optionalem Puffer),
+    dann:
+      - lösche Exchange TP Orders (cancel_all_tp_orders)
+      - sende Market Order zum Schließen (close_position_market)
+      - entferne active_dca Eintrag
+      - sende Telegram Nachricht
+    """
+    while True:
+        try:
+            with dca_lock:
+                symbols = list(active_dca.keys())
+
+            for symbol in symbols:
+                with dca_lock:
+                    d = active_dca.get(symbol)
+                    if not d:
+                        continue
+                    if not d.get("auto_close_enabled"):
+                        continue
+                    if d.get("closing"):
+                        continue
+                    side = d["side"]
+                    be_price = d.get("entry_dynamic")
+                    if be_price is None:
+                        continue
+
+                current_price = get_price(symbol)
+                if current_price is None:
+                    continue
+
+                # apply buffer: for LONG we require price >= be_price * (1 + buffer)
+                buffer = AUTO_CLOSE_BUFFER
+                if side == "LONG":
+                    threshold = be_price * (1 + buffer)
+                    reached = current_price >= threshold
+                else:
+                    threshold = be_price * (1 - buffer)
+                    reached = current_price <= threshold
+
+                if reached:
+                    # begin closing sequence
+                    with dca_lock:
+                        # mark as closing to avoid races
+                        d["closing"] = True
+
+                    try:
+                        # cancel exchange TP orders to avoid double-close
+                        cancel_all_tp_orders(symbol, side)
+                        time.sleep(0.2)  # kurz warten, damit Cancel verarbeitet wird
+
+                        # close via market order
+                        resp = close_position_market(symbol, side)
+                        if resp is None:
+                            print(f"[AUTO-CLOSE] Fehler beim Schließen {symbol}")
+                            send_telegram(f"⚠️ AUTO-CLOSE Fehler für {symbol} bei BE {be_price:.6f}")
+                        else:
+                            print(f"[AUTO-CLOSE] {symbol} bei BE {be_price:.6f} geschlossen (Market).")
+                            send_telegram(f"🔒 AUTO-CLOSE: {symbol} bei BE {be_price:.6f} geschlossen (Market).")
+
+                    except Exception as e:
+                        print("[AUTO-CLOSE ERROR]", e)
+                        send_telegram(f"⚠️ AUTO-CLOSE Exception für {symbol}: {e}")
+
+                    finally:
+                        # cleanup active_dca
+                        with dca_lock:
+                            active_dca.pop(symbol, None)
+
+                # tiny sleep between symbols
+                time.sleep(0.02)
+
+        except Exception as e:
+            print("[AUTO-CLOSE WATCHER ERROR]", e)
+
+        time.sleep(1)
 
 
 # ============================================================
@@ -497,6 +604,8 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percen
             "tp_percent": tp_percent,
             "sl_percent": sl_percent,
             "placing": False,
+            "closing": False,
+            "auto_close_enabled": False,
             "last_dca_ts": 0.0
         }
 
@@ -578,5 +687,6 @@ if __name__ == "__main__":
         threading.Thread(target=dca_watchdog, daemon=True).start()
         threading.Thread(target=keep_alive, daemon=True).start()
         threading.Thread(target=tp_sl_watcher, daemon=True).start()
+        threading.Thread(target=auto_close_watcher, daemon=True).start()
 
         app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
