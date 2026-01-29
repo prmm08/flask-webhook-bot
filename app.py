@@ -18,24 +18,21 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 app = Flask(__name__)
 
-# --- DEFAULT SETTINGS ---
+# --- SETTINGS ---
 LEVERAGE = 20
 TRADE_SIZE = 100
 TP_PERCENT = 1
 SL_PERCENT = 40
-
-# --- DCA SETTINGS ---
-DCA_INTERVAL = 5
-DCA_COUNT = 4
-DCA_DEVIATION_PERCENT = 5.0  # 1% Marktbewegung
+DCA_DEVIATION_PERCENT = 5.0 
 DCA_VOLUME_MULTIPLIER = 2
 DCA_SAVE_FILE = "active_dca.json"
 
 active_dca = {}
+processing_symbols = set() # Verhindert Doppel-Orders
 dca_lock = threading.Lock()
 
 # ============================================================
-#   PERSISTENCE & API HELPERS
+#   HELPERS & PERSISTENCE
 # ============================================================
 
 def save_dca_data():
@@ -43,7 +40,7 @@ def save_dca_data():
         try:
             with open(DCA_SAVE_FILE, "w") as f:
                 json.dump(active_dca, f)
-        except Exception as e: print("[SAVE ERROR]", e)
+        except: pass
 
 def load_dca_data():
     global active_dca
@@ -51,25 +48,25 @@ def load_dca_data():
         try:
             with open(DCA_SAVE_FILE, "r") as f:
                 active_dca = json.load(f)
-        except Exception as e: print("[LOAD ERROR]", e)
-
-def sign_bingx(params):
-    query_string = urllib.parse.urlencode(sorted((k, str(v)) for k, v in params.items()))
-    return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+        except: pass
 
 def api_request(method, endpoint, params=None):
     url = f"{BINGX_BASE}{endpoint}"
-    headers = {"X-BX-APIKEY": API_KEY}
-    params = dict(params) if params else {}
-    if "timestamp" not in params:
-        params["timestamp"] = str(int(time.time() * 1000))
+    p = dict(params) if params else {}
+    p["timestamp"] = str(int(time.time() * 1000))
     
-    sig = sign_bingx(params)
-    if method == "GET":
-        r = requests.get(f"{url}?{urllib.parse.urlencode(params)}&signature={sig}", headers=headers)
-    else:
-        r = requests.post(f"{url}?{urllib.parse.urlencode(params)}&signature={sig}", headers=headers)
-    return r.json()
+    query_string = urllib.parse.urlencode(sorted(p.items()))
+    sig = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+    full_url = f"{url}?{query_string}&signature={sig}"
+    
+    headers = {"X-BX-APIKEY": API_KEY}
+    try:
+        if method == "GET":
+            return requests.get(full_url, headers=headers, timeout=10).json()
+        return requests.post(full_url, headers=headers, timeout=10).json()
+    except Exception as e:
+        print(f"[API ERROR] {e}")
+        return None
 
 def get_price(symbol):
     r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
@@ -80,119 +77,130 @@ def get_positions():
     return r.get("data", []) if r else []
 
 # ============================================================
-#   TP / SL LOGIC (EXCHANGE SIDE)
+#   EXCHANGE TP/SL
 # ============================================================
-
-def reset_tp_sl(symbol, side):
-    r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
-    orders = r.get("data", {}).get("orders", []) if r else []
-    for o in orders:
-        if o.get("positionSide") == side and o.get("type") in ("TAKE_PROFIT_MARKET", "STOP_MARKET"):
-            api_request("POST", "/openApi/swap/v2/trade/cancelOrder", {"symbol": symbol, "orderId": o["orderId"]})
 
 def set_exchange_tp_sl(symbol, side, entry, tp_p, sl_p):
-    tp = entry * (1 + tp_p/100) if side == "LONG" else entry * (1 - tp_p/100)
-    sl = entry * (1 - sl_p/100) if side == "LONG" else entry * (1 + sl_p/100)
+    # Kurze Pause damit die Position bei BingX registriert ist
+    time.sleep(2)
+    tp = round(entry * (1 + tp_p/100 if side == "LONG" else 1 - tp_p/100), 6)
+    sl = round(entry * (1 - sl_p/100 if side == "LONG" else 1 + sl_p/100), 6)
     
     for price, otype in [(tp, "TAKE_PROFIT_MARKET"), (sl, "STOP_MARKET")]:
-        api_request("POST", "/openApi/swap/v2/trade/order", {
+        res = api_request("POST", "/openApi/swap/v2/trade/order", {
             "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY",
-            "positionSide": side, "type": otype, "stopPrice": f"{price:.6f}",
+            "positionSide": side, "type": otype, "stopPrice": str(price),
             "workingType": "MARK_PRICE", "closePosition": "true"
         })
+        print(f"[EXCHANGE] TP/SL {otype} für {symbol}: {res.get('msg')}")
 
 # ============================================================
-#   WATCHER LOGIC (DCA & BREAK EVEN)
+#   TRADE EXECUTION (WITH DOUBLE-ORDER PROTECTION)
+# ============================================================
+
+def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
+    if symbol in processing_symbols:
+        return
+    
+    processing_symbols.add(symbol)
+    try:
+        # Check API if position exists
+        pos = get_positions()
+        if any(p["symbol"] == symbol and float(p["positionAmt"]) != 0 for p in pos):
+            print(f"[SKIP] Position für {symbol} bereits offen.")
+            return
+
+        price = get_price(symbol)
+        if not price: return
+
+        # Set Leverage
+        api_request("POST", "/openApi/swap/v2/trade/leverage", {
+            "symbol": symbol, "leverage": leverage, "side": "BUY" if direction == "LONG" else "SELL"
+        })
+
+        # Market Order
+        qty = round(trade_size / price, 4)
+        res = api_request("POST", "/openApi/swap/v2/trade/order", {
+            "symbol": symbol, "side": "BUY" if direction == "LONG" else "SELL",
+            "positionSide": direction, "type": "MARKET", "quantity": str(qty)
+        })
+
+        if res and res.get("code") == 0:
+            print(f"[ORDER] {symbol} {direction} erfolgreich platziert.")
+            with dca_lock:
+                active_dca[symbol] = {
+                    "side": direction, "entry_static": price, "entry_dynamic": price,
+                    "executed": 0, "base_trade_size": trade_size
+                }
+                save_dca_data()
+            
+            # TP/SL auf Exchange setzen
+            set_exchange_tp_sl(symbol, direction, price, tp_percent, sl_percent)
+    finally:
+        # Kurze Sperre aufrecht erhalten, bis API synchron ist
+        time.sleep(5)
+        processing_symbols.discard(symbol)
+
+# ============================================================
+#   WORKER (DCA & BE)
 # ============================================================
 
 def monitor_worker():
     while True:
         try:
             positions = get_positions()
-            pos_dict = {p["symbol"]: p for p in positions if float(p["positionAmt"]) != 0}
+            active_list = {p["symbol"]: p for p in positions if float(p["positionAmt"]) != 0}
 
-            # Cleanup local data
             with dca_lock:
-                to_delete = [s for s in active_dca if s not in pos_dict]
+                to_delete = [s for s in active_dca if s not in active_list]
                 for s in to_delete: del active_dca[s]
                 if to_delete: save_dca_data()
 
-            for symbol, pos in pos_dict.items():
-                side = pos["positionSide"]
-                current_price = get_price(symbol)
-                if not current_price: continue
-
+            for symbol, pos in active_list.items():
                 with dca_lock:
                     if symbol not in active_dca: continue
                     d = active_dca[symbol]
-
-                # --- FALL A: DCA TRIGGER ---
-                triggered = (side == "LONG" and current_price <= d["entry_static"] * (1 - DCA_DEVIATION_PERCENT/100)) or \
-                            (side == "SHORT" and current_price >= d["entry_static"] * (1 + DCA_DEVIATION_PERCENT/100))
                 
-                if triggered and d["executed"] < DCA_COUNT:
-                    print(f"[DCA] Kaufe nach für {symbol}")
-                    qty = round((d["base_trade_size"] * (DCA_VOLUME_MULTIPLIER ** (d["executed"] + 1))) / current_price, 6)
-                    api_request("POST", "/openApi/swap/v2/trade/order", {
-                        "symbol": symbol, "side": "BUY" if side == "LONG" else "SELL",
-                        "positionSide": side, "type": "MARKET", "quantity": str(qty)
-                    })
-                    # Nach DCA: Exchange TP/SL löschen (Bot übernimmt ab jetzt BE-Exit)
-                    reset_tp_sl(symbol, side)
-                    with dca_lock:
-                        d["executed"] += 1
-                        time.sleep(1)
-                        new_p = next((p for p in get_positions() if p["symbol"] == symbol and p["positionSide"] == side), None)
-                        if new_p: d["entry_dynamic"] = float(new_p["avgPrice"])
-                        save_dca_data()
+                side = d["side"]
+                curr = get_price(symbol)
+                if not curr: continue
 
-                # --- FALL B: BREAK EVEN EXIT (Nur wenn DCA bereits erfolgte) ---
+                # DCA TRIGGER
+                if d["executed"] < 5: # DCA_COUNT
+                    triggered = (side == "LONG" and curr <= d["entry_static"] * (1 - DCA_DEVIATION_PERCENT/100)) or \
+                                (side == "SHORT" and curr >= d["entry_static"] * (1 + DCA_DEVIATION_PERCENT/100))
+                    
+                    if triggered:
+                        # Exchange TP/SL löschen (Bot übernimmt)
+                        r = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
+                        for o in r.get("data", {}).get("orders", []):
+                            api_request("POST", "/openApi/swap/v2/trade/cancelOrder", {"symbol": symbol, "orderId": o["orderId"]})
+                        
+                        qty = round((d["base_trade_size"] * (2 ** (d["executed"] + 1))) / curr, 4)
+                        api_request("POST", "/openApi/swap/v2/trade/order", {
+                            "symbol": symbol, "side": "BUY" if side == "LONG" else "SELL",
+                            "positionSide": side, "type": "MARKET", "quantity": str(qty)
+                        })
+                        with dca_lock:
+                            d["executed"] += 1
+                            time.sleep(2)
+                            p_now = next((p for p in get_positions() if p["symbol"] == symbol), None)
+                            if p_now: d["entry_dynamic"] = float(p_now["avgPrice"])
+                            save_dca_data()
+
+                # BE EXIT
                 if d["executed"] > 0:
-                    be_reached = (side == "LONG" and current_price >= d["entry_dynamic"]) or \
-                                 (side == "SHORT" and current_price <= d["entry_dynamic"])
-                    if be_reached:
-                        print(f"[BE EXIT] Schließe {symbol} am Break-Even.")
+                    if (side == "LONG" and curr >= d["entry_dynamic"]) or (side == "SHORT" and curr <= d["entry_dynamic"]):
                         api_request("POST", "/openApi/swap/v2/trade/order", {
                             "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY",
                             "positionSide": side, "type": "MARKET", "closePosition": "true"
                         })
-
-        except Exception as e: print("[WORKER ERROR]", e)
-        time.sleep(DCA_INTERVAL)
+        except: pass
+        time.sleep(5)
 
 # ============================================================
-#   EXECUTION & FLASK
+#   FLASK
 # ============================================================
-
-def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
-    # Check if already open
-    if any(p["symbol"] == symbol and p["positionSide"] == direction for p in get_positions()):
-        return
-
-    price = get_price(symbol)
-    if not price or not set_leverage_for_symbol(symbol, leverage, direction): return
-    
-    qty = round(trade_size / price, 6)
-    api_request("POST", "/openApi/swap/v2/trade/order", {
-        "symbol": symbol, "side": "BUY" if direction == "LONG" else "SELL",
-        "positionSide": direction, "type": "MARKET", "quantity": str(qty)
-    })
-    
-    # 1. Sofort TP/SL am Exchange setzen (Sicherheit für ersten Trade)
-    time.sleep(1)
-    set_exchange_tp_sl(symbol, direction, price, tp_percent, sl_percent)
-
-    # 2. In Watcher-Liste aufnehmen
-    with dca_lock:
-        active_dca[symbol] = {
-            "side": direction, "entry_static": price, "entry_dynamic": price,
-            "executed": 0, "base_trade_size": trade_size
-        }
-        save_dca_data()
-
-def set_leverage_for_symbol(symbol, leverage, side):
-    r = api_request("POST", "/openApi/swap/v2/trade/leverage", {"symbol": symbol, "leverage": leverage, "side": "BUY" if side=="LONG" else "SELL"})
-    return r.get("code") == 0
 
 @app.route("/testorder", methods=["POST"])
 def webhook():
@@ -201,28 +209,15 @@ def webhook():
     direction = str(data.get("direction", "")).upper()
     
     if direction in ("LONG", "SHORT"):
-        # Korrektur der Klammern:
-        threading.Thread(
-            target=execute_trade, 
-            args=(
-                symbol, 
-                direction, 
-                int(data.get("leverage", LEVERAGE)), 
-                float(data.get("trade_size", TRADE_SIZE)), 
-                float(data.get("tp_percent", TP_PERCENT)), 
-                float(data.get("sl_percent", SL_PERCENT))
-            )
-        ).start()
-        
+        threading.Thread(target=execute_trade, args=(
+            symbol, direction, int(data.get("leverage", LEVERAGE)),
+            float(data.get("trade_size", TRADE_SIZE)),
+            float(data.get("tp_percent", TP_PERCENT)),
+            float(data.get("sl_percent", SL_PERCENT))
+        )).start()
     return jsonify({"status": "processing"}), 200
 
 if __name__ == "__main__":
-    if not API_KEY or not API_SECRET:
-        print("FEHLER: API Keys fehlen in den Environment Variables!")
-    else:
-        load_dca_data()
-        # Der Worker übernimmt jetzt DCA und Break-Even Monitoring
-        threading.Thread(target=monitor_worker, daemon=True).start()
-        
-        print("Bot gestartet. Warte auf Webhooks...")
-        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    load_dca_data()
+    threading.Thread(target=monitor_worker, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
