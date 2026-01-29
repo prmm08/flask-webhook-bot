@@ -118,8 +118,7 @@ def get_positions():
 # ============================================================
 
 def set_exchange_tp_sl(symbol, side, entry, tp_p, sl_p):
-    """Setzt TP/SL direkt im Orderbuch der Exchange"""
-    time.sleep(2)
+    """Setzt TP/SL direkt im Orderbuch der Exchange mit Retry-Logik"""
     prec = get_symbol_precision(symbol)
     tp_raw = entry * (1 + tp_p/100 if side == "LONG" else 1 - tp_p/100)
     sl_raw = entry * (1 - sl_p/100 if side == "LONG" else 1 + sl_p/100)
@@ -127,13 +126,32 @@ def set_exchange_tp_sl(symbol, side, entry, tp_p, sl_p):
     tp = round_step(tp_raw, prec["price_step"])
     sl = round_step(sl_raw, prec["price_step"])
     
-    for price, otype in [(tp, "TAKE_PROFIT_MARKET"), (sl, "STOP_MARKET")]:
-        api_request("POST", "/openApi/swap/v2/trade/order", {
-            "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY",
-            "positionSide": side, "type": otype, "stopPrice": str(price),
-            "workingType": "MARK_PRICE", "closePosition": "true"
-        })
-    logging.info(f"[EXCHANGE] TP/SL gesetzt für {symbol} (TP: {tp}, SL: {sl})")
+    # Wir versuchen es bis zu 3 mal, falls die API langsam ist
+    for attempt in range(3):
+        time.sleep(2 * (attempt + 1)) # Steigende Wartezeit
+        
+        success_count = 0
+        for price, otype in [(tp, "TAKE_PROFIT_MARKET"), (sl, "STOP_MARKET")]:
+            res = api_request("POST", "/openApi/swap/v2/trade/order", {
+                "symbol": symbol, 
+                "side": "SELL" if side == "LONG" else "BUY",
+                "positionSide": side, 
+                "type": otype, 
+                "stopPrice": str(price),
+                "workingType": "MARK_PRICE", 
+                "closePosition": "true"
+            })
+            
+            if res and res.get("code") == 0:
+                success_count += 1
+            else:
+                logging.error(f"[EXCHANGE FAIL] {otype} für {symbol}: {res.get('msg')} (Code: {res.get('code')})")
+
+        if success_count == 2:
+            logging.info(f"[EXCHANGE SUCCESS] TP/SL erfolgreich im Orderbuch für {symbol}")
+            break
+        elif attempt == 2:
+            logging.error(f"[CRITICAL] TP/SL konnte für {symbol} nicht gesetzt werden nach 3 Versuchen!")
 
 def execute_trade(symbol, direction, leverage, trade_size, tp_percent, sl_percent):
     if symbol in processing_symbols: return
