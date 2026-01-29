@@ -1,195 +1,93 @@
+# bingx_api.py
+import os
 import time
 import hmac
 import hashlib
-import urllib.parse
 import requests
-from config import API_KEY, API_SECRET, BINGX_BASE
+from typing import Dict, Any
 
+from config import BINGX_BASE, BINGX_API_KEY, BINGX_API_SECRET
 
-# ---------------------------------------------------------
-#   SIGNATURE
-# ---------------------------------------------------------
-def sign(params: dict) -> str:
+BASE = BINGX_BASE.rstrip("/")
+
+def _sign(params: Dict[str, Any], secret: str) -> str:
+    items = sorted((k, str(v)) for k, v in params.items())
+    qs = "&".join(f"{k}={v}" for k, v in items)
+    return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+
+def place_market_order(symbol: str, side: str, quantity: float, leverage: int = 1, timeout: int = 15) -> Dict[str, Any]:
     """
-    BingX requires HMAC SHA256 signature over sorted query params.
+    Platziert Market Order. Prüfe die API-Doku und passe Pfad/Parameter an.
     """
-    items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
-    query = urllib.parse.urlencode(items)
-    return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    if not BINGX_API_KEY or not BINGX_API_SECRET:
+        raise RuntimeError("BingX credentials not set")
 
-
-# ---------------------------------------------------------
-#   GENERIC REQUEST WRAPPER
-# ---------------------------------------------------------
-def api_request(method: str, endpoint: str, params: dict = None):
-    """
-    Unified request handler for BingX API.
-    Deterministic, minimal, stable.
-    """
-    if params is None:
-        params = {}
-
-    url = f"{BINGX_BASE}{endpoint}"
-    headers = {"X-BX-APIKEY": API_KEY}
-    timeout = (5, 10)
-
-    try:
-        if method == "GET":
-            params_for_sign = dict(params)
-            signature = sign(params_for_sign)
-            params_for_sign["signature"] = signature
-            query = urllib.parse.urlencode(params_for_sign)
-            r = requests.get(f"{url}?{query}", headers=headers, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-
-        elif method == "POST":
-            params_for_sign = dict(params)
-            if "timestamp" not in params_for_sign:
-                params_for_sign["timestamp"] = str(int(time.time() * 1000))
-
-            query = urllib.parse.urlencode(sorted((k, str(v)) for k, v in params_for_sign.items()))
-            signature = sign(params_for_sign)
-
-            r = requests.post(f"{url}?{query}&signature={signature}",
-                              headers=headers, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-
-    except Exception as e:
-        print(f"[BINGX API ERROR] {method} {endpoint} → {e}")
-        return None
-
-
-# ---------------------------------------------------------
-#   PRICE
-# ---------------------------------------------------------
-def get_price(symbol: str):
-    r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-    try:
-        return float(r["data"]["price"])
-    except:
-        return None
-
-
-# ---------------------------------------------------------
-#   POSITIONS
-# ---------------------------------------------------------
-def get_positions():
-    ts = str(int(time.time() * 1000))
-    r = api_request("GET", "/openApi/swap/v2/user/positions", {"timestamp": ts})
-    if not r:
-        return []
-    return r.get("data", [])
-
-
-# ---------------------------------------------------------
-#   SYMBOL CHECK
-# ---------------------------------------------------------
-def symbol_exists(symbol: str) -> bool:
-    r = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-    return r and "data" in r and "price" in r["data"]
-
-
-# ---------------------------------------------------------
-#   LEVERAGE
-# ---------------------------------------------------------
-def set_leverage(symbol, leverage, position_side, side):
-    ts = str(int(time.time() * 1000))
+    path = "/api/v1/private/order"  # ANPASSEN falls nötig
+    url = BASE + path
+    timestamp = int(time.time() * 1000)
     params = {
         "symbol": symbol,
+        "side": side.upper(),
+        "type": "MARKET",
+        "quantity": str(quantity),
         "leverage": str(leverage),
-        "positionSide": position_side,
-        "side": side,
-        "timestamp": ts
+        "timestamp": str(timestamp)
     }
-    r = api_request("POST", "/openApi/swap/v2/trade/leverage", params)
-    return bool(r)
+    params["signature"] = _sign(params, BINGX_API_SECRET)
+    headers = {"X-API-KEY": BINGX_API_KEY}
+    r = requests.post(url, data=params, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-
-# ---------------------------------------------------------
-#   MARKET ORDER
-# ---------------------------------------------------------
-def place_market_order(symbol, side, position_side, qty):
+def place_limit_order(symbol: str, side: str, price: float, quantity: float, timeout: int = 15) -> Dict[str, Any]:
+    path = "/api/v1/private/order"  # ANPASSEN
+    url = BASE + path
+    timestamp = int(time.time() * 1000)
     params = {
         "symbol": symbol,
-        "side": side,
-        "positionSide": position_side,
-        "type": "MARKET",
-        "quantity": str(qty),
-        "timestamp": str(int(time.time() * 1000))
+        "side": side.upper(),
+        "type": "LIMIT",
+        "price": str(price),
+        "quantity": str(quantity),
+        "timestamp": str(timestamp)
     }
-    return api_request("POST", "/openApi/swap/v2/trade/order", params)
+    params["signature"] = _sign(params, BINGX_API_SECRET)
+    headers = {"X-API-KEY": BINGX_API_KEY}
+    r = requests.post(url, data=params, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-
-# ---------------------------------------------------------
-#   CLOSE POSITION (MARKET)
-# ---------------------------------------------------------
-def close_position_market(symbol, side):
-    params = {
-        "symbol": symbol,
-        "side": "SELL" if side == "LONG" else "BUY",
-        "positionSide": side,
-        "type": "MARKET",
-        "closePosition": "true",
-        "timestamp": str(int(time.time() * 1000))
-    }
-    return api_request("POST", "/openApi/swap/v2/trade/order", params)
-
-
-# ---------------------------------------------------------
-#   OPEN ORDERS
-# ---------------------------------------------------------
-def get_open_orders(symbol):
-    ts = str(int(time.time() * 1000))
-    r = api_request("GET", "/openApi/swap/v2/trade/openOrders",
-                    {"symbol": symbol, "timestamp": ts})
-    if not r:
-        return []
-    return r.get("data", {}).get("orders", [])
-
-
-# ---------------------------------------------------------
-#   CANCEL ORDER
-# ---------------------------------------------------------
-def cancel_order(symbol, order_id):
-    params = {
-        "symbol": symbol,
-        "orderId": order_id,
-        "timestamp": str(int(time.time() * 1000))
-    }
-    return api_request("POST", "/openApi/swap/v2/trade/cancelOrder", params)
-
-
-# ---------------------------------------------------------
-#   CANCEL ALL TP ORDERS FOR SIDE
-# ---------------------------------------------------------
-def cancel_all_tp(symbol, side):
-    orders = get_open_orders(symbol)
-    for o in orders:
-        if o.get("type") == "TAKE_PROFIT_MARKET" and o.get("positionSide") == side:
-            cancel_order(symbol, o["orderId"])
-
-
-# ---------------------------------------------------------
-#   SET TP/SL
-# ---------------------------------------------------------
-def set_tp_sl(symbol, side, tp_price, sl_price):
+def place_stop_order(symbol: str, side: str, stop_price: float, quantity: float, timeout: int = 15) -> Dict[str, Any]:
     """
-    Sets TP and SL as MARKET orders with stopPrice.
+    Platzhalter für Stop Order (SL). API-Parameter anpassen.
     """
-    def place(price, otype):
-        params = {
-            "symbol": symbol,
-            "side": "SELL" if side == "LONG" else "BUY",
-            "positionSide": side,
-            "type": otype,
-            "stopPrice": f"{price:.6f}",
-            "workingType": "MARK_PRICE",
-            "closePosition": "true",
-            "timestamp": str(int(time.time() * 1000))
-        }
-        api_request("POST", "/openApi/swap/v2/trade/order", params)
+    path = "/api/v1/private/order"  # ANPASSEN
+    url = BASE + path
+    timestamp = int(time.time() * 1000)
+    params = {
+        "symbol": symbol,
+        "side": side.upper(),
+        "type": "STOP_MARKET",  # oder je nach API "STOP"
+        "stopPrice": str(stop_price),
+        "quantity": str(quantity),
+        "timestamp": str(timestamp)
+    }
+    params["signature"] = _sign(params, BINGX_API_SECRET)
+    headers = {"X-API-KEY": BINGX_API_KEY}
+    r = requests.post(url, data=params, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-    place(tp_price, "TAKE_PROFIT_MARKET")
-    place(sl_price, "STOP_MARKET")
+def fetch_ticker_price(symbol: str, timeout: int = 10) -> float:
+    path = "/api/v1/market/ticker"  # ANPASSEN
+    url = BASE + path
+    r = requests.get(url, params={"symbol": symbol}, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    # Anpassung je nach Response
+    price = None
+    if isinstance(data, dict):
+        price = data.get("price") or data.get("data", {}).get("lastPrice")
+    if price is None:
+        raise RuntimeError("Could not fetch price")
+    return float(price)

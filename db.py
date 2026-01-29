@@ -1,132 +1,82 @@
 # db.py
+import os
 import json
-import time
+from typing import Optional, Dict, Any
 import psycopg
 from psycopg.rows import dict_row
 from config import DATABASE_URL
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is not set")
-
 def get_conn():
-    return psycopg.connect(DATABASE_URL, autocommit=False, sslmode="require")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not set")
+    return psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row)
 
-def _recalc_local_avg_from_fills(fills):
-    total_qty = 0.0
-    total_value = 0.0
-    for f in fills:
-        q = float(f.get("qty", 0))
-        p = float(f.get("price", 0))
-        total_qty += q
-        total_value += q * p
-    if total_qty == 0:
-        return None
-    return total_value / total_qty
-
-def create_position(symbol, side, entry_price, qty, tp_percent, sl_percent,
-                    dca_count=None, dca_deviation_percent=None, dca_volume_multiplier=None):
-    fills = [{"qty": qty, "price": entry_price}]
-    local_avg = entry_price
-    last_dca_ts = time.time()
-    # use provided dca values or defaults in DB schema
+def init_schema():
     sql = """
-        INSERT INTO positions (
-            symbol, side, entry_static, fills, local_avg,
-            executed, tp_percent, sl_percent, auto_close_enabled,
-            last_dca_ts, status, dca_count, dca_deviation_percent, dca_volume_multiplier, created_at, updated_at
-        )
-        VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, NOW(), NOW())
-        RETURNING id;
+    CREATE TABLE IF NOT EXISTS positions (
+      id SERIAL PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      side TEXT NOT NULL,
+      entry_price NUMERIC NOT NULL,
+      qty NUMERIC NOT NULL,
+      order_id TEXT,
+      fills JSONB,
+      local_avg NUMERIC,
+      status TEXT DEFAULT 'open',
+      tp_order_id TEXT,
+      sl_order_id TEXT,
+      last_dca_ts TIMESTAMP,
+      dca_count INTEGER DEFAULT 0,
+      dca_deviation_percent NUMERIC DEFAULT 0,
+      dca_volume_multiplier NUMERIC DEFAULT 1,
+      tp_percent NUMERIC,
+      sl_percent NUMERIC,
+      created_at TIMESTAMP DEFAULT now()
+    );
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+
+def create_position(symbol: str, side: str, entry_price: float, qty: float, order_id: Optional[str],
+                    fills: Optional[Dict]=None, local_avg: Optional[float]=None,
+                    tp_percent: Optional[float]=None, sl_percent: Optional[float]=None,
+                    dca_count: int=0, dca_deviation_percent: float=0.0, dca_volume_multiplier: float=1.0) -> int:
+    sql = """
+    INSERT INTO positions (symbol, side, entry_price, qty, order_id, fills, local_avg, tp_percent, sl_percent, dca_count, dca_deviation_percent, dca_volume_multiplier)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    RETURNING id;
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (
-                symbol, side, entry_price, json.dumps(fills),
-                local_avg, 0, float(tp_percent), float(sl_percent), False, last_dca_ts,
-                dca_count, dca_deviation_percent, dca_volume_multiplier
+                symbol, side, entry_price, qty, order_id, json.dumps(fills or {}), local_avg,
+                tp_percent, sl_percent, dca_count, dca_deviation_percent, dca_volume_multiplier
             ))
-            new_id = cur.fetchone()[0]
-        conn.commit()
-    return new_id
+            row = cur.fetchone()
+            return row["id"]
 
-def load_active_positions():
-    sql = "SELECT * FROM positions WHERE status = 'active';"
+def update_position_orders(pos_id: int, tp_order_id: Optional[str], sl_order_id: Optional[str]):
+    sql = "UPDATE positions SET tp_order_id=%s, sl_order_id=%s WHERE id=%s"
     with get_conn() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
+        with conn.cursor() as cur:
+            cur.execute(sql, (tp_order_id, sl_order_id, pos_id))
+
+def get_open_positions():
+    sql = "SELECT * FROM positions WHERE status='open'"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
             cur.execute(sql)
-            rows = cur.fetchall()
-            for r in rows:
-                if isinstance(r.get("fills"), str):
-                    r["fills"] = json.loads(r["fills"])
-            return rows
+            return cur.fetchall()
 
-def load_position(pos_id):
-    sql = "SELECT * FROM positions WHERE id = %s;"
-    with get_conn() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, (pos_id,))
-            r = cur.fetchone()
-            if r and isinstance(r.get("fills"), str):
-                r["fills"] = json.loads(r["fills"])
-            return r
-
-def add_fill(pos_id, qty, price):
-    pos = load_position(pos_id)
-    if not pos:
-        raise ValueError("Position not found")
-    fills = pos.get("fills") or []
-    if isinstance(fills, str):
-        fills = json.loads(fills)
-    fills.append({"qty": qty, "price": price})
-    local_avg = _recalc_local_avg_from_fills(fills) or pos.get("local_avg") or 0.0
-    sql = """
-        UPDATE positions
-        SET fills = %s::jsonb,
-            local_avg = %s,
-            updated_at = NOW()
-        WHERE id = %s;
-    """
+def append_dca(pos_id: int, added_qty: float, new_avg: float):
+    sql = "UPDATE positions SET qty = qty + %s, local_avg = %s, dca_count = dca_count + 1, last_dca_ts = now() WHERE id = %s"
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (json.dumps(fills), local_avg, pos_id))
-        conn.commit()
+            cur.execute(sql, (added_qty, new_avg, pos_id))
 
-def update_executed(pos_id, executed):
-    sql = "UPDATE positions SET executed = %s, updated_at = NOW() WHERE id = %s;"
+def set_position_status(pos_id: int, status: str):
+    sql = "UPDATE positions SET status=%s WHERE id=%s"
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (executed, pos_id))
-        conn.commit()
-
-def enable_auto_close(pos_id):
-    sql = "UPDATE positions SET auto_close_enabled = TRUE, updated_at = NOW() WHERE id = %s;"
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (pos_id,))
-        conn.commit()
-
-def update_last_dca_ts(pos_id):
-    sql = "UPDATE positions SET last_dca_ts = %s, updated_at = NOW() WHERE id = %s;"
-    ts = time.time()
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (ts, pos_id))
-        conn.commit()
-
-def close_position(pos_id):
-    sql = "UPDATE positions SET status = 'closed', updated_at = NOW() WHERE id = %s;"
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (pos_id,))
-        conn.commit()
-
-def list_all_positions(limit=100):
-    sql = "SELECT * FROM positions ORDER BY created_at DESC LIMIT %s;"
-    with get_conn() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, (limit,))
-            rows = cur.fetchall()
-            for r in rows:
-                if isinstance(r.get("fills"), str):
-                    r["fills"] = json.loads(r["fills"])
-            return rows
+            cur.execute(sql, (status, pos_id))
