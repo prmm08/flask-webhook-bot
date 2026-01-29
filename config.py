@@ -38,7 +38,7 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
 # --- WEB / EXECUTOR ---
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "5000"))
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/testorder")
 
 # --- WORKER INTERVALS & LOGGING ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
