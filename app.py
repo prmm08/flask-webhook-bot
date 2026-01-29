@@ -22,18 +22,18 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # --- DEFAULT SETTINGS ---
 LEVERAGE = 20
-TRADE_SIZE = 100
+TRADE_SIZE = 200
 TP_PERCENT = 0.5
 SL_PERCENT = 40
 
 # --- DCA SETTINGS ---
 DCA_INTERVAL = 5                # Sekunden zwischen DCA-Checks
 DCA_COUNT = 5
-DCA_DEVIATION_PERCENT = 2.5       # Prozent Abweichung vom Initial-Entry für DCA-Trigger (z.B. 5%)
+DCA_DEVIATION_PERCENT = 5       # Prozent Abweichung vom Initial-Entry für DCA-Trigger (z.B. 5%)
 DCA_VOLUME_MULTIPLIER = 2
 
 # --- RISK / LIMITS ---
-MAX_OPEN_POSITIONS = 15         # Maximale Anzahl gleichzeitig offener Positionen beim Exchange
+MAX_OPEN_POSITIONS = 20         # Maximale Anzahl gleichzeitig offener Positionen beim Exchange
 
 # --- AUTO-CLOSE SETTINGS ---
 AUTO_CLOSE_FROM_DCA = 1        # Ab welcher DCA-Stufe intern auf BE überwacht und per Market geschlossen wird
