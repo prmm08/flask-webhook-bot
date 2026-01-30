@@ -124,14 +124,46 @@ def execute_pending_trade(trade):
 def manage_open_trade(trade):
     symbol = trade['symbol']
     
-    # Aktuellen Preis holen
-    p_res = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-    if not p_res: return
-    curr = float(p_res["data"]["price"])
+    # 1. REALITÄTS-CHECK: Existiert die Position noch?
+    pos_res = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
     
-    # DCA Logik
+    # Sicherheits-Check: Wenn API-Fehler, nichts tun (nicht fälschlicherweise schließen)
+    if not pos_res or "data" not in pos_res: 
+        return
+
+    # Suchen, ob wir eine aktive Position > 0 finden
+    position_exists = False
+    current_qty = 0.0
+    current_price = 0.0
+    
+    for p in pos_res["data"]:
+        if p["symbol"] == symbol and float(p["positionAmt"]) != 0:
+            position_exists = True
+            current_qty = float(p["positionAmt"])
+            current_price = float(p.get("avgPrice", 0)) # Durchschnittspreis von BingX nehmen
+            break
+    
+    # WENN POSITION WEG IST (Manuell geschlossen oder TP/SL getroffen)
+    if not position_exists:
+        log(f"[SYNC] Position {symbol} ist nicht mehr auf Exchange. Schließe in DB.")
+        close_trade(trade['id'])
+        return # Arbeit hier beendet
+
+    # ----------------------------------------------------
+    # Ab hier läuft die normale DCA-Logik weiter, 
+    # da wir wissen, dass die Position noch offen ist.
+    # ----------------------------------------------------
+
+    # Aktuellen Marktpreis holen
+    quote_res = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
+    if not quote_res: return
+    curr = float(quote_res["data"]["price"])
+    
+    # DCA Logik (nutzt jetzt den echten avgPrice von der Exchange)
     if trade['dca_level'] < DCA_MAX_STEPS:
-        entry = trade['entry_price'] # Basis für DCA Stufen
+        # Wir nutzen current_price (den echten Avg Entry von BingX), nicht den aus der DB,
+        # falls du manuell nachgekauft hast.
+        entry = current_price 
         req_drop = DCA_DEVIATION * (trade['dca_level'] + 1)
         
         triggered = False
@@ -157,19 +189,14 @@ def manage_open_trade(trade):
             })
             
             if res and res.get("code") == 0:
-                # Neuen Durchschnitt holen
                 time.sleep(2)
-                pos = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
-                if pos and pos.get("data"):
-                    avg_p = float(pos["data"][0]["avgPrice"])
-                    total_qty = float(pos["data"][0]["positionAmt"]) # Achtung: Short kann hier negativ sein
-                    
-                    update_dca(trade['id'], trade['dca_level'] + 1, avg_p, abs(total_qty))
-                    log(f"   [DCA OK] Neuer Avg: {avg_p}")
+                # Wir holen uns das Update im nächsten Loop durch den Realitäts-Check oben
+                # Aber wir erhöhen das Level in der DB schon mal
+                update_dca(trade['id'], trade['dca_level'] + 1, current_price, abs(current_qty))
 
     # Virtual Exit Check (Nur wenn DCA aktiv war)
     if trade['dca_level'] > 0:
-        avg = trade['avg_price']
+        avg = current_price # Immer den echten Wert nehmen
         exit_reason = None
         
         if trade['direction'] == "LONG":
@@ -185,8 +212,8 @@ def manage_open_trade(trade):
                 "symbol": symbol, "side": "SELL" if trade['direction'] == "LONG" else "BUY",
                 "positionSide": trade['direction'], "type": "MARKET", "closePosition": "true"
             })
-            if res and res.get("code") == 0:
-                close_trade(trade['id'])
+            # Das eigentliche Schließen in der DB passiert automatisch im nächsten Loop 
+            # durch den Realitäts-Check ganz oben.
 
 # --- WORKER LOOP ---
 if __name__ == "__main__":
