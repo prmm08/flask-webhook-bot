@@ -151,14 +151,8 @@ def manage_open_trade(trade):
     if not check_trade_exists(trade['id']): return
     symbol = trade['symbol']
 
-    # 1. COOLDOWN CHECK
-    last_update = trade.get('updated_at')
-    if last_update:
-        now = datetime.now(timezone.utc) if last_update.tzinfo else datetime.now()
-        seconds_since = (now - last_update).total_seconds()
-        if seconds_since < DCA_COOLDOWN_SEC: return 
-
-    # 2. STATUS SYNC
+    # --- 1. STATUS SYNC (JETZT GANZ OBEN!) ---
+    # Wir prüfen SOFORT, ob die Position noch da ist, egal ob Cooldown oder nicht.
     pos_res = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
     if not pos_res or "data" not in pos_res: return
 
@@ -167,6 +161,7 @@ def manage_open_trade(trade):
     avg_price = 0.0 
     
     for p in pos_res["data"]:
+        # Wichtig: Wir prüfen auf positionAmt != 0
         if p["symbol"] == symbol and float(p["positionAmt"]) != 0:
             position_exists = True
             current_qty = float(p["positionAmt"])
@@ -174,12 +169,21 @@ def manage_open_trade(trade):
             break
     
     if not position_exists:
-        log(f"[SYNC] {symbol} ist geschlossen.")
+        log(f"[SYNC] Position {symbol} wurde manuell/extern geschlossen.")
         close_trade(trade['id'])
-        # HIER WURDE DIE NACHRICHT ENTFERNT - KEIN TELEGRAM MEHR BEIM SCHLIESSEN
+        # Keine Telegram Nachricht hier (wie gewünscht)
         return
 
-    # 3. DCA LOGIK
+    # --- 2. COOLDOWN CHECK (Erst jetzt prüfen wir die Wartezeit) ---
+    last_update = trade.get('updated_at')
+    if last_update:
+        now = datetime.now(timezone.utc) if last_update.tzinfo else datetime.now()
+        seconds_since = (now - last_update).total_seconds()
+        # Wenn Cooldown aktiv ist, brechen wir HIER ab. 
+        # Da wir den Sync-Check aber schon gemacht haben, ist das okay.
+        if seconds_since < DCA_COOLDOWN_SEC: return 
+
+    # --- 3. DCA LOGIK ---
     quote_res = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     if not quote_res: return
     curr_price = float(quote_res["data"]["price"])
@@ -227,12 +231,10 @@ def manage_open_trade(trade):
                             new_total = float(p.get("positionAmt", current_qty))
 
                 update_dca(trade['id'], trade['dca_level'] + 1, new_avg, abs(new_total))
-                
                 update_tp_to_breakeven(symbol, trade['direction'], new_avg, new_total)
                 
-                # HIER IST DIE EINZIGE VERBLEIBENDE NACHRICHT
                 send_telegram(f"📉 <b>DCA BUY</b> ({trade['dca_level']+1}/{DCA_MAX_STEPS})\nSymbol: {symbol}\nSize: {new_size_usdt} USDT\nNew Avg: {new_avg}")
-
+                
 # --- MAIN LOOP ---
 if __name__ == "__main__":
     init_db()
