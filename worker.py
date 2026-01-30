@@ -23,7 +23,7 @@ MAX_OPEN_POSITIONS = 20  # <-- Hier dein Limit setzen (z.B. maximal 3 Trades gle
 DCA_DEVIATION = 5.0
 DCA_MULTIPLIER = 2.0
 DCA_MAX_STEPS = 4
-DCA_EXIT_TP = 1.2
+DCA_EXIT_TP = 0.1
 DCA_EXIT_SL = 10.0
 
 def log(msg):
