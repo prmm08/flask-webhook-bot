@@ -5,6 +5,7 @@ import hashlib
 import requests
 import urllib.parse
 from math import floor
+from datetime import datetime, timezone
 from db import get_pending_trades, get_open_trades, update_trade_execution, update_dca, close_trade, fail_trade, init_db, check_trade_exists
 
 # --- KONFIGURATION ---
@@ -17,12 +18,13 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # DCA Settings
-DCA_DEVIATION = 5.0     # % Abstand zum DURCHSCHNITTSPREIS
-DCA_MULTIPLIER = 2.0    # Martingale (Volumen verdoppeln)
-DCA_MAX_STEPS = 5       # Max Nachkäufe
-DCA_FEES_BUFFER = 0.15  # Puffer für Break-Even TP
+DCA_DEVIATION = 5.0     
+DCA_MULTIPLIER = 2.0    
+DCA_MAX_STEPS = 4
+DCA_FEES_BUFFER = 0.15 
+DCA_COOLDOWN_SEC = 60   
 
-# Virtual Exit (Sicherheitsnetz)
+# Virtual Exit
 DCA_EXIT_TP = 0.1
 DCA_EXIT_SL = 20.0
 
@@ -74,17 +76,14 @@ def round_step(value, step):
 # --- TP/SL MANAGER ---
 
 def update_tp_to_breakeven(symbol, direction, avg_price, total_qty):
-    """Löscht alte Orders und setzt TP auf AvgPrice + Fees"""
-    log(f"   [TP UPDATE] Setze TP auf Break-Even für {symbol}...")
+    log(f"   [TP UPDATE] Setze TP auf Break-Even ({avg_price}) für {symbol}...")
     
-    # 1. Alte Orders löschen
     ords = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
     for o in ords.get("data", {}).get("orders", []):
         api_request("POST", "/openApi/swap/v2/trade/cancelOrder", {"symbol": symbol, "orderId": o["orderId"]})
     
     time.sleep(1)
     
-    # 2. Neuen TP berechnen
     info = get_symbol_info(symbol)
     if direction == "LONG":
         tp_price = avg_price * (1 + DCA_FEES_BUFFER/100)
@@ -92,7 +91,6 @@ def update_tp_to_breakeven(symbol, direction, avg_price, total_qty):
         tp_price = avg_price * (1 - DCA_FEES_BUFFER/100)
     tp_price = round_step(tp_price, info['price_step'])
     
-    # 3. TP Order senden
     close_side = "SELL" if direction == "LONG" else "BUY"
     payload = {
         "symbol": symbol, "side": close_side, "positionSide": direction,
@@ -101,7 +99,6 @@ def update_tp_to_breakeven(symbol, direction, avg_price, total_qty):
         "closePosition": "true"
     }
     api_request("POST", "/openApi/swap/v2/trade/order", payload)
-    log(f"   [TP SET] Neuer TP @ {tp_price} (BE)")
 
 def place_initial_tp_sl(symbol, side, entry, tp_p, sl_p, quantity):
     log(f"   [TP/SL] Warte 5s auf Sync für {symbol}...")
@@ -123,10 +120,7 @@ def place_initial_tp_sl(symbol, side, entry, tp_p, sl_p, quantity):
 # --- EXECUTION LOGIC ---
 
 def execute_pending_trade(trade):
-    # ZOMBIE CHECK 1
-    if not check_trade_exists(trade['id']):
-        log(f"[ZOMBIE] Trade {trade['symbol']} existiert nicht mehr. Skip.")
-        return
+    if not check_trade_exists(trade['id']): return
 
     symbol = trade['symbol']
     log(f"--- START TRADE: {symbol} ---")
@@ -149,18 +143,22 @@ def execute_pending_trade(trade):
         log(f"   [FILLED] Entry @ {price}")
         update_trade_execution(trade['id'], price, qty)
         place_initial_tp_sl(symbol, trade['direction'], price, trade['tp_percent'], trade['sl_percent'], qty)
-        # KEIN TELEGRAM HIER
     else:
         log(f"   [FAIL] {res}")
         fail_trade(trade['id'])
 
 def manage_open_trade(trade):
-    # ZOMBIE CHECK 2
     if not check_trade_exists(trade['id']): return
-
     symbol = trade['symbol']
-    
-    # 1. STATUS SYNC (Echte Daten von BingX holen)
+
+    # 1. COOLDOWN CHECK
+    last_update = trade.get('updated_at')
+    if last_update:
+        now = datetime.now(timezone.utc) if last_update.tzinfo else datetime.now()
+        seconds_since = (now - last_update).total_seconds()
+        if seconds_since < DCA_COOLDOWN_SEC: return 
+
+    # 2. STATUS SYNC
     pos_res = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
     if not pos_res or "data" not in pos_res: return
 
@@ -178,41 +176,47 @@ def manage_open_trade(trade):
     if not position_exists:
         log(f"[SYNC] {symbol} ist geschlossen.")
         close_trade(trade['id'])
-        # Telegram: Position geschlossen
-        send_telegram(f"💰 <b>TRADE CLOSED</b>\nSymbol: {symbol}\nAvg Price: {trade['avg_price']}\nDCA Level: {trade['dca_level']}")
+        # HIER WURDE DIE NACHRICHT ENTFERNT - KEIN TELEGRAM MEHR BEIM SCHLIESSEN
         return
 
-    # 2. DCA LOGIK
+    # 3. DCA LOGIK
     quote_res = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     if not quote_res: return
     curr_price = float(quote_res["data"]["price"])
     
     if trade['dca_level'] < DCA_MAX_STEPS:
-        # ABSTAND VOM DURCHSCHNITTSPREIS
         baseline = avg_price 
         req_drop = DCA_DEVIATION 
         
+        target_price = 0
         triggered = False
-        if trade['direction'] == "LONG" and curr_price <= baseline * (1 - req_drop/100): triggered = True
-        if trade['direction'] == "SHORT" and curr_price >= baseline * (1 + req_drop/100): triggered = True
+        
+        if trade['direction'] == "LONG":
+            target_price = baseline * (1 - req_drop/100)
+            if curr_price <= target_price: triggered = True
+        elif trade['direction'] == "SHORT":
+            target_price = baseline * (1 + req_drop/100)
+            if curr_price >= target_price: triggered = True
         
         if triggered:
             log(f"[DCA TRIGGER] {symbol} Level {trade['dca_level']+1}")
             
             info = get_symbol_info(symbol)
-            # MARTINGALE: Base * 2^(Level+1)
-            new_size_usdt = trade['trade_size'] * (DCA_MULTIPLIER ** (trade['dca_level'] + 1))
+            multiplier_now = DCA_MULTIPLIER ** (trade['dca_level'] + 1)
+            new_size_usdt = trade['trade_size'] * multiplier_now
+            
             new_qty = round_step(new_size_usdt / curr_price, info['qty_step'])
             
+            log(f"   [CALC] Base: {trade['trade_size']} x {multiplier_now} = {new_size_usdt} USDT")
+
             res = api_request("POST", "/openApi/swap/v2/trade/order", {
                 "symbol": symbol, "side": "BUY" if trade['direction'] == "LONG" else "SELL",
                 "positionSide": trade['direction'], "type": "MARKET", "quantity": str(new_qty)
             })
             
             if res and res.get("code") == 0:
-                time.sleep(3)
+                time.sleep(2)
                 
-                # Neuen Durchschnitt ermitteln
                 pos_upd = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
                 new_avg = avg_price
                 new_total = current_qty
@@ -224,16 +228,15 @@ def manage_open_trade(trade):
 
                 update_dca(trade['id'], trade['dca_level'] + 1, new_avg, abs(new_total))
                 
-                # Break-Even setzen
                 update_tp_to_breakeven(symbol, trade['direction'], new_avg, new_total)
                 
-                # Telegram: DCA Info
-                send_telegram(f"📉 <b>DCA BUY</b> ({trade['dca_level']+1}/{DCA_MAX_STEPS})\nSymbol: {symbol}\nNew Avg: {new_avg}\nTP set to Break-Even")
+                # HIER IST DIE EINZIGE VERBLEIBENDE NACHRICHT
+                send_telegram(f"📉 <b>DCA BUY</b> ({trade['dca_level']+1}/{DCA_MAX_STEPS})\nSymbol: {symbol}\nSize: {new_size_usdt} USDT\nNew Avg: {new_avg}")
 
 # --- MAIN LOOP ---
 if __name__ == "__main__":
     init_db()
-    log("Worker Started.")
+    log("Worker v4 Started (Telegram Silent Mode).")
     
     while True:
         try:
