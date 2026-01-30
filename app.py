@@ -12,10 +12,9 @@ from math import floor
 from flask import Flask, request, jsonify
 
 # ============================================================
-#   DEBUG HELPER (Damit Render sofort Logs anzeigt)
+#   DEBUG HELPER
 # ============================================================
 def log(msg):
-    # Zwingt den Server, die Nachricht SOFORT auszuspucken
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ============================================================
@@ -25,7 +24,6 @@ API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
-# Standard-Werte
 LEVERAGE = 20
 TRADE_SIZE = 100
 TP_PERCENT = 1.0
@@ -39,14 +37,16 @@ DCA_SAVE_FILE = "active_dca.json"
 
 app = Flask(__name__)
 active_dca = {}
-dca_lock = threading.Lock()
+
+# --- WICHTIGER FIX: RLock statt Lock (Verhindert Deadlock) ---
+dca_lock = threading.RLock() 
+
 symbol_info_cache = {}
 processing_symbols = set()
 
 # ============================================================
 #   API CORE
 # ============================================================
-
 def get_sign(params):
     params["timestamp"] = str(int(time.time() * 1000))
     query_string = urllib.parse.urlencode(sorted(params.items()))
@@ -104,11 +104,7 @@ def load_dca():
 # ============================================================
 #   TP/SL THREAD (CRASH SAFE)
 # ============================================================
-
 def set_exchange_tp_sl_safe(symbol, side, entry, tp_p, sl_p, quantity):
-    """
-    Wrapper, der Abstürze abfängt und loggt
-    """
     try:
         log(f">>> TP/SL THREAD GESTARTET für {symbol}")
         
@@ -121,24 +117,17 @@ def set_exchange_tp_sl_safe(symbol, side, entry, tp_p, sl_p, quantity):
         tp_price = round_step(entry * (1 + tp_p/100 if side == "LONG" else 1 - tp_p/100), info["price_step"])
         sl_price = round_step(entry * (1 - sl_p/100 if side == "LONG" else 1 + sl_p/100), info["price_step"])
         
-        # Hedge Mode: Close Side ist Gegenteil
         close_side = "SELL" if side == "LONG" else "BUY"
         str_qty = str(round_step(quantity, info["qty_step"]))
 
-        log(f"--- DATEN FÜR {symbol} ---")
-        log(f"   Entry: {entry}")
-        log(f"   TP Ziel: {tp_price}")
-        log(f"   SL Ziel: {sl_price}")
-        log(f"   Qty: {str_qty}")
-        log(f"   Close Side: {close_side}")
-        
         orders = [("TAKE_PROFIT_MARKET", tp_price), ("STOP_MARKET", sl_price)]
 
         for o_type, price in orders:
+            # Das Payload Format aus deinem erfolgreichen Test
             payload = {
                 "symbol": symbol,
-                "side": close_side,     # WICHTIG
-                "positionSide": side,   # WICHTIG
+                "side": close_side,
+                "positionSide": side,
                 "type": o_type,
                 "stopPrice": str(price),
                 "workingType": "MARK_PRICE",
@@ -146,51 +135,41 @@ def set_exchange_tp_sl_safe(symbol, side, entry, tp_p, sl_p, quantity):
                 "closePosition": "true"
             }
             
-            log(f"Sende {o_type}: {json.dumps(payload)}")
+            log(f"Sende {o_type}: {price}")
             
-            # 3 Versuche
             for i in range(3):
                 res = api_request("POST", "/openApi/swap/v2/trade/order", payload)
-                log(f"   Antwort {i+1}: {json.dumps(res)}")
                 
                 if res and res.get("code") == 0:
                     log(f"   [OK] {o_type} erfolgreich!")
                     break
                 else:
-                    log(f"   [RETRY] Wegen Fehler. Warte 2s.")
+                    log(f"   [RETRY] {res.get('msg')}")
                     time.sleep(2)
 
         log(f"<<< TP/SL THREAD BEENDET für {symbol}")
 
     except Exception:
         log("!!! CRASH IM TP/SL THREAD !!!")
-        traceback.print_exc() # Druckt den Fehler exakt aus
+        traceback.print_exc()
 
 # ============================================================
 #   MAIN EXECUTION
 # ============================================================
-
 def execute_trade(symbol, direction, leverage, trade_size, tp_p, sl_p):
-    if symbol in processing_symbols: 
-        log(f"Blockiere Doppelklick für {symbol}")
-        return
+    if symbol in processing_symbols: return
     processing_symbols.add(symbol)
     
     try:
         log(f"--- NEUER TRADE: {symbol} {direction} ---")
         
-        # 1. Preis
         price_res = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-        if not price_res or "data" not in price_res:
-            log("Fehler: Kein Preis gefunden.")
-            return
+        if not price_res or "data" not in price_res: return
         price = float(price_res["data"]["price"])
         log(f"Preis: {price}")
 
-        # 2. Hebel
         api_request("POST", "/openApi/swap/v2/trade/leverage", {"symbol": symbol, "leverage": leverage, "side": direction})
         
-        # 3. Order
         info = get_symbol_info(symbol)
         qty = round_step(trade_size / price, info["qty_step"])
         
@@ -200,17 +179,18 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_p, sl_p):
             "positionSide": direction, "type": "MARKET", "quantity": str(qty)
         })
 
-        log(f"ORDER ANTWORT: {json.dumps(res)}") # WICHTIG: Das wollen wir sehen
+        log(f"ORDER ANTWORT: {json.dumps(res)}")
 
         if res and res.get("code") == 0:
+            # --- HIER WAR DER FEHLER (DEADLOCK) ---
             with dca_lock:
                 active_dca[symbol] = {
                     "side": direction, "entry_static": price, "entry_dynamic": price,
                     "executed": 0, "base_trade_size": trade_size, "qty": qty
                 }
-                save_dca()
+                save_dca() # Dank RLock klappt das jetzt!
             
-            # Starte Thread mit Crash-Schutz
+            # Jetzt wird dieser Thread auch wirklich gestartet
             t = threading.Thread(target=set_exchange_tp_sl_safe, args=(symbol, direction, price, tp_p, sl_p, qty))
             t.start()
         else:
@@ -226,15 +206,13 @@ def execute_trade(symbol, direction, leverage, trade_size, tp_p, sl_p):
 # ============================================================
 #   WORKER & SERVER
 # ============================================================
-
 def monitor_worker():
-    log("Monitor Worker gestartet.")
     while True:
         try:
-            # (Hier deine normale DCA Logik, gekürzt für Fokus auf Logs)
-            time.sleep(10) 
-            # Um Logs sauber zu halten, loggen wir hier nur, wenn DCA passiert
+            # (DCA Logik hier...)
+            pass 
         except: pass
+        time.sleep(10)
 
 @app.route("/ping")
 def ping(): return "OK", 200
@@ -242,8 +220,6 @@ def ping(): return "OK", 200
 @app.route("/testorder", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
-    log(f"Webhook empfangen: {data}") # Loggt was ankommt
-    
     raw = data.get("ticker") or data.get("currency") or data.get("pair") or data.get("symbol")
     if not raw: return jsonify({"error": "No ticker"}), 400
     
