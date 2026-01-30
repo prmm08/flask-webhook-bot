@@ -16,7 +16,7 @@ BINGX_BASE = "https://open-api.bingx.com"
 # --- DCA SETTINGS ---
 DCA_DEVIATION = 5.0
 DCA_MULTIPLIER = 2.0
-DCA_MAX_STEPS = 5
+DCA_MAX_STEPS = 4
 DCA_EXIT_TP = 1.2  # Virtual TP
 DCA_EXIT_SL = 40.0 # Virtual SL
 
