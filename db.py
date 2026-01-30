@@ -44,6 +44,27 @@ def init_db():
         print(f"Init DB Error: {e}")
     finally:
         conn.close()
+        
+# FÜGE DAS ZU DEINER db.py HINZU
+
+def is_symbol_active(symbol):
+    """Prüft, ob für dieses Symbol schon ein Trade läuft (OPEN oder PENDING)"""
+    conn = get_conn()
+    if not conn: return False
+    try:
+        cur = conn.cursor()
+        # Wir suchen nach Trades, die NICHT geschlossen oder fehlerhaft sind
+        cur.execute("""
+            SELECT id FROM trades 
+            WHERE symbol = %s AND status IN ('OPEN', 'PENDING') 
+            LIMIT 1
+        """, (symbol,))
+        return cur.fetchone() is not None
+    except Exception as e:
+        print(f"DB Check Error: {e}")
+        return True # Im Zweifel lieber blockieren als doppelt kaufen
+    finally:
+        conn.close()
 
 def add_pending_trade(data):
     conn = get_conn()
