@@ -1,82 +1,134 @@
-# db.py
 import os
-import json
-from typing import Optional, Dict, Any
-import psycopg
-from psycopg.rows import dict_row
-from config import DATABASE_URL
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import logging
+
+# Render setzt diese Variable automatisch, wenn du die DB verbindest
+DB_URL = os.getenv("DATABASE_URL")
 
 def get_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not set")
-    return psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row)
+    if not DB_URL:
+        print("FEHLER: DATABASE_URL nicht gesetzt!")
+        return None
+    try:
+        conn = psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
+        return conn
+    except Exception as e:
+        print(f"DB Connection Error: {e}")
+        return None
 
-def init_schema():
-    sql = """
-    CREATE TABLE IF NOT EXISTS positions (
-      id SERIAL PRIMARY KEY,
-      symbol TEXT NOT NULL,
-      side TEXT NOT NULL,
-      entry_price NUMERIC NOT NULL,
-      qty NUMERIC NOT NULL,
-      order_id TEXT,
-      fills JSONB,
-      local_avg NUMERIC,
-      status TEXT DEFAULT 'open',
-      tp_order_id TEXT,
-      sl_order_id TEXT,
-      last_dca_ts TIMESTAMP,
-      dca_count INTEGER DEFAULT 0,
-      dca_deviation_percent NUMERIC DEFAULT 0,
-      dca_volume_multiplier NUMERIC DEFAULT 1,
-      tp_percent NUMERIC,
-      sl_percent NUMERIC,
-      created_at TIMESTAMP DEFAULT now()
-    );
-    """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
+def init_db():
+    """Erstellt die Tabelle automatisch beim Start, falls nicht vorhanden"""
+    conn = get_conn()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id SERIAL PRIMARY KEY,
+                symbol VARCHAR(20) NOT NULL,
+                direction VARCHAR(10) NOT NULL,
+                status VARCHAR(20) DEFAULT 'PENDING',
+                leverage INT,
+                trade_size FLOAT,
+                entry_price FLOAT DEFAULT 0,
+                avg_price FLOAT DEFAULT 0,
+                quantity FLOAT DEFAULT 0,
+                tp_percent FLOAT,
+                sl_percent FLOAT,
+                dca_level INT DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        conn.commit()
+        print("Datenbank-Tabelle 'trades' überprüft/erstellt.")
+    except Exception as e:
+        print(f"Init DB Error: {e}")
+    finally:
+        conn.close()
 
-def create_position(symbol: str, side: str, entry_price: float, qty: float, order_id: Optional[str],
-                    fills: Optional[Dict]=None, local_avg: Optional[float]=None,
-                    tp_percent: Optional[float]=None, sl_percent: Optional[float]=None,
-                    dca_count: int=0, dca_deviation_percent: float=0.0, dca_volume_multiplier: float=1.0) -> int:
-    sql = """
-    INSERT INTO positions (symbol, side, entry_price, qty, order_id, fills, local_avg, tp_percent, sl_percent, dca_count, dca_deviation_percent, dca_volume_multiplier)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    RETURNING id;
-    """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (
-                symbol, side, entry_price, qty, order_id, json.dumps(fills or {}), local_avg,
-                tp_percent, sl_percent, dca_count, dca_deviation_percent, dca_volume_multiplier
-            ))
-            row = cur.fetchone()
-            return row["id"]
+def add_pending_trade(data):
+    conn = get_conn()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO trades (symbol, direction, leverage, trade_size, tp_percent, sl_percent, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'PENDING')
+        """, (
+            data['symbol'], data['direction'], data['leverage'], 
+            data['trade_size'], data['tp_percent'], data['sl_percent']
+        ))
+        conn.commit()
+    finally:
+        conn.close()
 
-def update_position_orders(pos_id: int, tp_order_id: Optional[str], sl_order_id: Optional[str]):
-    sql = "UPDATE positions SET tp_order_id=%s, sl_order_id=%s WHERE id=%s"
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (tp_order_id, sl_order_id, pos_id))
+def get_pending_trades():
+    conn = get_conn()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM trades WHERE status = 'PENDING' ORDER BY created_at ASC")
+        return cur.fetchall()
+    finally:
+        conn.close()
 
-def get_open_positions():
-    sql = "SELECT * FROM positions WHERE status='open'"
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            return cur.fetchall()
+def get_open_trades():
+    conn = get_conn()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM trades WHERE status = 'OPEN'")
+        return cur.fetchall()
+    finally:
+        conn.close()
 
-def append_dca(pos_id: int, added_qty: float, new_avg: float):
-    sql = "UPDATE positions SET qty = qty + %s, local_avg = %s, dca_count = dca_count + 1, last_dca_ts = now() WHERE id = %s"
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (added_qty, new_avg, pos_id))
+def update_trade_execution(trade_id, price, qty):
+    """Markiert Trade als OPEN und speichert Entry"""
+    conn = get_conn()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE trades 
+            SET status = 'OPEN', entry_price = %s, avg_price = %s, quantity = %s, updated_at = NOW()
+            WHERE id = %s
+        """, (price, price, qty, trade_id))
+        conn.commit()
+    finally:
+        conn.close()
 
-def set_position_status(pos_id: int, status: str):
-    sql = "UPDATE positions SET status=%s WHERE id=%s"
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (status, pos_id))
+def update_dca(trade_id, level, new_avg, new_qty):
+    conn = get_conn()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE trades 
+            SET dca_level = %s, avg_price = %s, quantity = %s, updated_at = NOW()
+            WHERE id = %s
+        """, (level, new_avg, new_qty, trade_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+def close_trade(trade_id):
+    conn = get_conn()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE trades SET status = 'CLOSED', updated_at = NOW() WHERE id = %s", (trade_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def fail_trade(trade_id):
+    conn = get_conn()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE trades SET status = 'ERROR', updated_at = NOW() WHERE id = %s", (trade_id,))
+        conn.commit()
+    finally:
+        conn.close()
