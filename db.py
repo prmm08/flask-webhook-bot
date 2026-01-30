@@ -132,3 +132,19 @@ def fail_trade(trade_id):
         conn.commit()
     finally:
         conn.close()
+        
+# ... (der restliche Code bleibt gleich)
+
+def get_open_trade_count():
+    """Zählt, wie viele Trades gerade aktiv sind"""
+    conn = get_conn()
+    if not conn: return 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as count FROM trades WHERE status = 'OPEN'")
+        result = cur.fetchone()
+        return result['count'] if result else 0
+    except Exception:
+        return 0
+    finally:
+        conn.close()

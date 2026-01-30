@@ -5,25 +5,45 @@ import hashlib
 import requests
 import urllib.parse
 from math import floor
-# Importiere unsere DB Funktionen
-from db import get_pending_trades, get_open_trades, update_trade_execution, update_dca, close_trade, fail_trade, init_db
+from db import get_pending_trades, get_open_trades, update_trade_execution, update_dca, close_trade, fail_trade, init_db, get_open_trade_count # <--- NEU: get_open_trade_count importieren
 
-# --- BINGX CONFIG ---
+# --- KONFIGURATION ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
 
-# --- DCA SETTINGS ---
+# Telegram Konfiguration
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# --- NEU: LIMIT EINSTELLUNG ---
+MAX_OPEN_POSITIONS = 20  # <-- Hier dein Limit setzen (z.B. maximal 3 Trades gleichzeitig)
+
+# DCA Settings
 DCA_DEVIATION = 5.0
 DCA_MULTIPLIER = 2.0
 DCA_MAX_STEPS = 4
-DCA_EXIT_TP = 1.2  # Virtual TP
-DCA_EXIT_SL = 40.0 # Virtual SL
+DCA_EXIT_TP = 1.2
+DCA_EXIT_SL = 10.0
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# --- API HELPER ---
+# --- TELEGRAM HELPER (NEU) ---
+def send_telegram(message):
+    if not TG_TOKEN or not TG_CHAT_ID: return
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TG_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML" # Erlaubt Fettschrift etc.
+        }
+        requests.post(url, data=payload, timeout=5)
+    except Exception as e:
+        log(f"[TELEGRAM FAIL] {e}")
+
+# --- API & MATH HELPER (Bleiben gleich) ---
 def get_sign(params):
     params["timestamp"] = str(int(time.time() * 1000))
     query_string = urllib.parse.urlencode(sorted(params.items()))
@@ -57,51 +77,44 @@ def round_step(value, step):
     if not step: return value
     return round(floor(value * (1/step) + 0.00000001) / (1/step), 8)
 
-# --- TRADING ACTIONS ---
+# --- TRADING LOGIC ---
 
 def place_tp_sl(symbol, side, entry, tp_p, sl_p, quantity):
-    """
-    Die 'Force'-Methode mit quantity+closePosition
-    """
     log(f"   [TP/SL] Warte 5s auf Sync für {symbol}...")
-    time.sleep(5) 
-    
+    time.sleep(5)
     info = get_symbol_info(symbol)
     tp_price = round_step(entry * (1 + tp_p/100 if side == "LONG" else 1 - tp_p/100), info['price_step'])
     sl_price = round_step(entry * (1 - sl_p/100 if side == "LONG" else 1 + sl_p/100), info['price_step'])
-    
     close_side = "SELL" if side == "LONG" else "BUY"
     str_qty = str(round_step(quantity, info['qty_step']))
-    
     orders = [("TAKE_PROFIT_MARKET", tp_price), ("STOP_MARKET", sl_price)]
-    
     for o_type, price in orders:
         payload = {
             "symbol": symbol, "side": close_side, "positionSide": side,
             "type": o_type, "stopPrice": str(price), "workingType": "MARK_PRICE",
             "quantity": str_qty, "closePosition": "true"
         }
-        # Retry Loop
         for i in range(3):
             res = api_request("POST", "/openApi/swap/v2/trade/order", payload)
-            if res and res.get("code") == 0:
-                log(f"   [OK] {o_type} gesetzt.")
-                break
+            if res and res.get("code") == 0: break
             time.sleep(1)
 
 def execute_pending_trade(trade):
+    # --- NEU: LIMIT CHECK ---
+    current_open = get_open_trade_count()
+    if current_open >= MAX_OPEN_POSITIONS:
+        log(f"[LIMIT] Max Positionen ({MAX_OPEN_POSITIONS}) erreicht. Warte mit {trade['symbol']}...")
+        return # Wir machen nichts, Trade bleibt PENDING in der DB und wird später probiert
+
     symbol = trade['symbol']
-    log(f"--- FÜHRE TRADE AUS: {symbol} ---")
+    log(f"--- START TRADE: {symbol} ---")
     
-    # 1. Preis
     p_res = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     if not p_res or "data" not in p_res: return
     price = float(p_res["data"]["price"])
     
-    # 2. Leverage
     api_request("POST", "/openApi/swap/v2/trade/leverage", {"symbol": symbol, "leverage": trade['leverage'], "side": trade['direction']})
     
-    # 3. Order
     info = get_symbol_info(symbol)
     qty = round_step(trade['trade_size'] / price, info['qty_step'])
     
@@ -112,11 +125,11 @@ def execute_pending_trade(trade):
     
     if res and res.get("code") == 0:
         log(f"   [FILLED] Entry @ {price}")
-        # DB Update: Pending -> Open
         update_trade_execution(trade['id'], price, qty)
-        
-        # TP/SL setzen
         place_tp_sl(symbol, trade['direction'], price, trade['tp_percent'], trade['sl_percent'], qty)
+        
+        # Telegram Info bei Start
+        send_telegram(f"🚀 <b>NEW TRADE</b>\nSymbol: {symbol}\nSide: {trade['direction']}\nEntry: {price}")
     else:
         log(f"   [FAIL] {res}")
         fail_trade(trade['id'])
@@ -124,14 +137,10 @@ def execute_pending_trade(trade):
 def manage_open_trade(trade):
     symbol = trade['symbol']
     
-    # 1. REALITÄTS-CHECK: Existiert die Position noch?
+    # 1. Check ob Position existiert (Self-Healing)
     pos_res = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
-    
-    # Sicherheits-Check: Wenn API-Fehler, nichts tun (nicht fälschlicherweise schließen)
-    if not pos_res or "data" not in pos_res: 
-        return
+    if not pos_res or "data" not in pos_res: return
 
-    # Suchen, ob wir eine aktive Position > 0 finden
     position_exists = False
     current_qty = 0.0
     current_price = 0.0
@@ -140,45 +149,37 @@ def manage_open_trade(trade):
         if p["symbol"] == symbol and float(p["positionAmt"]) != 0:
             position_exists = True
             current_qty = float(p["positionAmt"])
-            current_price = float(p.get("avgPrice", 0)) # Durchschnittspreis von BingX nehmen
+            current_price = float(p.get("avgPrice", 0))
             break
     
-    # WENN POSITION WEG IST (Manuell geschlossen oder TP/SL getroffen)
+    # WENN POSITION WEG IST (Geschlossen durch TP, SL oder Manuell)
     if not position_exists:
-        log(f"[SYNC] Position {symbol} ist nicht mehr auf Exchange. Schließe in DB.")
+        log(f"[SYNC] {symbol} ist geschlossen.")
         close_trade(trade['id'])
-        return # Arbeit hier beendet
+        
+        # --- NEU: TELEGRAM NACHRICHT BEI ABSCHLUSS ---
+        msg = f"💰 <b>TRADE CLOSED</b>\nSymbol: {symbol}\nAvg Entry: {trade['avg_price']}\nDCA Level: {trade['dca_level']}"
+        send_telegram(msg)
+        return
 
-    # ----------------------------------------------------
-    # Ab hier läuft die normale DCA-Logik weiter, 
-    # da wir wissen, dass die Position noch offen ist.
-    # ----------------------------------------------------
-
-    # Aktuellen Marktpreis holen
+    # 2. DCA Logik
     quote_res = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     if not quote_res: return
     curr = float(quote_res["data"]["price"])
     
-    # DCA Logik (nutzt jetzt den echten avgPrice von der Exchange)
     if trade['dca_level'] < DCA_MAX_STEPS:
-        # Wir nutzen current_price (den echten Avg Entry von BingX), nicht den aus der DB,
-        # falls du manuell nachgekauft hast.
         entry = current_price 
         req_drop = DCA_DEVIATION * (trade['dca_level'] + 1)
-        
         triggered = False
         if trade['direction'] == "LONG" and curr <= entry * (1 - req_drop/100): triggered = True
         if trade['direction'] == "SHORT" and curr >= entry * (1 + req_drop/100): triggered = True
         
         if triggered:
-            log(f"[DCA TRIGGER] {symbol} Level {trade['dca_level']+1}")
-            
-            # Alte Orders löschen
+            log(f"[DCA TRIGGER] {symbol}")
             ords = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
             for o in ords.get("data", {}).get("orders", []):
                 api_request("POST", "/openApi/swap/v2/trade/cancelOrder", {"symbol": symbol, "orderId": o["orderId"]})
             
-            # Nachkaufen
             info = get_symbol_info(symbol)
             new_size = trade['trade_size'] * (DCA_MULTIPLIER ** (trade['dca_level'] + 1))
             new_qty = round_step(new_size / curr, info['qty_step'])
@@ -190,15 +191,15 @@ def manage_open_trade(trade):
             
             if res and res.get("code") == 0:
                 time.sleep(2)
-                # Wir holen uns das Update im nächsten Loop durch den Realitäts-Check oben
-                # Aber wir erhöhen das Level in der DB schon mal
                 update_dca(trade['id'], trade['dca_level'] + 1, current_price, abs(current_qty))
+                
+                # Telegram Info bei DCA Nachkauf
+                send_telegram(f"📉 <b>DCA BUY</b> ({trade['dca_level']+1}/{DCA_MAX_STEPS})\nSymbol: {symbol}\nNew Avg: {current_price}")
 
-    # Virtual Exit Check (Nur wenn DCA aktiv war)
+    # 3. Virtual Exit (Nur wenn DCA aktiv war)
     if trade['dca_level'] > 0:
-        avg = current_price # Immer den echten Wert nehmen
+        avg = current_price
         exit_reason = None
-        
         if trade['direction'] == "LONG":
             if curr >= avg * (1 + DCA_EXIT_TP/100): exit_reason = "TP"
             elif curr <= avg * (1 - DCA_EXIT_SL/100): exit_reason = "SL"
@@ -207,34 +208,29 @@ def manage_open_trade(trade):
             elif curr >= avg * (1 + DCA_EXIT_SL/100): exit_reason = "SL"
             
         if exit_reason:
-            log(f"[VIRTUAL EXIT] {symbol} via {exit_reason}")
             res = api_request("POST", "/openApi/swap/v2/trade/order", {
                 "symbol": symbol, "side": "SELL" if trade['direction'] == "LONG" else "BUY",
                 "positionSide": trade['direction'], "type": "MARKET", "closePosition": "true"
             })
-            # Das eigentliche Schließen in der DB passiert automatisch im nächsten Loop 
-            # durch den Realitäts-Check ganz oben.
+            # Die Telegram-Nachricht kommt dann im nächsten Loop durch den "Position Weg"-Check oben
 
-# --- WORKER LOOP ---
+# --- WORKER START ---
 if __name__ == "__main__":
-    log("--- WORKER GESTARTET ---")
-    init_db() # Stellt sicher, dass DB Tabelle existiert
+    init_db()
+    # Test Nachricht beim Start
+    send_telegram("🤖 <b>Bot Worker Started</b>\nMonitoring Database...")
     
     while True:
         try:
-            # 1. Neue Trades abarbeiten
             pending = get_pending_trades()
             if pending:
-                log(f"Gefunden: {len(pending)} neue Signale.")
                 for t in pending:
                     execute_pending_trade(t)
             
-            # 2. Laufende Trades managen (DCA)
             active = get_open_trades()
             for t in active:
                 manage_open_trade(t)
-                
         except Exception as e:
-            log(f"Loop Fehler: {e}")
+            log(f"Loop Error: {e}")
         
-        time.sleep(3) # Kurze Pause
+        time.sleep(3)
