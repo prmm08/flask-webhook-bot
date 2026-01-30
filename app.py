@@ -1,31 +1,30 @@
 from flask import Flask, request, jsonify
 from db import add_pending_trade, init_db, get_open_trade_count
-import os
 
 app = Flask(__name__)
 
 # --- KONFIGURATION ---
-# Maximale gleichzeitige Positionen
-MAX_OPEN_POSITIONS = 3  
+MAX_OPEN_POSITIONS = 3  # Dein Limit
 
+# DB beim Start prüfen
 init_db()
 
 @app.route("/", methods=["GET"])
+@app.route("/ping", methods=["GET"])
 def ping(): return "OK", 200
 
 @app.route("/testorder", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
     
-    # 1. LIMIT CHECK (PUNKT 2)
-    # Bevor wir irgendwas machen, zählen wir die offenen Trades.
+    # 1. LIMIT PRÜFUNG (Vor dem Speichern)
     current_count = get_open_trade_count()
     if current_count >= MAX_OPEN_POSITIONS:
-        print(f"[LIMIT] Ignoriere Signal. {current_count}/{MAX_OPEN_POSITIONS} belegt.", flush=True)
-        # Wir geben 200 zurück, damit TradingView keinen Fehler meldet, aber wir speichern NICHTS.
+        print(f"[LIMIT] Ignoriere Signal. {current_count}/{MAX_OPEN_POSITIONS} Slots belegt.", flush=True)
+        # Wir geben 'success' zurück, damit TradingView nicht meckert, aber tun nichts.
         return jsonify({"status": "ignored", "reason": "limit_reached"}), 200
 
-    # 2. Parsing
+    # 2. PARSING
     raw = data.get("ticker") or data.get("currency") or data.get("pair") or data.get("symbol")
     if not raw: return jsonify({"error": "No ticker"}), 400
     

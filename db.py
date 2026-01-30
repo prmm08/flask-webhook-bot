@@ -1,9 +1,8 @@
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
-import logging
 
-# Render setzt diese Variable automatisch, wenn du die DB verbindest
+# Render Connection String
 DB_URL = os.getenv("DATABASE_URL")
 
 def get_conn():
@@ -18,7 +17,6 @@ def get_conn():
         return None
 
 def init_db():
-    """Erstellt die Tabelle automatisch beim Start, falls nicht vorhanden"""
     conn = get_conn()
     if not conn: return
     try:
@@ -42,7 +40,6 @@ def init_db():
             );
         """)
         conn.commit()
-        print("Datenbank-Tabelle 'trades' überprüft/erstellt.")
     except Exception as e:
         print(f"Init DB Error: {e}")
     finally:
@@ -85,7 +82,6 @@ def get_open_trades():
         conn.close()
 
 def update_trade_execution(trade_id, price, qty):
-    """Markiert Trade als OPEN und speichert Entry"""
     conn = get_conn()
     if not conn: return
     try:
@@ -132,11 +128,8 @@ def fail_trade(trade_id):
         conn.commit()
     finally:
         conn.close()
-        
-# ... (der restliche Code bleibt gleich)
 
 def get_open_trade_count():
-    """Zählt, wie viele Trades gerade aktiv sind"""
     conn = get_conn()
     if not conn: return 0
     try:
@@ -144,7 +137,18 @@ def get_open_trade_count():
         cur.execute("SELECT COUNT(*) as count FROM trades WHERE status = 'OPEN'")
         result = cur.fetchone()
         return result['count'] if result else 0
-    except Exception:
-        return 0
+    except: return 0
+    finally:
+        conn.close()
+
+def check_trade_exists(trade_id):
+    """ZOMBIE CHECK: Prüft ob Trade noch in DB ist"""
+    conn = get_conn()
+    if not conn: return False
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM trades WHERE id = %s", (trade_id,))
+        return cur.fetchone() is not None
+    except: return False
     finally:
         conn.close()
