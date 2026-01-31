@@ -47,7 +47,7 @@ def webhook():
         "direction": direction,
         "leverage": int(data.get("leverage", 20)),
         "trade_size": float(data.get("trade_size", 100)),
-        "tp_percent": float(data.get("tp_percent", 1.0)),
+        "tp_percent": float(data.get("tp_percent", 0.5)),
         # SL ist hier nicht mehr nötig, DB setzt es auf 0
     }
     
