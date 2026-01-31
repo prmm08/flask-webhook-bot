@@ -17,12 +17,12 @@ BINGX_BASE = "https://open-api.bingx.com"
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# DCA Settings
-DCA_DEVIATION = 5.0     # 5% Abstand zum Durchschnitt
-DCA_MULTIPLIER = 2.0    # Martingale (x2)
-DCA_MAX_STEPS = 4       # Max 5 Nachkäufe
-DCA_FEES_BUFFER = 0.15  # Ziel: Break Even + 0.15%
-DCA_COOLDOWN_SEC = 60   # Zwingende Pause nach jedem Kauf
+# DCA Settings (Short Optimized)
+DCA_DEVIATION = 5.0     # 5% Preis-Anstieg (gegen uns)
+DCA_MULTIPLIER = 2.0    
+DCA_MAX_STEPS = 4       
+DCA_FEES_BUFFER = 0.15  # Ziel: Break Even + Buffer
+DCA_COOLDOWN_SEC = 60   
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -69,11 +69,11 @@ def round_step(value, step):
     if not step: return value
     return round(floor(value * (1/step) + 0.00000001) / (1/step), 8)
 
-# --- TP MANAGEMENT ---
+# --- TP MANAGEMENT (SHORT ONLY - NO SL) ---
 
-def update_tp_to_breakeven(symbol, direction, avg_price, total_qty):
-    """Löscht alte Orders & setzt TP neu auf Break-Even."""
-    log(f"   [TP UPDATE] 🧹 Setze TP auf Break-Even ({avg_price}) für {symbol}...")
+def update_tp_to_breakeven(symbol, avg_price, total_qty):
+    """Setzt nur TP (kein SL)"""
+    log(f"   [TP UPDATE] 🧹 Aktualisiere Short-TP auf {avg_price} für {symbol}...")
     
     # 1. Alte Orders löschen
     try:
@@ -89,18 +89,13 @@ def update_tp_to_breakeven(symbol, direction, avg_price, total_qty):
 
     # 2. Neuen TP berechnen
     info = get_symbol_info(symbol)
-    if direction == "LONG":
-        tp_price = avg_price * (1 + DCA_FEES_BUFFER/100)
-    else:
-        tp_price = avg_price * (1 - DCA_FEES_BUFFER/100)
-        
+    tp_price = avg_price * (1 - DCA_FEES_BUFFER/100)
     tp_price = round_step(tp_price, info['price_step'])
     qty_str = str(round_step(abs(total_qty), info['qty_step']))
 
-    # 3. TP Order setzen
-    close_side = "SELL" if direction == "LONG" else "BUY"
+    # 3. TP Order setzen (BUY to Close)
     payload = {
-        "symbol": symbol, "side": close_side, "positionSide": direction,
+        "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
         "type": "TAKE_PROFIT_MARKET", 
         "stopPrice": str(tp_price), "workingType": "MARK_PRICE", 
         "quantity": qty_str, "closePosition": "true"
@@ -108,24 +103,28 @@ def update_tp_to_breakeven(symbol, direction, avg_price, total_qty):
     
     res = api_request("POST", "/openApi/swap/v2/trade/order", payload)
     if res and res.get("code") == 0:
-        log(f"   [TP SET] ✅ Neuer TP @ {tp_price}")
+        log(f"   [TP SET] ✅ Short TP @ {tp_price}")
+    else:
+        log(f"   [TP FAIL] ❌ Fehler: {res}")
 
-def place_initial_tp_sl(symbol, side, entry, tp_p, sl_p, quantity):
-    log(f"   [TP/SL] Warte 5s auf Sync für {symbol}...")
+def place_initial_tp(symbol, entry, tp_p, quantity):
+    """Nur Initial TP setzen, KEIN SL"""
+    log(f"   [TP] Warte 5s auf Sync für {symbol}...")
     time.sleep(5)
     info = get_symbol_info(symbol)
-    tp_price = round_step(entry * (1 + tp_p/100 if side == "LONG" else 1 - tp_p/100), info['price_step'])
-    sl_price = round_step(entry * (1 - sl_p/100 if side == "LONG" else 1 + sl_p/100), info['price_step'])
-    close_side = "SELL" if side == "LONG" else "BUY"
+    
+    # SHORT: TP ist UNTEN
+    tp_price = round_step(entry * (1 - tp_p/100), info['price_step'])
     str_qty = str(round_step(quantity, info['qty_step']))
     
-    for o_type, price in [("TAKE_PROFIT_MARKET", tp_price), ("STOP_MARKET", sl_price)]:
-        payload = {
-            "symbol": symbol, "side": close_side, "positionSide": side,
-            "type": o_type, "stopPrice": str(price), "workingType": "MARK_PRICE",
-            "quantity": str_qty, "closePosition": "true"
-        }
-        api_request("POST", "/openApi/swap/v2/trade/order", payload)
+    # Nur EINE Order senden: TP
+    payload = {
+        "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
+        "type": "TAKE_PROFIT_MARKET", "stopPrice": str(tp_price), 
+        "workingType": "MARK_PRICE",
+        "quantity": str_qty, "closePosition": "true"
+    }
+    api_request("POST", "/openApi/swap/v2/trade/order", payload)
 
 # --- EXECUTION LOGIC ---
 
@@ -133,26 +132,34 @@ def execute_pending_trade(trade):
     if not check_trade_exists(trade['id']): return
 
     symbol = trade['symbol']
-    log(f"--- START TRADE: {symbol} ---")
+    # Check: Ist es wirklich SHORT?
+    if trade['direction'] != "SHORT":
+        log(f"[SKIP] Ignoriere {symbol} (Ist LONG, wir machen nur SHORT).")
+        fail_trade(trade['id'])
+        return
+
+    log(f"--- START SHORT (NO SL): {symbol} ---")
     
     p_res = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     if not p_res: return
     price = float(p_res["data"]["price"])
     
-    api_request("POST", "/openApi/swap/v2/trade/leverage", {"symbol": symbol, "leverage": trade['leverage'], "side": trade['direction']})
+    api_request("POST", "/openApi/swap/v2/trade/leverage", {"symbol": symbol, "leverage": trade['leverage'], "side": "SHORT"})
     
     info = get_symbol_info(symbol)
     qty = round_step(trade['trade_size'] / price, info['qty_step'])
     
+    # ENTRY ORDER (SELL SHORT)
     res = api_request("POST", "/openApi/swap/v2/trade/order", {
-        "symbol": symbol, "side": "BUY" if trade['direction'] == "LONG" else "SELL",
-        "positionSide": trade['direction'], "type": "MARKET", "quantity": str(qty)
+        "symbol": symbol, "side": "SELL", "positionSide": "SHORT", 
+        "type": "MARKET", "quantity": str(qty)
     })
     
     if res and res.get("code") == 0:
-        log(f"   [FILLED] Entry @ {price}")
+        log(f"   [FILLED] Short Entry @ {price}")
         update_trade_execution(trade['id'], price, qty)
-        place_initial_tp_sl(symbol, trade['direction'], price, trade['tp_percent'], trade['sl_percent'], qty)
+        # HIER WIRD KEIN SL MEHR ÜBERGEBEN
+        place_initial_tp(symbol, price, trade['tp_percent'], qty)
     else:
         log(f"   [FAIL] {res}")
         fail_trade(trade['id'])
@@ -170,67 +177,68 @@ def manage_open_trade(trade):
     avg_price = 0.0 
     
     for p in pos_res["data"]:
+        # SHORT check
         if p["symbol"] == symbol and float(p["positionAmt"]) != 0:
             position_exists = True
-            current_qty = float(p["positionAmt"])
+            current_qty = abs(float(p["positionAmt"])) 
             avg_price = float(p.get("avgPrice", 0))
             break
     
     if not position_exists:
-        log(f"[SYNC] {symbol} ist geschlossen.")
+        log(f"[SYNC] {symbol} Short ist geschlossen.")
         close_trade(trade['id'])
         return
 
-    # 2. COOLDOWN CHECK (60s Wartezeit)
+    # 2. WATCHDOG (Plan B: Break-Even Check)
+    quote_res = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
+    if not quote_res: return
+    curr_price = float(quote_res["data"]["price"])
+    
+    # Wenn wir im DCA Modus sind (oder einfach Position haben), prüfen wir Break-Even
+    if trade['dca_level'] > 0 and avg_price > 0:
+        # SHORT: Ziel = AvgPrice - Fees
+        target_price = avg_price * (1 - DCA_FEES_BUFFER/100)
+        
+        if curr_price <= target_price:
+            log(f"[WATCHDOG] 🚨 {symbol} Short im Ziel! Force Close.")
+            res = api_request("POST", "/openApi/swap/v2/trade/order", {
+                "symbol": symbol, "side": "BUY", "positionSide": "SHORT", 
+                "type": "MARKET", "closePosition": "true"
+            })
+            if res and res.get("code") == 0:
+                log(f"   [WATCHDOG] Geschlossen.")
+                return 
+
+    # 3. COOLDOWN CHECK
     last_update = trade.get('updated_at')
     if last_update:
         now = datetime.now(timezone.utc) if last_update.tzinfo else datetime.now()
         seconds_since = (now - last_update).total_seconds()
         if seconds_since < DCA_COOLDOWN_SEC: return 
 
-    # 3. DCA LOGIK
-    quote_res = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
-    if not quote_res: return
-    curr_price = float(quote_res["data"]["price"])
-    
-    # Sicherheits-Check: Wenn BingX noch "0" meldet, nichts tun
-    if avg_price == 0: return
-
+    # 4. DCA LOGIK (SHORT ONLY)
     if trade['dca_level'] < DCA_MAX_STEPS:
         baseline = avg_price 
-        req_drop = DCA_DEVIATION 
+        # SHORT DCA TRIGGER: Preis > AvgPrice + 5%
+        target_trigger = baseline * (1 + DCA_DEVIATION/100)
         
-        triggered = False
-        target_price = 0
-        
-        # Berechnung der Trigger-Schwelle
-        if trade['direction'] == "LONG":
-            target_price = baseline * (1 - req_drop/100)
-            if curr_price <= target_price: triggered = True
-        elif trade['direction'] == "SHORT":
-            target_price = baseline * (1 + req_drop/100)
-            if curr_price >= target_price: triggered = True
-        
-        # LOGGING (Damit du siehst, warum er kauft oder wartet)
-        # log(f"[{symbol}] Kurs: {curr_price} | Ziel: {target_price} (Avg: {baseline})")
-
-        if triggered:
-            log(f"[DCA TRIGGER] {symbol} Level {trade['dca_level']+1}")
+        if curr_price >= target_trigger:
+            log(f"[DCA TRIGGER] {symbol} Short Level {trade['dca_level']+1}")
             
             info = get_symbol_info(symbol)
             multiplier_now = DCA_MULTIPLIER ** (trade['dca_level'] + 1)
             new_size_usdt = trade['trade_size'] * multiplier_now
             new_qty = round_step(new_size_usdt / curr_price, info['qty_step'])
             
+            # DCA ORDER
             res = api_request("POST", "/openApi/swap/v2/trade/order", {
-                "symbol": symbol, "side": "BUY" if trade['direction'] == "LONG" else "SELL",
-                "positionSide": trade['direction'], "type": "MARKET", "quantity": str(new_qty)
+                "symbol": symbol, "side": "SELL", "positionSide": "SHORT", 
+                "type": "MARKET", "quantity": str(new_qty)
             })
             
             if res and res.get("code") == 0:
-                time.sleep(3) # Warte auf Exchange
+                time.sleep(3)
                 
-                # Update nach Kauf
                 pos_upd = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
                 new_avg = avg_price
                 new_total = current_qty
@@ -238,20 +246,17 @@ def manage_open_trade(trade):
                      for p in pos_upd["data"]:
                         if p["symbol"] == symbol:
                             new_avg = float(p.get("avgPrice", avg_price))
-                            new_total = float(p.get("positionAmt", current_qty))
+                            new_total = abs(float(p.get("positionAmt", current_qty)))
 
-                update_dca(trade['id'], trade['dca_level'] + 1, new_avg, abs(new_total))
-                update_tp_to_breakeven(symbol, trade['direction'], new_avg, new_total)
+                update_dca(trade['id'], trade['dca_level'] + 1, new_avg, new_total)
+                update_tp_to_breakeven(symbol, new_avg, new_total)
                 
-                send_telegram(f"📉 <b>DCA BUY</b> ({trade['dca_level']+1}/{DCA_MAX_STEPS})\nSymbol: {symbol}\nAvg: {new_avg}")
-
-    # --- (VIRTUAL EXIT WURDE ENTFERNT) ---
-    # Der Bot schließt nicht mehr selbstständig. Nur noch Exchange TP/SL.
+                send_telegram(f"📉 <b>SHORT DCA</b> ({trade['dca_level']+1}/{DCA_MAX_STEPS})\nSymbol: {symbol}\nAvg: {new_avg}")
 
 # --- MAIN LOOP ---
 if __name__ == "__main__":
     init_db()
-    log("Worker v7 Started (Robust DCA Only).")
+    log("Worker v10 Started (Short Only, NO SL).")
     
     while True:
         try:

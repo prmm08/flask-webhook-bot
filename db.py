@@ -21,6 +21,7 @@ def init_db():
     if not conn: return
     try:
         cur = conn.cursor()
+        # Tabelle bleibt gleich, SL Spalte existiert noch, wird aber ignoriert
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 id SERIAL PRIMARY KEY,
@@ -44,39 +45,19 @@ def init_db():
         print(f"Init DB Error: {e}")
     finally:
         conn.close()
-        
-# FÜGE DAS ZU DEINER db.py HINZU
-
-def is_symbol_active(symbol):
-    """Prüft, ob für dieses Symbol schon ein Trade läuft (OPEN oder PENDING)"""
-    conn = get_conn()
-    if not conn: return False
-    try:
-        cur = conn.cursor()
-        # Wir suchen nach Trades, die NICHT geschlossen oder fehlerhaft sind
-        cur.execute("""
-            SELECT id FROM trades 
-            WHERE symbol = %s AND status IN ('OPEN', 'PENDING') 
-            LIMIT 1
-        """, (symbol,))
-        return cur.fetchone() is not None
-    except Exception as e:
-        print(f"DB Check Error: {e}")
-        return True # Im Zweifel lieber blockieren als doppelt kaufen
-    finally:
-        conn.close()
 
 def add_pending_trade(data):
     conn = get_conn()
     if not conn: return
     try:
         cur = conn.cursor()
+        # WICHTIG: Wir fügen bei sl_percent hart eine 0 ein
         cur.execute("""
             INSERT INTO trades (symbol, direction, leverage, trade_size, tp_percent, sl_percent, status)
-            VALUES (%s, %s, %s, %s, %s, %s, 'PENDING')
+            VALUES (%s, %s, %s, %s, %s, 0, 'PENDING')
         """, (
             data['symbol'], data['direction'], data['leverage'], 
-            data['trade_size'], data['tp_percent'], data['sl_percent']
+            data['trade_size'], data['tp_percent']
         ))
         conn.commit()
     finally:
@@ -163,7 +144,6 @@ def get_open_trade_count():
         conn.close()
 
 def check_trade_exists(trade_id):
-    """ZOMBIE CHECK: Prüft ob Trade noch in DB ist"""
     conn = get_conn()
     if not conn: return False
     try:
@@ -171,5 +151,21 @@ def check_trade_exists(trade_id):
         cur.execute("SELECT id FROM trades WHERE id = %s", (trade_id,))
         return cur.fetchone() is not None
     except: return False
+    finally:
+        conn.close()
+
+def is_symbol_active(symbol):
+    conn = get_conn()
+    if not conn: return False
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id FROM trades 
+            WHERE symbol = %s AND status IN ('OPEN', 'PENDING') 
+            LIMIT 1
+        """, (symbol,))
+        return cur.fetchone() is not None
+    except Exception as e:
+        return True 
     finally:
         conn.close()
