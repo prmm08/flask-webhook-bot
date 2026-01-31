@@ -79,7 +79,7 @@ def webhook():
         "symbol": symbol,
         "direction": direction,
         "leverage": int(data.get("leverage", 20)),
-        "trade_size": float(data.get("trade_size", 200)),
+        "trade_size": float(data.get("trade_size", 100)),
         "tp_percent": float(data.get("tp_percent", 0.5)),
         # SL ist 0
     }
