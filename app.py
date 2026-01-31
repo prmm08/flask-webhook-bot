@@ -5,7 +5,7 @@ from db import add_pending_trade, init_db, get_open_trade_count, is_symbol_activ
 app = Flask(__name__)
 
 # --- KONFIGURATION ---
-MAX_OPEN_POSITIONS = 20 
+MAX_OPEN_POSITIONS = 15 
 
 init_db()
 
