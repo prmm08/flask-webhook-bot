@@ -6,7 +6,7 @@ import requests  # <--- WICHTIG: Das brauchen wir zum Senden
 app = Flask(__name__)
 
 # --- KONFIGURATION ---
-MAX_OPEN_POSITIONS = 30  # Dein Limit
+MAX_OPEN_POSITIONS = 20  # Dein Limit
 
 # Telegram Config (Muss auch hier in app.py stehen!)
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
