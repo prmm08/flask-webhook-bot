@@ -6,12 +6,15 @@ import requests
 import urllib.parse
 from math import floor
 from datetime import datetime, timezone
-from db import get_pending_trades, get_open_trades, update_trade_execution, update_dca, close_trade, fail_trade, init_db, check_trade_exists
+from db import get_pending_trades, get_open_trades, update_trade_execution, update_dca, close_trade, fail_trade, init_db, check_trade_exists, get_conn # <--- get_conn importieren
 
 # --- KONFIGURATION ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
+
+# WICHTIG: Das Limit muss auch hier bekannt sein!
+MAX_OPEN_POSITIONS = 20
 
 # Telegram
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -20,8 +23,8 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # DCA Settings
 DCA_DEVIATION = 5.0     
 DCA_MULTIPLIER = 2.0    
-DCA_MAX_STEPS = 4       
-DCA_FEES_BUFFER = 0.1  # Nur für DCA Fälle (Level > 0)
+DCA_MAX_STEPS = 5       
+DCA_FEES_BUFFER = 0.15  
 DCA_COOLDOWN_SEC = 60   
 
 def log(msg):
@@ -69,57 +72,49 @@ def round_step(value, step):
     if not step: return value
     return round(floor(value * (1/step) + 0.00000001) / (1/step), 8)
 
-# --- INTELLIGENTES TP MANAGEMENT (ZENTRALISIERT) ---
+# --- SPECIAL DB HELPER ---
+def get_strict_open_count():
+    """Zählt NUR Trades, die wirklich 'OPEN' sind (Geld im Markt)."""
+    conn = get_conn()
+    if not conn: return 999 # Sicherheits-Blocker
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as count FROM trades WHERE status = 'OPEN'")
+        res = cur.fetchone()
+        return res['count'] if res else 0
+    except: return 999
+    finally:
+        conn.close()
 
+# --- TP MANAGEMENT ---
 def set_robust_tp(symbol, avg_price, total_qty, current_level, target_tp_percent):
-    """
-    Setzt den TP basierend auf dem Level:
-    - Level 0: Nimm target_tp_percent (z.B. 5%)
-    - Level > 0: Nimm DCA_FEES_BUFFER (Break-Even)
-    
-    Nutzt CancelAllOrders + Retry Loop für maximale Sicherheit.
-    """
-    
-    # 1. ENTSCHEIDUNG: WELCHER TP?
     is_dca_active = current_level > 0
-    
     if is_dca_active:
-        # DCA Fall: Break-Even + Fees
         percent = DCA_FEES_BUFFER
         tp_type_str = "Break-Even"
     else:
-        # Normalfall: User Wunsch (z.B. 5%)
         percent = target_tp_percent
         tp_type_str = f"Target ({percent}%)"
 
     log(f"   [TP LOGIC] {symbol} (Level {current_level}) -> Setze {tp_type_str} TP...")
-
-    # 2. CALCULATION (SHORT ONLY)
     info = get_symbol_info(symbol)
-    # Short TP: Entry * (1 - percent)
     tp_price = avg_price * (1 - percent/100)
     tp_price = round_step(tp_price, info['price_step'])
     qty_str = str(round_step(abs(total_qty), info['qty_step']))
 
-    # 3. CLEANUP (ALTE ORDERS LÖSCHEN)
+    # Cleanup
     orders_cleared = False
     for i in range(3):
         api_request("POST", "/openApi/swap/v2/trade/cancelAllOrders", {"symbol": symbol})
         time.sleep(1) 
-        # Check ob leer
         check = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
-        if check and "data" in check and "orders" in check["data"]:
-            if len(check["data"]["orders"]) == 0:
-                orders_cleared = True
-                break
-        else:
+        if check and "data" in check and "orders" in check["data"] and len(check["data"]["orders"]) == 0:
+            orders_cleared = True
+            break
+        elif not check or "data" not in check:
             orders_cleared = True
             break
             
-    if not orders_cleared:
-        log("   [WARN] Konnte nicht alle alten Orders löschen. Versuche trotzdem...")
-
-    # 4. PLACE ORDER (MIT RETRY)
     payload = {
         "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
         "type": "TAKE_PROFIT_MARKET", 
@@ -130,14 +125,12 @@ def set_robust_tp(symbol, avg_price, total_qty, current_level, target_tp_percent
     for attempt in range(3):
         res = api_request("POST", "/openApi/swap/v2/trade/order", payload)
         if res and res.get("code") == 0:
-            log(f"   [TP SET] ✅ {symbol} TP @ {tp_price} ({tp_type_str})")
+            log(f"   [TP SET] ✅ {symbol} TP @ {tp_price}")
             return
         elif res and res.get("code") == 110407:
-            log(f"   [BUSY] TP existiert noch. Retry {attempt+1}...")
             api_request("POST", "/openApi/swap/v2/trade/cancelAllOrders", {"symbol": symbol})
             time.sleep(2)
         else:
-            log(f"   [TP FAIL] {res}")
             break
 
 # --- EXECUTION LOGIC ---
@@ -147,9 +140,22 @@ def execute_pending_trade(trade):
 
     symbol = trade['symbol']
     if trade['direction'] != "SHORT":
-        log(f"[SKIP] Ignoriere {symbol} (Ist LONG).")
         fail_trade(trade['id'])
         return
+
+    # --- FINALER LIMIT CHECK (Gatekeeper) ---
+    # Wir prüfen JETZT (bevor wir kaufen), wie viele wirklich offen sind.
+    real_open = get_strict_open_count()
+    if real_open >= MAX_OPEN_POSITIONS:
+        log(f"[ABORT] Limit erreicht ({real_open}/{MAX_OPEN_POSITIONS}). {symbol} wird übersprungen.")
+        
+        # Trade als "SKIPPED" oder "ERROR" markieren, damit er aus PENDING rausfliegt
+        fail_trade(trade['id']) 
+        
+        # Telegram Warnung
+        send_telegram(f"⛔ <b>WORKER REJECT</b>\n{symbol} cancelled.\nMax Limit ({MAX_OPEN_POSITIONS}) reached.")
+        return
+    # ----------------------------------------
 
     log(f"--- START SHORT: {symbol} ---")
     
@@ -162,7 +168,6 @@ def execute_pending_trade(trade):
     info = get_symbol_info(symbol)
     qty = round_step(trade['trade_size'] / price, info['qty_step'])
     
-    # ENTRY ORDER
     res = api_request("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol, "side": "SELL", "positionSide": "SHORT", 
         "type": "MARKET", "quantity": str(qty)
@@ -171,11 +176,7 @@ def execute_pending_trade(trade):
     if res and res.get("code") == 0:
         log(f"   [FILLED] Short Entry @ {price}")
         update_trade_execution(trade['id'], price, qty)
-        
-        # NEU: Wir nutzen jetzt auch hier die robuste TP Funktion
-        # Level ist 0 -> Er nimmt trade['tp_percent'] (z.B. 5%)
         set_robust_tp(symbol, price, qty, 0, trade['tp_percent'])
-        
     else:
         log(f"   [FAIL] {res}")
         fail_trade(trade['id'])
@@ -204,16 +205,14 @@ def manage_open_trade(trade):
         close_trade(trade['id'])
         return
 
-    # 2. WATCHDOG (Plan B)
+    # 2. WATCHDOG
     quote_res = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     if not quote_res: return
     curr_price = float(quote_res["data"]["price"])
     
-    # Nur eingreifen, wenn wir im DCA Modus (Level > 0) sind!
     if trade['dca_level'] > 0 and avg_price > 0:
         target_price = avg_price * (1 - DCA_FEES_BUFFER/100)
         if curr_price <= target_price:
-            log(f"[WATCHDOG] 🚨 {symbol} Short im Ziel! Force Close.")
             res = api_request("POST", "/openApi/swap/v2/trade/order", {
                 "symbol": symbol, "side": "BUY", "positionSide": "SHORT", 
                 "type": "MARKET", "closePosition": "true"
@@ -259,22 +258,17 @@ def manage_open_trade(trade):
 
                 new_level = trade['dca_level'] + 1
                 update_dca(trade['id'], new_level, new_avg, new_total)
-                
-                # UPDATE TP: Da Level jetzt > 0 ist, schaltet er automatisch auf Break-Even um
                 set_robust_tp(symbol, new_avg, new_total, new_level, trade['tp_percent'])
                 
                 send_telegram(f"📉 <b>SHORT DCA</b> ({new_level}/{DCA_MAX_STEPS})\nSymbol: {symbol}\nAvg: {new_avg}")
 
-# --- MAIN LOOP ---
 if __name__ == "__main__":
     init_db()
-    log("Worker v12 Started (Smart TP Management).")
-    
+    log(f"Worker v13 Started (Strict Limit: {MAX_OPEN_POSITIONS}).")
     while True:
         try:
             pending = get_pending_trades()
             for t in pending: execute_pending_trade(t)
-            
             active = get_open_trades()
             for t in active: manage_open_trade(t)
         except Exception as e:
