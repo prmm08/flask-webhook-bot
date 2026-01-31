@@ -20,7 +20,7 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # DCA Settings
 DCA_DEVIATION = 5.0     # 5% Abstand zum Durchschnitt
 DCA_MULTIPLIER = 2.0    # Martingale (x2)
-DCA_MAX_STEPS = 5       # Max 5 Nachkäufe
+DCA_MAX_STEPS = 4       # Max 5 Nachkäufe
 DCA_FEES_BUFFER = 0.15  # Ziel: Break Even + 0.15%
 DCA_COOLDOWN_SEC = 60   # Zwingende Pause nach jedem Kauf
 
