@@ -136,7 +136,9 @@ def get_open_trade_count():
     if not conn: return 0
     try:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) as count FROM trades WHERE status = 'OPEN'")
+        # WICHTIG: Wir zählen jetzt OPEN UND PENDING zusammen!
+        # Das verhindert, dass die Warteschlange das Limit sprengt.
+        cur.execute("SELECT COUNT(*) as count FROM trades WHERE status IN ('OPEN', 'PENDING')")
         result = cur.fetchone()
         return result['count'] if result else 0
     except: return 0
