@@ -23,7 +23,7 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # DCA Settings
 DCA_DEVIATION = 5.0     
 DCA_MULTIPLIER = 2.0    
-DCA_MAX_STEPS = 5       
+DCA_MAX_STEPS = 4       
 DCA_FEES_BUFFER = 0.15  
 DCA_COOLDOWN_SEC = 60   
 
