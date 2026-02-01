@@ -6,14 +6,12 @@ import requests
 import urllib.parse
 from math import floor
 from datetime import datetime, timezone
-from db import get_pending_trades, get_open_trades, update_trade_execution, update_dca, close_trade, fail_trade, init_db, check_trade_exists, get_conn # <--- get_conn importieren
+from db import get_pending_trades, get_open_trades, update_trade_execution, update_dca, close_trade, fail_trade, init_db, check_trade_exists, get_conn
 
 # --- KONFIGURATION ---
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
-
-# WICHTIG: Das Limit muss auch hier bekannt sein!
 MAX_OPEN_POSITIONS = 20
 
 # Telegram
@@ -24,7 +22,7 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DCA_DEVIATION = 5.0     
 DCA_MULTIPLIER = 2.0    
 DCA_MAX_STEPS = 4       
-DCA_FEES_BUFFER = 0.15  
+DCA_FEES_BUFFER = 0.1  
 DCA_COOLDOWN_SEC = 60   
 
 def log(msg):
@@ -72,11 +70,11 @@ def round_step(value, step):
     if not step: return value
     return round(floor(value * (1/step) + 0.00000001) / (1/step), 8)
 
-# --- SPECIAL DB HELPER ---
+# --- SPECIAL HELPERS ---
+
 def get_strict_open_count():
-    """Zählt NUR Trades, die wirklich 'OPEN' sind (Geld im Markt)."""
     conn = get_conn()
-    if not conn: return 999 # Sicherheits-Blocker
+    if not conn: return 999 
     try:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) as count FROM trades WHERE status = 'OPEN'")
@@ -86,7 +84,26 @@ def get_strict_open_count():
     finally:
         conn.close()
 
+def wait_for_position_update(symbol, old_qty):
+    """Wartet auf BingX Update der Positionsgröße"""
+    log(f"   [SYNC WAIT] Warte auf BingX Update für {symbol}...")
+    for i in range(10): 
+        time.sleep(1.5) 
+        res = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
+        if res and "data" in res:
+            for p in res["data"]:
+                if p["symbol"] == symbol:
+                    curr_qty = abs(float(p["positionAmt"]))
+                    curr_avg = float(p["avgPrice"])
+                    if curr_qty != old_qty:
+                        log(f"   [SYNC OK] Daten frisch! Avg: {curr_avg}")
+                        return curr_avg, curr_qty
+        log(f"   ... warte ({i+1}/10)")
+    log("   [SYNC FAIL] Nutze alte Daten (Risiko!).")
+    return 0.0, 0.0 
+
 # --- TP MANAGEMENT ---
+
 def set_robust_tp(symbol, avg_price, total_qty, current_level, target_tp_percent):
     is_dca_active = current_level > 0
     if is_dca_active:
@@ -96,13 +113,14 @@ def set_robust_tp(symbol, avg_price, total_qty, current_level, target_tp_percent
         percent = target_tp_percent
         tp_type_str = f"Target ({percent}%)"
 
-    log(f"   [TP LOGIC] {symbol} (Level {current_level}) -> Setze {tp_type_str} TP...")
     info = get_symbol_info(symbol)
     tp_price = avg_price * (1 - percent/100)
     tp_price = round_step(tp_price, info['price_step'])
     qty_str = str(round_step(abs(total_qty), info['qty_step']))
+    
+    log(f"   [TP LOGIC] {symbol} (Lvl {current_level}) -> Target: {tp_price} ({tp_type_str})")
 
-    # Cleanup
+    # Cleanup (Cancel All)
     orders_cleared = False
     for i in range(3):
         api_request("POST", "/openApi/swap/v2/trade/cancelAllOrders", {"symbol": symbol})
@@ -131,6 +149,7 @@ def set_robust_tp(symbol, avg_price, total_qty, current_level, target_tp_percent
             api_request("POST", "/openApi/swap/v2/trade/cancelAllOrders", {"symbol": symbol})
             time.sleep(2)
         else:
+            log(f"   [TP FAIL] {res}")
             break
 
 # --- EXECUTION LOGIC ---
@@ -143,19 +162,12 @@ def execute_pending_trade(trade):
         fail_trade(trade['id'])
         return
 
-    # --- FINALER LIMIT CHECK (Gatekeeper) ---
-    # Wir prüfen JETZT (bevor wir kaufen), wie viele wirklich offen sind.
     real_open = get_strict_open_count()
     if real_open >= MAX_OPEN_POSITIONS:
-        log(f"[ABORT] Limit erreicht ({real_open}/{MAX_OPEN_POSITIONS}). {symbol} wird übersprungen.")
-        
-        # Trade als "SKIPPED" oder "ERROR" markieren, damit er aus PENDING rausfliegt
-        fail_trade(trade['id']) 
-        
-        # Telegram Warnung
-        send_telegram(f"⛔ <b>WORKER REJECT</b>\n{symbol} cancelled.\nMax Limit ({MAX_OPEN_POSITIONS}) reached.")
+        log(f"[ABORT] Limit erreicht ({real_open}/{MAX_OPEN_POSITIONS}). {symbol} cancelled.")
+        fail_trade(trade['id'])
+        # KEIN TELEGRAM MEHR HIER
         return
-    # ----------------------------------------
 
     log(f"--- START SHORT: {symbol} ---")
     
@@ -213,6 +225,7 @@ def manage_open_trade(trade):
     if trade['dca_level'] > 0 and avg_price > 0:
         target_price = avg_price * (1 - DCA_FEES_BUFFER/100)
         if curr_price <= target_price:
+            log(f"[WATCHDOG] 🚨 {symbol} hat BE erreicht! Force Close.")
             res = api_request("POST", "/openApi/swap/v2/trade/order", {
                 "symbol": symbol, "side": "BUY", "positionSide": "SHORT", 
                 "type": "MARKET", "closePosition": "true"
@@ -245,26 +258,32 @@ def manage_open_trade(trade):
             })
             
             if res and res.get("code") == 0:
-                time.sleep(3)
+                # SYNC WAIT
+                fresh_avg, fresh_qty = wait_for_position_update(symbol, current_qty)
                 
-                pos_upd = api_request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
-                new_avg = avg_price
-                new_total = current_qty
-                if pos_upd and pos_upd.get("data"):
-                     for p in pos_upd["data"]:
-                        if p["symbol"] == symbol:
-                            new_avg = float(p.get("avgPrice", avg_price))
-                            new_total = abs(float(p.get("positionAmt", current_qty)))
-
-                new_level = trade['dca_level'] + 1
-                update_dca(trade['id'], new_level, new_avg, new_total)
-                set_robust_tp(symbol, new_avg, new_total, new_level, trade['tp_percent'])
-                
-                send_telegram(f"📉 <b>SHORT DCA</b> ({new_level}/{DCA_MAX_STEPS})\nSymbol: {symbol}\nAvg: {new_avg}")
+                if fresh_avg > 0:
+                    new_level = trade['dca_level'] + 1
+                    update_dca(trade['id'], new_level, fresh_avg, fresh_qty)
+                    
+                    # Robust TP
+                    set_robust_tp(symbol, fresh_avg, fresh_qty, new_level, trade['tp_percent'])
+                    
+                    send_telegram(f"📉 <b>SHORT DCA</b> ({new_level}/{DCA_MAX_STEPS})\nSymbol: {symbol}\nNew Avg: {fresh_avg}")
+                    
+                    # Lucky Exit Check
+                    target_check = fresh_avg * (1 - DCA_FEES_BUFFER/100)
+                    if curr_price <= target_check:
+                         log(f"[LUCKY EXIT] DCA hat uns direkt ins Plus gebracht! Schließe.")
+                         api_request("POST", "/openApi/swap/v2/trade/order", {
+                            "symbol": symbol, "side": "BUY", "positionSide": "SHORT", 
+                            "type": "MARKET", "closePosition": "true"
+                        })
+                else:
+                    log("[CRITICAL] Konnte neue DCA Daten nicht syncen.")
 
 if __name__ == "__main__":
     init_db()
-    log(f"Worker v13 Started (Strict Limit: {MAX_OPEN_POSITIONS}).")
+    log(f"Worker v15 Started (Silent Mode + Limit Check).")
     while True:
         try:
             pending = get_pending_trades()

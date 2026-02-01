@@ -1,39 +1,13 @@
 from flask import Flask, request, jsonify
 from db import add_pending_trade, init_db, get_open_trade_count, is_symbol_active
 import os
-import requests  # <--- WICHTIG: Das brauchen wir zum Senden
 
 app = Flask(__name__)
 
 # --- KONFIGURATION ---
-MAX_OPEN_POSITIONS = 20  # Dein Limit
-
-# Telegram Config (Muss auch hier in app.py stehen!)
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+MAX_OPEN_POSITIONS = 20 
 
 init_db()
-
-# --- HELPER: TELEGRAM SENDEN ---
-def send_telegram_warning(symbol, current, max_limit):
-    """Sendet eine Warnung, wenn das Limit voll ist"""
-    if not TG_TOKEN or not TG_CHAT_ID: return
-    try:
-        msg = (
-            f"⛔ <b>SIGNAL REJECTED</b>\n"
-            f"Symbol: {symbol}\n"
-            f"Reason: Portfolio Full\n"
-            f"Status: {current}/{max_limit} Slots used."
-        )
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        data = {
-            "chat_id": TG_CHAT_ID, 
-            "text": msg, 
-            "parse_mode": "HTML"
-        }
-        requests.post(url, data=data, timeout=3)
-    except Exception as e:
-        print(f"[TG ERROR] {e}")
 
 @app.route("/", methods=["GET"])
 @app.route("/ping", methods=["GET"])
@@ -57,21 +31,16 @@ def webhook():
     
     direction = "SHORT"
 
-    # 3. DUPLIKAT-CHECK (Läuft der Coin schon?)
+    # 3. DUPLIKAT-CHECK
     if is_symbol_active(symbol):
         print(f"[IGNORE] Signal für {symbol} ignoriert (bereits aktiv).", flush=True)
         return jsonify({"status": "ignored", "reason": "symbol_already_active"}), 200
 
-    # 4. GLOBAL LIMIT CHECK (HIER PASSIERT ES!)
+    # 4. GLOBAL LIMIT CHECK
     current_count = get_open_trade_count()
-    
-    # Wenn wir 3 oder mehr haben...
     if current_count >= MAX_OPEN_POSITIONS:
+        # Nur noch Print im Log, keine Telegram Nachricht mehr
         print(f"[LIMIT] Signal für {symbol} blockiert. Limit {MAX_OPEN_POSITIONS} erreicht.", flush=True)
-        
-        # ---> SENDE TELEGRAM NACHRICHT <---
-        send_telegram_warning(symbol, current_count, MAX_OPEN_POSITIONS)
-        
         return jsonify({"status": "ignored", "reason": "global_limit_reached"}), 200
 
     # 5. TRADE ERSTELLEN
@@ -81,7 +50,6 @@ def webhook():
         "leverage": int(data.get("leverage", 20)),
         "trade_size": float(data.get("trade_size", 100)),
         "tp_percent": float(data.get("tp_percent", 0.5)),
-        # SL ist 0
     }
     
     try:
