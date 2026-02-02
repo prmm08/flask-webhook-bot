@@ -137,9 +137,9 @@ def check_conditions(df, symbol):
     
     signal_reason = None
 
-    # --- STRATEGIE 1: RSI CROSS DOWN 70 ---
-    # RSI war über 70 und ist jetzt darunter gefallen
-    if prev_rsi >= 70 and curr_rsi < 70:
+    # --- STRATEGIE 1: RSI CROSS DOWN 60 ---
+    # RSI war über 60 und ist jetzt darunter gefallen
+    if prev_rsi >= 60 and curr_rsi < 60:
         signal_reason = f"RSI Cross Down (Prev: {prev_rsi:.1f}, Curr: {curr_rsi:.1f})"
 
     # --- STRATEGIE 2: SIMPLE BEARISH DIVERGENCE CHECK ---
