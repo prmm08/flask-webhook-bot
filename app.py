@@ -5,7 +5,7 @@ import os
 app = Flask(__name__)
 
 # --- KONFIGURATION ---
-MAX_OPEN_POSITIONS = 30 
+MAX_OPEN_POSITIONS = 20 
 
 init_db()
 
@@ -48,7 +48,7 @@ def webhook():
         "symbol": symbol,
         "direction": direction,
         "leverage": int(data.get("leverage", 20)),
-        "trade_size": float(data.get("trade_size", 50)),
+        "trade_size": float(data.get("trade_size", 200)),
         "tp_percent": float(data.get("tp_percent", 0.5)),
     }
     
