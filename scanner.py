@@ -91,10 +91,23 @@ def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def get_binance_data(symbol, limit=50):
-    """Holt Kerzendaten von Binance (Public API, keine Keys nötig)"""
+    """Holt Kerzendaten von Binance Futures"""
     try:
-        exchange = ccxt.binance()
+        # HIER IST DER FIX: Wir zwingen ccxt in den Futures-Modus
+        exchange = ccxt.binance({
+            'options': {
+                'defaultType': 'future' 
+            }
+        })
+        
+        # ccxt kümmert sich um die Details.
+        # WICHTIG: Sollte ein Symbol trotzdem nicht gehen, prüfe ob es "1000" im Namen hat 
+        # (z.B. 1000PEPE/USDT statt PEPE/USDT bei Futures).
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=limit)
+        
+        if not ohlcv:
+            return None
+
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['close'] = df['close'].astype(float)
         return df
