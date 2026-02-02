@@ -81,7 +81,7 @@ WATCHLIST = [
 
 TIMEFRAME = '1m'       # 1-Minute Kerzen für schnelle Signale
 RSI_LENGTH = 14
-CHECK_INTERVAL = 30    # Alle 30 Sekunden prüfen
+CHECK_INTERVAL = 15    # Alle 15 Sekunden prüfen
 
 # Cooldown: Verhindert Spam. Wenn Signal gesendet, warte X Sekunden für diesen Coin.
 SIGNAL_COOLDOWN = 300  # 5 Minuten Ruhe pro Coin nach Signal
