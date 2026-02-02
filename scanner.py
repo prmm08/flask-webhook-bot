@@ -81,7 +81,7 @@ WATCHLIST = [
 
 TIMEFRAME = '1m'       # 1-Minute Kerzen für schnelle Signale
 RSI_LENGTH = 14
-CHECK_INTERVAL = 15    # Alle 30 Sekunden prüfen
+CHECK_INTERVAL = 30    # Alle 30 Sekunden prüfen
 
 # Cooldown: Verhindert Spam. Wenn Signal gesendet, warte X Sekunden für diesen Coin.
 SIGNAL_COOLDOWN = 300  # 5 Minuten Ruhe pro Coin nach Signal
@@ -171,7 +171,7 @@ def send_webhook(symbol, reason):
 # --- MAIN LOOP ---
 if __name__ == "__main__":
     log(f"Markt-Scanner gestartet. Überwache {len(WATCHLIST)} Coins auf {TIMEFRAME}.")
-    log("Strategie: RSI Cross Down 60 & Bearish Div.")
+    log("Strategie: RSI Cross Down 70 & Bearish Div.")
 
     while True:
         for symbol in WATCHLIST:
