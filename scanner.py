@@ -3,14 +3,13 @@ import pandas as pd
 import pandas_ta as ta
 import requests
 import time
-import os
 from datetime import datetime
 
-# --- KONFIGURATION --- #
-# Deine Render Webhook URL (wo app.py läuft)
+# --- KONFIGURATION ---
+# Deine Render Webhook URL
 WEBHOOK_URL = "https://flask-webhook-bot-1.onrender.com/testorder" 
 
-# Welche Coins sollen überwacht werden?
+# HIER DEINE LISTE REINKOPIEREN:
 WATCHLIST = [
     'AIN/USDT',
     'AIXBT/USDT',
@@ -79,83 +78,94 @@ WATCHLIST = [
     'ZKJ/USDT'
 ]
 
-TIMEFRAME = '1m'       # 1-Minute Kerzen für schnelle Signale
-RSI_LENGTH = 14
-CHECK_INTERVAL = 15    # Alle 15 Sekunden prüfen
+TIMEFRAME = '1m'
+CHECK_INTERVAL = 15    
 
-# Cooldown: Verhindert Spam. Wenn Signal gesendet, warte X Sekunden für diesen Coin.
-SIGNAL_COOLDOWN = 300  # 5 Minuten Ruhe pro Coin nach Signal
+# --- RSI SETTINGS ---
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70
+
+# --- DIVERGENCE SETTINGS ---
+PIVOT_LEFT = 5      
+PIVOT_RIGHT = 5     
+RANGE_MIN = 5       
+RANGE_MAX = 60      
+
+# Cooldown
+SIGNAL_COOLDOWN = 300  
 last_signal_time = {}
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-def get_binance_data(symbol, limit=50):
-    """Holt Kerzendaten von Binance Futures"""
+def get_binance_data(symbol, limit=150):
     try:
-        # HIER IST DER FIX: Wir zwingen ccxt in den Futures-Modus
-        exchange = ccxt.binance({
-            'options': {
-                'defaultType': 'future' 
-            }
-        })
+        # Futures Modus
+        exchange = ccxt.binance({'options': {'defaultType': 'future'}})
         
-        # ccxt kümmert sich um die Details.
-        # WICHTIG: Sollte ein Symbol trotzdem nicht gehen, prüfe ob es "1000" im Namen hat 
-        # (z.B. 1000PEPE/USDT statt PEPE/USDT bei Futures).
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=limit)
-        
-        if not ohlcv:
-            return None
+        if not ohlcv: return None
 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['close'] = df['close'].astype(float)
+        df['high'] = df['high'].astype(float)
         return df
     except Exception as e:
         log(f"Data Error {symbol}: {e}")
         return None
 
 def calculate_indicators(df):
-    """Berechnet RSI"""
-    # RSI berechnen mit pandas_ta
-    df['rsi'] = df.ta.rsi(length=RSI_LENGTH)
+    df['rsi'] = df.ta.rsi(length=RSI_PERIOD, close=df['close'])
     return df
 
-def check_conditions(df, symbol):
-    """Prüft auf Short Signale"""
-    if df is None or len(df) < RSI_LENGTH + 2: return None
-
-    # Wir schauen uns die vorletzte Kerze an (die gerade abgeschlossen ist)
-    # und die aktuelle (die noch läuft).
+# --- LOGIK 1: RSI CROSS DOWN ---
+def check_rsi_cross_down(df):
+    if len(df) < 2: return None
     
-    # Indizes: -1 = Aktuelle Kerze, -2 = Letzte fertige Kerze, -3 = Vorletzte
     curr_rsi = df['rsi'].iloc[-1]
     prev_rsi = df['rsi'].iloc[-2]
     
-    curr_price = df['close'].iloc[-1]
-    prev_high = df['high'].iloc[-2]
+    if prev_rsi >= RSI_OVERBOUGHT and curr_rsi < RSI_OVERBOUGHT:
+        return f"RSI Cross Down ({prev_rsi:.1f} -> {curr_rsi:.1f})"
+    return None
+
+# --- LOGIK 2: BEARISH DIVERGENCE ---
+def is_pivot_high(df, index, left, right):
+    if index - left < 0 or index + right >= len(df): return False
+    current_high = df['high'].iloc[index]
+    for i in range(1, left + 1):
+        if df['high'].iloc[index - i] > current_high: return False
+    for i in range(1, right + 1):
+        if df['high'].iloc[index + i] > current_high: return False       
+    return True
+
+def check_bearish_divergence(df):
+    if len(df) < RANGE_MAX + PIVOT_RIGHT + 5: return None
+
+    curr_idx = len(df) - 1 - PIVOT_RIGHT 
     
-    signal_reason = None
+    if not is_pivot_high(df, curr_idx, PIVOT_LEFT, PIVOT_RIGHT):
+        return None
 
-    # --- STRATEGIE 1: RSI CROSS DOWN 70 ---
-    # RSI war über 70 und ist jetzt darunter gefallen
-    if prev_rsi >= 70 and curr_rsi < 70:
-        signal_reason = f"RSI Cross Down (Prev: {prev_rsi:.1f}, Curr: {curr_rsi:.1f})"
-
-    # --- STRATEGIE 2: SIMPLE BEARISH DIVERGENCE CHECK ---
-    # Wenn RSI extrem hoch war (>70), Preis steigt, aber RSI fällt
-    # (Dies ist eine vereinfachte Divergenz-Prüfung)
-    elif prev_rsi > 65 and curr_rsi < prev_rsi and curr_price > prev_high:
-         # Nur signalisieren, wenn RSI auch wirklich fällt
-         if curr_rsi < 68: # Filter: Nicht zu früh shorten
-            signal_reason = "Potential Bearish Divergence"
-
-    return signal_reason
+    p1_price = df['high'].iloc[curr_idx]
+    p1_rsi = df['rsi'].iloc[curr_idx]
+    
+    start_search = curr_idx - RANGE_MIN
+    end_search = max(0, curr_idx - RANGE_MAX)
+    
+    for prev_idx in range(start_search, end_search, -1):
+        if is_pivot_high(df, prev_idx, PIVOT_LEFT, PIVOT_RIGHT):
+            p0_price = df['high'].iloc[prev_idx]
+            p0_rsi = df['rsi'].iloc[prev_idx]
+            
+            if p1_price > p0_price and p1_rsi < p0_rsi:
+                if p1_rsi > 50: 
+                    return f"Bearish Div (Price: {p1_price:.2f} > {p0_price:.2f} | RSI: {p1_rsi:.1f} < {p0_rsi:.1f})"
+    return None
 
 def send_webhook(symbol, reason):
-    """Sendet das Signal an deinen eigenen Bot (app.py)"""
-    # Formatierung für app.py
-    clean_symbol = symbol.replace("/", "") # Macht BTCUSDT aus BTC/USDT
+    # Entfernt /USDT und ggf. 1000 für den Ticker im Webhook
+    clean_symbol = symbol.replace("/", "").replace("1000", "") 
     
     payload = {
         "ticker": clean_symbol,
@@ -163,36 +173,40 @@ def send_webhook(symbol, reason):
     }
     
     try:
-        log(f"🚀 SIGNAL für {symbol}: {reason} -> Sende an Webhook...")
+        log(f"🚀 SIGNAL für {symbol}: {reason}")
         requests.post(WEBHOOK_URL, json=payload, timeout=5)
     except Exception as e:
         log(f"Webhook Fail: {e}")
 
 # --- MAIN LOOP ---
 if __name__ == "__main__":
-    log(f"Markt-Scanner gestartet. Überwache {len(WATCHLIST)} Coins auf {TIMEFRAME}.")
-    log("Strategie: RSI Cross Down 70 & Bearish Div.")
-
+    log(f"Dual-Scanner gestartet (Watchlist: {len(WATCHLIST)} Coins).")
+    
     while True:
         for symbol in WATCHLIST:
-            # 1. Cooldown Check
             last_time = last_signal_time.get(symbol, 0)
             if (time.time() - last_time) < SIGNAL_COOLDOWN:
-                continue # Diesen Coin überspringen
+                continue 
 
-            # 2. Daten holen & Berechnen
-            df = get_binance_data(symbol)
+            df = get_binance_data(symbol, limit=150)
             if df is not None:
                 df = calculate_indicators(df)
                 
-                # 3. Prüfen
-                reason = check_conditions(df, symbol)
+                signal_reason = None
                 
-                if reason:
-                    # 4. Feuern
-                    send_webhook(symbol, reason)
-                    last_signal_time[symbol] = time.time() # Cooldown setzen
+                # Check 1
+                rsi_signal = check_rsi_cross_down(df)
+                if rsi_signal: signal_reason = rsi_signal
+                
+                # Check 2 (nur wenn Check 1 leer)
+                if not signal_reason:
+                    div_signal = check_bearish_divergence(df)
+                    if div_signal: signal_reason = div_signal
+                
+                if signal_reason:
+                    send_webhook(symbol, signal_reason)
+                    last_signal_time[symbol] = time.time()
             
-            time.sleep(1) # Kurz atmen zwischen Coins, um Binance Rate Limit nicht zu ärgern
+            time.sleep(1) 
 
         time.sleep(CHECK_INTERVAL)
