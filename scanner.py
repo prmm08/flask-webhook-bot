@@ -126,7 +126,7 @@ def check_rsi_cross_down(df):
     prev_rsi = df['rsi'].iloc[-2]
     
     if prev_rsi >= RSI_OVERBOUGHT and curr_rsi < RSI_OVERBOUGHT:
-        return f"RSI Cross Down ({prev_rsi:.1f} -> {curr_rsi:.1f})"
+        return f"RSI Crossing Down 70 ({prev_rsi:.1f} -> {curr_rsi:.1f})"
     return None
 
 # --- LOGIK 2: BEARISH DIVERGENCE ---
