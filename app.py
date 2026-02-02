@@ -5,7 +5,7 @@ import os
 app = Flask(__name__)
 
 # --- KONFIGURATION ---
-MAX_OPEN_POSITIONS = 20 
+MAX_OPEN_POSITIONS = 30 
 
 init_db()
 
