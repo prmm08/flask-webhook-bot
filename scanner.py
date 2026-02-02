@@ -8,7 +8,7 @@ from datetime import datetime
 
 # --- KONFIGURATION --- #
 # Deine Render Webhook URL (wo app.py läuft)
-WEBHOOK_URL = "https://flask-webhook-bot-1.onrender.com/test" 
+WEBHOOK_URL = "https://flask-webhook-bot-1.onrender.com/testorder" 
 
 # Welche Coins sollen überwacht werden?
 WATCHLIST = [
