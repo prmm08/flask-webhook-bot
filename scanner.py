@@ -159,11 +159,7 @@ def send_webhook(symbol, reason):
     
     payload = {
         "ticker": clean_symbol,
-        "direction": "SHORT",
-        "leverage": 20,       # Standard Leverage
-        "trade_size": 50,     # Standard Größe in USDT
-        "tp_percent": 1.5,    # Take Profit
-        "passphrase": "..."   # Falls du eine Passphrase nutzt (optional)
+        "direction": "SHORT"
     }
     
     try:
