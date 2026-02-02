@@ -12,7 +12,7 @@ from db import get_pending_trades, get_open_trades, update_trade_execution, upda
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
-MAX_OPEN_POSITIONS = 20
+MAX_OPEN_POSITIONS = 30
 
 # Telegram
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
