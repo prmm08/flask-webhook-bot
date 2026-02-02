@@ -30,7 +30,6 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def debug_log(prefix, data):
-    """Gibt rohe Daten für Debugging aus"""
     print(f"[DEBUG] {prefix}: {data}", flush=True)
 
 def send_telegram(message):
@@ -41,7 +40,7 @@ def send_telegram(message):
         }, timeout=5)
     except: pass
 
-# --- API HELPERS (MIT FULL LOGGING) ---
+# --- API HELPERS ---
 def get_sign(params):
     params["timestamp"] = str(int(time.time() * 1000))
     query_string = urllib.parse.urlencode(sorted(params.items()))
@@ -54,20 +53,16 @@ def api_request(method, endpoint, payload=None):
     url = f"{BINGX_BASE}{endpoint}?{query_with_sig}"
     headers = {"X-BX-APIKEY": API_KEY}
     
-    # DEBUG: Request Info
-    # debug_log("REQ_URL", url)
-    # debug_log("REQ_PAYLOAD", payload)
-    
     try:
         if method == "GET": r = requests.get(url, headers=headers, timeout=10)
         else: r = requests.post(url, headers=headers, timeout=10)
         
         response_json = r.json()
         
-        # DEBUG: Wenn es kein GET Request ist (also Order, Cancel etc), loggen wir die Antwort immer
-        if method == "POST":
-            debug_log(f"RESP ({endpoint})", response_json)
-            
+        # DEBUG: Wir loggen jetzt Fehler explizit
+        if response_json.get("code") != 0:
+             debug_log(f"API_FAIL ({endpoint})", response_json)
+
         return response_json
     except Exception as e:
         log(f"API CRITICAL ERROR: {e}")
@@ -112,50 +107,56 @@ def wait_for_position_update(symbol, old_qty):
                     curr_qty = abs(float(p["positionAmt"]))
                     curr_avg = float(p.get("avgPrice", 0))
                     if curr_qty != old_qty:
-                        log(f"   [SYNC OK] Daten frisch! Avg: {curr_avg} | Qty: {curr_qty}")
+                        log(f"   [SYNC OK] Daten frisch! Avg: {curr_avg}")
                         return curr_avg, curr_qty
         log(f"   ... warte ({i+1}/10)")
     log("   [SYNC FAIL] Nutze alte Daten.")
     return 0.0, 0.0 
 
-# --- ROBUST CLOSE FUNCTION (NEU) ---
+def cancel_all_orders_loop(symbol):
+    """Löscht Orders manuell nacheinander, da cancelAllOrders nicht existiert"""
+    log(f"   [CLEANUP] Lösche Orders für {symbol} manuell...")
+    
+    # Liste holen
+    res = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
+    if res and "data" in res and "orders" in res["data"]:
+        orders = res["data"]["orders"]
+        count = len(orders)
+        
+        if count == 0:
+            return True # Nichts zu tun
+            
+        for o in orders:
+            # Einzeln löschen
+            api_request("POST", "/openApi/swap/v2/trade/cancelOrder", {
+                "symbol": symbol, "orderId": o["orderId"]
+            })
+            
+        time.sleep(1) # Kurz warten bis Engine verarbeitet hat
+        return True
+    
+    return False
 
 def force_close_position(symbol, qty):
-    """Versucht die Position mit ALLEN Mitteln zu schließen"""
     log(f"   [CLOSE] Versuche Hard-Close für {symbol} (Qty: {qty})...")
     
-    # Methode 1: Standard Close Position Flag
+    # Methode 1
     payload_1 = {
         "symbol": symbol, "side": "BUY", "positionSide": "SHORT", 
         "type": "MARKET", "closePosition": "true"
     }
     res = api_request("POST", "/openApi/swap/v2/trade/order", payload_1)
+    if res and res.get("code") == 0: return True
     
-    if res and res.get("code") == 0:
-        log("   [CLOSE] Methode 1 (Flag) erfolgreich gesendet.")
-        return True
-    
-    # Wenn Methode 1 fehlschlägt, loggen wir warum und probieren Methode 2
-    debug_log("CLOSE_FAIL_1", res)
-    
-    log("   [CLOSE] Methode 1 fehlgeschlagen. Versuche Methode 2 (Explicit Order)...")
-    
-    # Methode 2: Explizite Gegen-Order
-    # WICHTIG: Wir müssen sicherstellen, dass wir nicht MEHR kaufen als wir Short sind
-    # (Reduce Only wäre ideal, aber BingX API V2 ist da manchmal eigen)
+    # Methode 2 (Explicit)
     payload_2 = {
         "symbol": symbol, "side": "BUY", "positionSide": "SHORT", 
-        "type": "MARKET", 
-        "quantity": str(qty),
-        "reduceOnly": "true" # Wir versuchen es mit ReduceOnly
+        "type": "MARKET", "quantity": str(qty), "reduceOnly": "true"
     }
     res2 = api_request("POST", "/openApi/swap/v2/trade/order", payload_2)
+    if res2 and res2.get("code") == 0: return True
     
-    if res2 and res2.get("code") == 0:
-        log("   [CLOSE] Methode 2 (Explicit) erfolgreich gesendet.")
-        return True
-        
-    debug_log("CLOSE_FAIL_2", res2)
+    debug_log("CLOSE_FAIL", res2)
     return False
 
 # --- TP MANAGEMENT ---
@@ -176,9 +177,8 @@ def set_robust_tp(symbol, avg_price, total_qty, current_level, target_tp_percent
     
     log(f"   [TP] Setze {tp_type_str} auf {tp_price}")
 
-    # Cleanup
-    api_request("POST", "/openApi/swap/v2/trade/cancelAllOrders", {"symbol": symbol})
-    time.sleep(1) 
+    # CLEANUP: Wir nutzen jetzt die manuelle Schleife!
+    cancel_all_orders_loop(symbol)
             
     payload = {
         "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
@@ -187,12 +187,18 @@ def set_robust_tp(symbol, avg_price, total_qty, current_level, target_tp_percent
         "quantity": qty_str, "closePosition": "true"
     }
     
-    # Einmaliger Versuch mit vollem Logging
+    # Setzen
     res = api_request("POST", "/openApi/swap/v2/trade/order", payload)
     if res and res.get("code") == 0:
         log(f"   [TP SET] ✅ {symbol} TP @ {tp_price}")
     else:
-        debug_log("TP_SET_FAIL", res) # <--- HIER WERDEN WIR SEHEN WARUM!
+        debug_log("TP_SET_FAIL", res)
+        # Wenn Fehler "Already exists", versuchen wir cleanup nochmal
+        if res and res.get("code") == 110407:
+            log("   [RETRY] TP existiert noch. Lösche erneut...")
+            cancel_all_orders_loop(symbol)
+            time.sleep(1)
+            api_request("POST", "/openApi/swap/v2/trade/order", payload)
 
 # --- EXECUTION LOGIC ---
 
@@ -206,7 +212,6 @@ def execute_pending_trade(trade):
 
     real_open = get_strict_open_count()
     if real_open >= MAX_OPEN_POSITIONS:
-        # Silent fail
         fail_trade(trade['id'])
         return
 
@@ -258,7 +263,7 @@ def manage_open_trade(trade):
         close_trade(trade['id'])
         return
 
-    # 2. WATCHDOG (MIT FORCE CLOSE)
+    # 2. WATCHDOG
     quote_res = api_request("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
     if not quote_res: return
     curr_price = float(quote_res["data"]["price"])
@@ -267,17 +272,11 @@ def manage_open_trade(trade):
         target_price = avg_price * (1 - DCA_FEES_BUFFER/100)
         
         if curr_price <= target_price:
-            log(f"[WATCHDOG] 🚨 {symbol} hat BE erreicht! ({curr_price} < {target_price})")
-            
-            # Neue Funktion nutzen!
+            log(f"[WATCHDOG] 🚨 {symbol} hat BE erreicht! Force Close.")
             success = force_close_position(symbol, current_qty)
-            
             if success:
-                log(f"   [WATCHDOG] ✅ Erfolgreich gesendet. Setze DB Status CLOSED.")
+                log(f"   [WATCHDOG] ✅ Erfolgreich. Schließe DB.")
                 close_trade(trade['id'])
-            else:
-                log(f"   [WATCHDOG] ❌ SCHLIESSEN FEHLGESCHLAGEN! Siehe Debug Log oben.")
-            
             return 
 
     # 3. COOLDOWN
@@ -307,22 +306,17 @@ def manage_open_trade(trade):
             
             if res and res.get("code") == 0:
                 fresh_avg, fresh_qty = wait_for_position_update(symbol, current_qty)
-                
                 if fresh_avg > 0:
                     new_level = trade['dca_level'] + 1
                     update_dca(trade['id'], new_level, fresh_avg, fresh_qty)
-                    
                     set_robust_tp(symbol, fresh_avg, fresh_qty, new_level, trade['tp_percent'])
-                    
                     send_telegram(f"📉 <b>SHORT DCA</b> ({new_level}/{DCA_MAX_STEPS})\nSymbol: {symbol}\nAvg: {fresh_avg}")
                     
-                    # Lucky Exit
                     target_check = fresh_avg * (1 - DCA_FEES_BUFFER/100)
                     if curr_price <= target_check:
                          log(f"[LUCKY EXIT] Schließe sofort.")
                          force_close_position(symbol, fresh_qty)
                          close_trade(trade['id'])
-
                 else:
                     log("[CRITICAL] Konnte neue DCA Daten nicht syncen.")
             else:
@@ -330,7 +324,7 @@ def manage_open_trade(trade):
 
 if __name__ == "__main__":
     init_db()
-    log(f"Worker v16 DEBUG MODE Started.")
+    log(f"Worker v17 FIX Started.")
     while True:
         try:
             pending = get_pending_trades()
