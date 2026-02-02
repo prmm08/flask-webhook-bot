@@ -40,7 +40,7 @@ def send_telegram(message):
         }, timeout=5)
     except: pass
 
-# --- API HELPERS ---
+# --- API HELPERS (JETZT MIT DELETE SUPPORT) ---
 def get_sign(params):
     params["timestamp"] = str(int(time.time() * 1000))
     query_string = urllib.parse.urlencode(sorted(params.items()))
@@ -54,14 +54,18 @@ def api_request(method, endpoint, payload=None):
     headers = {"X-BX-APIKEY": API_KEY}
     
     try:
-        if method == "GET": r = requests.get(url, headers=headers, timeout=10)
-        else: r = requests.post(url, headers=headers, timeout=10)
+        # WICHTIG: Hier fehlte DELETE! Jetzt ist es drin.
+        if method == "GET": 
+            r = requests.get(url, headers=headers, timeout=10)
+        elif method == "DELETE":
+            r = requests.delete(url, headers=headers, timeout=10)
+        else: 
+            r = requests.post(url, headers=headers, timeout=10)
         
         response_json = r.json()
         
-        # DEBUG: Wir loggen jetzt Fehler explizit
         if response_json.get("code") != 0:
-             debug_log(f"API_FAIL ({endpoint})", response_json)
+             debug_log(f"API_FAIL ({endpoint} {method})", response_json)
 
         return response_json
     except Exception as e:
@@ -114,25 +118,24 @@ def wait_for_position_update(symbol, old_qty):
     return 0.0, 0.0 
 
 def cancel_all_orders_loop(symbol):
-    """Löscht Orders manuell nacheinander, da cancelAllOrders nicht existiert"""
-    log(f"   [CLEANUP] Lösche Orders für {symbol} manuell...")
-    
-    # Liste holen
+    """Löscht Orders manuell mit dem KORREKTEN Befehl (DELETE /trade/order)"""
+    # 1. Liste holen
     res = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
     if res and "data" in res and "orders" in res["data"]:
         orders = res["data"]["orders"]
         count = len(orders)
         
-        if count == 0:
-            return True # Nichts zu tun
-            
+        if count == 0: return True 
+        
+        log(f"   [CLEANUP] Lösche {count} Orders für {symbol}...")
+        
         for o in orders:
-            # Einzeln löschen
-            api_request("POST", "/openApi/swap/v2/trade/cancelOrder", {
+            # WICHTIG: DELETE Methode nutzen! Endpoint ist derselbe wie bei Order Erstellung!
+            api_request("DELETE", "/openApi/swap/v2/trade/order", {
                 "symbol": symbol, "orderId": o["orderId"]
             })
             
-        time.sleep(1) # Kurz warten bis Engine verarbeitet hat
+        time.sleep(1)
         return True
     
     return False
@@ -177,7 +180,7 @@ def set_robust_tp(symbol, avg_price, total_qty, current_level, target_tp_percent
     
     log(f"   [TP] Setze {tp_type_str} auf {tp_price}")
 
-    # CLEANUP: Wir nutzen jetzt die manuelle Schleife!
+    # CLEANUP: Erst alte löschen (jetzt mit DELETE Befehl)
     cancel_all_orders_loop(symbol)
             
     payload = {
@@ -193,7 +196,7 @@ def set_robust_tp(symbol, avg_price, total_qty, current_level, target_tp_percent
         log(f"   [TP SET] ✅ {symbol} TP @ {tp_price}")
     else:
         debug_log("TP_SET_FAIL", res)
-        # Wenn Fehler "Already exists", versuchen wir cleanup nochmal
+        # Wenn BingX sagt "Order exists" (Race Condition), nochmal löschen
         if res and res.get("code") == 110407:
             log("   [RETRY] TP existiert noch. Lösche erneut...")
             cancel_all_orders_loop(symbol)
@@ -324,7 +327,7 @@ def manage_open_trade(trade):
 
 if __name__ == "__main__":
     init_db()
-    log(f"Worker v17 FIX Started.")
+    log(f"Worker v18 (REST DELETE Fix) Started.")
     while True:
         try:
             pending = get_pending_trades()
