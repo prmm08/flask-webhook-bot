@@ -81,7 +81,7 @@ WATCHLIST = [
 
 TIMEFRAME = '1m'       # 1-Minute Kerzen für schnelle Signale
 RSI_LENGTH = 14
-CHECK_INTERVAL = 30    # Alle 30 Sekunden prüfen
+CHECK_INTERVAL = 15    # Alle 30 Sekunden prüfen
 
 # Cooldown: Verhindert Spam. Wenn Signal gesendet, warte X Sekunden für diesen Coin.
 SIGNAL_COOLDOWN = 300  # 5 Minuten Ruhe pro Coin nach Signal
@@ -137,9 +137,9 @@ def check_conditions(df, symbol):
     
     signal_reason = None
 
-    # --- STRATEGIE 1: RSI CROSS DOWN 60 ---
-    # RSI war über 60 und ist jetzt darunter gefallen
-    if prev_rsi >= 60 and curr_rsi < 60:
+    # --- STRATEGIE 1: RSI CROSS DOWN 70 ---
+    # RSI war über 70 und ist jetzt darunter gefallen
+    if prev_rsi >= 70 and curr_rsi < 70:
         signal_reason = f"RSI Cross Down (Prev: {prev_rsi:.1f}, Curr: {curr_rsi:.1f})"
 
     # --- STRATEGIE 2: SIMPLE BEARISH DIVERGENCE CHECK ---
@@ -171,7 +171,7 @@ def send_webhook(symbol, reason):
 # --- MAIN LOOP ---
 if __name__ == "__main__":
     log(f"Markt-Scanner gestartet. Überwache {len(WATCHLIST)} Coins auf {TIMEFRAME}.")
-    log("Strategie: RSI Cross Down 70 & Bearish Div.")
+    log("Strategie: RSI Cross Down 60 & Bearish Div.")
 
     while True:
         for symbol in WATCHLIST:
