@@ -6,10 +6,10 @@ import time
 from datetime import datetime
 
 # --- KONFIGURATION ---
-# Deine Render Webhook URL
+# Docker interne URL (oder deine Render URL, falls extern)
 WEBHOOK_URL = "https://flask-webhook-bot-1.onrender.com/testorder" 
 
-# HIER DEINE LISTE REINKOPIEREN:
+# Deine Watchlist
 WATCHLIST = [
     'AIN/USDT',
     'AIXBT/USDT',
@@ -78,8 +78,9 @@ WATCHLIST = [
     'ZKJ/USDT'
 ]
 
-TIMEFRAME = '1m'
-CHECK_INTERVAL = 15    
+# WICHTIG: Auf 1m für 1-Minuten-Chart gestellt
+TIMEFRAME = '1m'       
+CHECK_INTERVAL = 10    # Bei 1m Chart öfter prüfen (alle 10s)
 
 # --- RSI SETTINGS ---
 RSI_PERIOD = 14
@@ -90,9 +91,10 @@ PIVOT_LEFT = 5
 PIVOT_RIGHT = 5     
 RANGE_MIN = 5       
 RANGE_MAX = 60      
+MIN_PRICE_DIFF_PERCENT = 0.10  # Mindestens 0.10% höherer Preis für Divergenz (Filtert Double Tops)
 
-# Cooldown
-SIGNAL_COOLDOWN = 300  
+# Cooldown (damit er nicht spammt)
+SIGNAL_COOLDOWN = 180  # 3 Minuten Ruhe pro Coin nach Signal (bei 1m Chart kürzerer Cooldown sinnvoll)
 last_signal_time = {}
 
 def log(msg):
@@ -100,7 +102,7 @@ def log(msg):
 
 def get_binance_data(symbol, limit=150):
     try:
-        # Futures Modus
+        # Futures Modus für Binance
         exchange = ccxt.binance({'options': {'defaultType': 'future'}})
         
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=limit)
@@ -125,14 +127,16 @@ def check_rsi_cross_down(df):
     curr_rsi = df['rsi'].iloc[-1]
     prev_rsi = df['rsi'].iloc[-2]
     
+    # War vorher über 70 und ist jetzt drunter?
     if prev_rsi >= RSI_OVERBOUGHT and curr_rsi < RSI_OVERBOUGHT:
-        return f"RSI Crossing Down 70 ({prev_rsi:.1f} -> {curr_rsi:.1f})"
+        return f"RSI Cross Down ({prev_rsi:.1f} -> {curr_rsi:.1f})"
     return None
 
-# --- LOGIK 2: BEARISH DIVERGENCE ---
+# --- LOGIK 2: BEARISH DIVERGENCE (Verbessert) ---
 def is_pivot_high(df, index, left, right):
     if index - left < 0 or index + right >= len(df): return False
     current_high = df['high'].iloc[index]
+    
     for i in range(1, left + 1):
         if df['high'].iloc[index - i] > current_high: return False
     for i in range(1, right + 1):
@@ -142,7 +146,7 @@ def is_pivot_high(df, index, left, right):
 def check_bearish_divergence(df):
     if len(df) < RANGE_MAX + PIVOT_RIGHT + 5: return None
 
-    # Aktuelles Pivot High (P1) bestimmen
+    # Aktuelles Pivot High (P1)
     curr_idx = len(df) - 1 - PIVOT_RIGHT 
     
     if not is_pivot_high(df, curr_idx, PIVOT_LEFT, PIVOT_RIGHT):
@@ -151,12 +155,10 @@ def check_bearish_divergence(df):
     p1_price = df['high'].iloc[curr_idx]
     p1_rsi = df['rsi'].iloc[curr_idx]
     
-    # FILTER A: Der aktuelle RSI sollte nicht schon komplett im Keller sein.
-    # Wenn RSI schon unter 55 ist, ist der Drop oft schon vorbei.
-    if p1_rsi < 55: 
-        return None
+    # Filter A: RSI muss bei P1 noch halbwegs hoch sein (nicht schon im Keller)
+    if p1_rsi < 55: return None
 
-    # Suche rückwärts nach vorherigem Pivot High (P0)
+    # Suche rückwärts nach P0
     start_search = curr_idx - RANGE_MIN
     end_search = max(0, curr_idx - RANGE_MAX)
     
@@ -165,45 +167,35 @@ def check_bearish_divergence(df):
             p0_price = df['high'].iloc[prev_idx]
             p0_rsi = df['rsi'].iloc[prev_idx]
             
-            # --- DIE VERBESSERTE LOGIK ---
-
-            # 1. PREIS CHECK: Higher High
-            # Aber: Der Preis muss MERKLICH höher sein (Rauschen filtern).
-            # Wir fordern mind. 0.1% Anstieg (bei 1m Chart) oder 0.2% (bei 5m).
-            # Beispiel XPL: 0.1012 / 0.1010 = 1.0019 (0.19% Unterschied).
-            price_threshold = 1.0015  # 0.15% Mindest-Anstieg
-            
+            # 1. PREIS FILTER (Gegen Rauschen)
+            # Preis muss um X % gestiegen sein
+            price_threshold = 1 + (MIN_PRICE_DIFF_PERCENT / 100)
             if p1_price < (p0_price * price_threshold):
-                continue # Preis ist nicht hoch genug gestiegen -> Ignorieren (Double Top Rauschen)
+                continue 
 
-            # 2. RSI CHECK: Lower High
-            if p1_rsi >= p0_rsi:
-                continue # RSI ist gestiegen oder gleich -> Keine Divergenz
+            # 2. RSI DIVERGENZ CHECK
+            # Preis höher UND RSI tiefer
+            if p1_price > p0_price and p1_rsi < p0_rsi:
+                
+                # Filter B: Ursprungs-RSI (P0) muss stark gewesen sein
+                if p0_rsi < 65: continue
+                
+                # Filter C: RSI muss signifikant gefallen sein (> 2 Punkte)
+                if (p0_rsi - p1_rsi) < 2.0: continue
 
-            # 3. RSI QUALITÄTS-CHECK (WICHTIG!)
-            # Eine starke Bearish Div kommt meistens von einem Overbought Level.
-            # Der ERSTE Peak (P0) muss > 68 gewesen sein (wir geben etwas Toleranz zu 70).
-            if p0_rsi < 68:
-                continue # Der erste Peak war nicht stark genug -> Ignorieren
-            
-            # 4. RSI DIFFERENZ
-            # Der RSI muss signifikant gefallen sein (mind. 2.5 Punkte)
-            if (p0_rsi - p1_rsi) < 2.5:
-                continue
-
-            # TREFFER!
-            return (f"Bearish Div (Strong): Price {p1_price:.5f} > {p0_price:.5f} (+{((p1_price/p0_price)-1)*100:.2f}%) "
-                    f"| RSI {p1_rsi:.1f} < {p0_rsi:.1f}")
-
+                return f"Bearish Div (Price: {p1_price:.4f} > {p0_price:.4f} | RSI: {p1_rsi:.1f} < {p0_rsi:.1f})"
     return None
 
 def send_webhook(symbol, reason):
-    # Entfernt /USDT und ggf. 1000 für den Ticker im Webhook
     clean_symbol = symbol.replace("/", "").replace("1000", "") 
     
     payload = {
         "ticker": clean_symbol,
-        "direction": "SHORT"
+        "direction": "SHORT",
+        "leverage": 20,       
+        "trade_size": 100,     
+        "tp_percent": 3.0,     
+        "sl_percent": 0        
     }
     
     try:
@@ -214,33 +206,41 @@ def send_webhook(symbol, reason):
 
 # --- MAIN LOOP ---
 if __name__ == "__main__":
-    log(f"Dual-Scanner gestartet (Watchlist: {len(WATCHLIST)} Coins).")
+    log(f"Dual-Scanner gestartet (1m Chart).")
+    log(f"Modus: RSI Cross < {RSI_OVERBOUGHT} ODER Bearish Divergence.")
     
     while True:
         for symbol in WATCHLIST:
+            # 1. Cooldown Check
             last_time = last_signal_time.get(symbol, 0)
             if (time.time() - last_time) < SIGNAL_COOLDOWN:
                 continue 
 
+            # 2. Daten holen
             df = get_binance_data(symbol, limit=150)
             if df is not None:
                 df = calculate_indicators(df)
                 
                 signal_reason = None
                 
-                # Check 1
+                # --- PRÜFUNG A: RSI Cross ---
                 rsi_signal = check_rsi_cross_down(df)
-                if rsi_signal: signal_reason = rsi_signal
+                if rsi_signal: 
+                    signal_reason = rsi_signal
                 
-                # Check 2 (nur wenn Check 1 leer)
+                # --- PRÜFUNG B: Divergenz (Nur wenn A nicht schon ausgelöst hat) ---
                 if not signal_reason:
                     div_signal = check_bearish_divergence(df)
-                    if div_signal: signal_reason = div_signal
+                    if div_signal: 
+                        signal_reason = div_signal
                 
+                # 3. FEUERN
                 if signal_reason:
                     send_webhook(symbol, signal_reason)
                     last_signal_time[symbol] = time.time()
             
-            time.sleep(1) 
+            # Kurze Pause zwischen API Calls
+            time.sleep(0.5) 
 
+        # Pause zwischen den Runden
         time.sleep(CHECK_INTERVAL)
