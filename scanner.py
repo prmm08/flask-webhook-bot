@@ -142,6 +142,7 @@ def is_pivot_high(df, index, left, right):
 def check_bearish_divergence(df):
     if len(df) < RANGE_MAX + PIVOT_RIGHT + 5: return None
 
+    # Aktuelles Pivot High (P1) bestimmen
     curr_idx = len(df) - 1 - PIVOT_RIGHT 
     
     if not is_pivot_high(df, curr_idx, PIVOT_LEFT, PIVOT_RIGHT):
@@ -150,6 +151,12 @@ def check_bearish_divergence(df):
     p1_price = df['high'].iloc[curr_idx]
     p1_rsi = df['rsi'].iloc[curr_idx]
     
+    # FILTER A: Der aktuelle RSI sollte nicht schon komplett im Keller sein.
+    # Wenn RSI schon unter 55 ist, ist der Drop oft schon vorbei.
+    if p1_rsi < 55: 
+        return None
+
+    # Suche rückwärts nach vorherigem Pivot High (P0)
     start_search = curr_idx - RANGE_MIN
     end_search = max(0, curr_idx - RANGE_MAX)
     
@@ -158,9 +165,36 @@ def check_bearish_divergence(df):
             p0_price = df['high'].iloc[prev_idx]
             p0_rsi = df['rsi'].iloc[prev_idx]
             
-            if p1_price > p0_price and p1_rsi < p0_rsi:
-                if p1_rsi > 50: 
-                    return f"Bearish Div (Price: {p1_price:.2f} > {p0_price:.2f} | RSI: {p1_rsi:.1f} < {p0_rsi:.1f})"
+            # --- DIE VERBESSERTE LOGIK ---
+
+            # 1. PREIS CHECK: Higher High
+            # Aber: Der Preis muss MERKLICH höher sein (Rauschen filtern).
+            # Wir fordern mind. 0.1% Anstieg (bei 1m Chart) oder 0.2% (bei 5m).
+            # Beispiel XPL: 0.1012 / 0.1010 = 1.0019 (0.19% Unterschied).
+            price_threshold = 1.0015  # 0.15% Mindest-Anstieg
+            
+            if p1_price < (p0_price * price_threshold):
+                continue # Preis ist nicht hoch genug gestiegen -> Ignorieren (Double Top Rauschen)
+
+            # 2. RSI CHECK: Lower High
+            if p1_rsi >= p0_rsi:
+                continue # RSI ist gestiegen oder gleich -> Keine Divergenz
+
+            # 3. RSI QUALITÄTS-CHECK (WICHTIG!)
+            # Eine starke Bearish Div kommt meistens von einem Overbought Level.
+            # Der ERSTE Peak (P0) muss > 68 gewesen sein (wir geben etwas Toleranz zu 70).
+            if p0_rsi < 68:
+                continue # Der erste Peak war nicht stark genug -> Ignorieren
+            
+            # 4. RSI DIFFERENZ
+            # Der RSI muss signifikant gefallen sein (mind. 2.5 Punkte)
+            if (p0_rsi - p1_rsi) < 2.5:
+                continue
+
+            # TREFFER!
+            return (f"Bearish Div (Strong): Price {p1_price:.5f} > {p0_price:.5f} (+{((p1_price/p0_price)-1)*100:.2f}%) "
+                    f"| RSI {p1_rsi:.1f} < {p0_rsi:.1f}")
+
     return None
 
 def send_webhook(symbol, reason):
