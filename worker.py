@@ -12,7 +12,7 @@ from db import get_pending_trades, get_open_trades, update_trade_execution, upda
 API_KEY = os.getenv("BINGX_API_KEY")
 API_SECRET = os.getenv("BINGX_API_SECRET")
 BINGX_BASE = "https://open-api.bingx.com"
-MAX_OPEN_POSITIONS = 20
+MAX_OPEN_POSITIONS = 1
 
 # Telegram
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -21,8 +21,8 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # DCA Settings
 DCA_DEVIATION = 5.0     
 DCA_MULTIPLIER = 2.0    
-DCA_MAX_STEPS = 5       
-DCA_FEES_BUFFER = 0.15  
+DCA_MAX_STEPS = 4       
+DCA_FEES_BUFFER = 2.5  
 DCA_COOLDOWN_SEC = 60   
 
 def log(msg):
