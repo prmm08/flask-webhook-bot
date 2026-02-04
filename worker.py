@@ -22,10 +22,9 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DCA_DEVIATION = 5.0     
 DCA_MULTIPLIER = 2.0    
 DCA_MAX_STEPS = 5       
-DCA_FEES_BUFFER = 0.1  
+DCA_FEES_BUFFER = 0.15  
 DCA_COOLDOWN_SEC = 60   
 
-# --- LOGGING HELPER ---
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -40,7 +39,7 @@ def send_telegram(message):
         }, timeout=5)
     except: pass
 
-# --- API HELPERS (JETZT MIT DELETE SUPPORT) ---
+# --- API HELPERS ---
 def get_sign(params):
     params["timestamp"] = str(int(time.time() * 1000))
     query_string = urllib.parse.urlencode(sorted(params.items()))
@@ -54,7 +53,6 @@ def api_request(method, endpoint, payload=None):
     headers = {"X-BX-APIKEY": API_KEY}
     
     try:
-        # WICHTIG: Hier fehlte DELETE! Jetzt ist es drin.
         if method == "GET": 
             r = requests.get(url, headers=headers, timeout=10)
         elif method == "DELETE":
@@ -63,10 +61,8 @@ def api_request(method, endpoint, payload=None):
             r = requests.post(url, headers=headers, timeout=10)
         
         response_json = r.json()
-        
         if response_json.get("code") != 0:
              debug_log(f"API_FAIL ({endpoint} {method})", response_json)
-
         return response_json
     except Exception as e:
         log(f"API CRITICAL ERROR: {e}")
@@ -118,44 +114,26 @@ def wait_for_position_update(symbol, old_qty):
     return 0.0, 0.0 
 
 def cancel_all_orders_loop(symbol):
-    """Löscht Orders manuell mit dem KORREKTEN Befehl (DELETE /trade/order)"""
-    # 1. Liste holen
     res = api_request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
     if res and "data" in res and "orders" in res["data"]:
         orders = res["data"]["orders"]
-        count = len(orders)
-        
-        if count == 0: return True 
-        
-        log(f"   [CLEANUP] Lösche {count} Orders für {symbol}...")
+        if len(orders) == 0: return True 
         
         for o in orders:
-            # WICHTIG: DELETE Methode nutzen! Endpoint ist derselbe wie bei Order Erstellung!
             api_request("DELETE", "/openApi/swap/v2/trade/order", {
                 "symbol": symbol, "orderId": o["orderId"]
             })
-            
         time.sleep(1)
         return True
-    
     return False
 
 def force_close_position(symbol, qty):
     log(f"   [CLOSE] Versuche Hard-Close für {symbol} (Qty: {qty})...")
-    
-    # Methode 1
-    payload_1 = {
-        "symbol": symbol, "side": "BUY", "positionSide": "SHORT", 
-        "type": "MARKET", "closePosition": "true"
-    }
+    payload_1 = {"symbol": symbol, "side": "BUY", "positionSide": "SHORT", "type": "MARKET", "closePosition": "true"}
     res = api_request("POST", "/openApi/swap/v2/trade/order", payload_1)
     if res and res.get("code") == 0: return True
     
-    # Methode 2 (Explicit)
-    payload_2 = {
-        "symbol": symbol, "side": "BUY", "positionSide": "SHORT", 
-        "type": "MARKET", "quantity": str(qty), "reduceOnly": "true"
-    }
+    payload_2 = {"symbol": symbol, "side": "BUY", "positionSide": "SHORT", "type": "MARKET", "quantity": str(qty), "reduceOnly": "true"}
     res2 = api_request("POST", "/openApi/swap/v2/trade/order", payload_2)
     if res2 and res2.get("code") == 0: return True
     
@@ -180,7 +158,6 @@ def set_robust_tp(symbol, avg_price, total_qty, current_level, target_tp_percent
     
     log(f"   [TP] Setze {tp_type_str} auf {tp_price}")
 
-    # CLEANUP: Erst alte löschen (jetzt mit DELETE Befehl)
     cancel_all_orders_loop(symbol)
             
     payload = {
@@ -190,13 +167,11 @@ def set_robust_tp(symbol, avg_price, total_qty, current_level, target_tp_percent
         "quantity": qty_str, "closePosition": "true"
     }
     
-    # Setzen
     res = api_request("POST", "/openApi/swap/v2/trade/order", payload)
     if res and res.get("code") == 0:
         log(f"   [TP SET] ✅ {symbol} TP @ {tp_price}")
     else:
         debug_log("TP_SET_FAIL", res)
-        # Wenn BingX sagt "Order exists" (Race Condition), nochmal löschen
         if res and res.get("code") == 110407:
             log("   [RETRY] TP existiert noch. Lösche erneut...")
             cancel_all_orders_loop(symbol)
@@ -273,7 +248,6 @@ def manage_open_trade(trade):
     
     if trade['dca_level'] > 0 and avg_price > 0:
         target_price = avg_price * (1 - DCA_FEES_BUFFER/100)
-        
         if curr_price <= target_price:
             log(f"[WATCHDOG] 🚨 {symbol} hat BE erreicht! Force Close.")
             success = force_close_position(symbol, current_qty)
@@ -289,13 +263,29 @@ def manage_open_trade(trade):
         seconds_since = (now - last_update).total_seconds()
         if seconds_since < DCA_COOLDOWN_SEC: return 
 
-    # 4. DCA LOGIK
+    # 4. DCA LOGIK (PRÄZISIONS UPDATE)
     if trade['dca_level'] < DCA_MAX_STEPS:
-        baseline = avg_price 
-        target_trigger = baseline * (1 + DCA_DEVIATION/100)
+        
+        # HIER IST DIE ÄNDERUNG:
+        # Wir nehmen NICHT mehr den "avg_price" als Basis für den Trigger,
+        # sondern den ursprünglichen "entry_price".
+        # Sollte entry_price in der DB fehlen (alte Trades), Fallback auf avg_price.
+        
+        base_entry = float(trade.get('entry_price') or avg_price)
+        
+        # Wir berechnen den Faktor exponentiell (Compounding):
+        # Level 0 (warte auf DCA 1) -> Faktor 1.05^1 = 1.05
+        # Level 1 (warte auf DCA 2) -> Faktor 1.05^2 = 1.1025
+        # Level 2 (warte auf DCA 3) -> Faktor 1.05^3 = 1.1576
+        
+        multiplier_factor = (1 + DCA_DEVIATION/100) ** (trade['dca_level'] + 1)
+        target_trigger = base_entry * multiplier_factor
+        
+        # Optional: Debugging aktivieren, um Trigger zu sehen
+        # log(f"[DCA CHECK] {symbol} Lvl {trade['dca_level']} | Entry: {base_entry} | Trigger: {target_trigger:.5f} | Curr: {curr_price}")
         
         if curr_price >= target_trigger:
-            log(f"[DCA TRIGGER] {symbol} Short Level {trade['dca_level']+1}")
+            log(f"[DCA TRIGGER] {symbol} Short Level {trade['dca_level']+1} @ {curr_price} (Target: {target_trigger:.5f})")
             
             info = get_symbol_info(symbol)
             multiplier_now = DCA_MULTIPLIER ** (trade['dca_level'] + 1)
@@ -327,7 +317,7 @@ def manage_open_trade(trade):
 
 if __name__ == "__main__":
     init_db()
-    log(f"Worker v18 (REST DELETE Fix) Started.")
+    log(f"Worker v20 (Precise DCA) Started.")
     while True:
         try:
             pending = get_pending_trades()
